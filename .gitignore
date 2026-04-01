@@ -1,0 +1,37 @@
+# Secrets
+.env
+*.pem
+*.key
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Databases (runtime state — not source code)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and runtime output
+bot.log
+dry_run_overview.txt
+pnl_attribution.txt
+
+# Trained model weights (large binaries)
+models/
+
+# Training data (large, regenerable)
+data/
+
+# macOS
+.DS_Store
+.claudeignore
+.aiignore
+.claude/
+CLAUDE.md
+AI_MODEL_PLAN.md
+ROADMAP.md
+rules.md

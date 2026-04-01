@@ -1,0 +1,662 @@
+"""Live dry-run trading ledger.
+
+After every poll cycle, rewrites ``dry_run_overview.txt`` with a complete
+snapshot of all simulated trades, their current P&L, and a running balance
+starting from a configurable amount of paper capital.
+
+The file is a plain-text table you can open at any time (or ``tail -f`` if
+you redirect bot output to a log file) to see exactly what the bot would have
+done with real money.
+
+P&L accounting
+--------------
+Each trade's outcome depends on its lifecycle state:
+
+  EXITED   — early exit triggered by ExitManager (profit-take or stop-loss).
+               P&L is locked at the exit price captured when the exit fired.
+               exit_pnl_cents stored in the DB is used directly.
+
+  SETTLED  — realized P&L computed from the API result field:
+               YES buy:  gain = (100 − entry)¢ × count  if result=YES
+                         loss = −entry¢ × count          if result=NO
+               NO buy:   gain = (100 − no_cost)¢ × count  if result=NO
+                         loss = −no_cost¢ × count          if result=YES
+               (no_cost = 100 − limit_price, since limit_price stores yes_bid)
+
+  OPEN     — unrealized mark-to-market using conservative exit-side price:
+               YES buy:  unrealized = (yes_bid − entry)¢ × count
+               NO buy:   unrealized = (entry − (100 − yes_ask))¢ × count
+
+  UNKNOWN  — market data unavailable; shown as pending.
+
+Balance
+-------
+  current_balance = starting_capital
+                    + locked_gains  (settled wins + profitable exits)
+                    − locked_losses (settled losses + stop-loss exits)
+                    + unrealized_pnl  (mark-to-market on purely open trades)
+
+Output file
+-----------
+  dry_run_overview.txt  in the project root (overwritten every cycle).
+  Configurable via DRY_RUN_OVERVIEW_PATH env var.
+
+Price snapshot table
+--------------------
+Every poll cycle, a row is written to ``price_snapshots`` for each open
+(unsettled, unexited) trade.  Schema:
+
+  trade_id         → foreign key into ``trades``
+  snapshot_at      → UTC ISO-8601 timestamp
+  yes_bid          → Kalshi yes_bid in cents
+  yes_ask          → Kalshi yes_ask in cents
+  exit_price       → conservative exit price (yes_bid for YES positions,
+                     100 − yes_ask for NO positions)
+  unrealized_cents → (exit_price − entry) × count  (signed)
+  pct_gain         → unrealized_cents / total_cost_cents  (signed ratio)
+  days_to_close    → fractional days until market closes at snapshot time
+
+This produces a time-series of price trajectories per position.  Combined
+with exit event data in the ``trades`` table, it enables queries such as:
+
+  • At what pct_gain level did each position peak?
+  • How quickly did price decay after peak?
+  • Did the exit fire before or after the peak?
+  • Would a different threshold have outperformed?
+"""
+
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+from .exit_manager import ExitManager
+from .markets import fetch_market_detail
+
+_DEFAULT_DB_PATH       = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_OVERVIEW_PATH = Path(__file__).parent.parent / "dry_run_overview.txt"
+
+# Starting paper capital in cents (default $100.00 = 10_000¢).
+STARTING_CAPITAL_CENTS: int = int(
+    float(os.environ.get("DRY_RUN_STARTING_CAPITAL", "100")) * 100
+)
+OVERVIEW_PATH: Path = Path(
+    os.environ.get("DRY_RUN_OVERVIEW_PATH", str(_DEFAULT_OVERVIEW_PATH))
+)
+
+from .trade_executor import TRADE_DRY_RUN
+
+
+# ---------------------------------------------------------------------------
+# Internal trade record
+# ---------------------------------------------------------------------------
+
+class _Trade:
+    """Single dry-run trade entry with P&L attached after enrichment."""
+
+    __slots__ = (
+        "trade_id", "logged_at", "ticker", "side", "count",
+        "limit_price", "score", "kelly_fraction", "p_estimate",
+        "source",
+        # exit state (loaded from DB)
+        "exited", "exit_pnl", "exit_reason",
+        # settlement state (loaded from DB outcome / live API)
+        "settled", "result",
+        # live market data (populated by _enrich)
+        "current_mid", "yes_bid", "yes_ask", "close_time",
+    )
+
+    def __init__(
+        self,
+        trade_id:       int,
+        logged_at:      str,
+        ticker:         str,
+        side:           str,
+        count:          int,
+        limit_price:    int,
+        score:          float,
+        kelly_fraction: float | None,
+        p_estimate:     float | None,
+        outcome:        str | None = None,
+        exited_at:      str | None = None,
+        exit_pnl_cents: float | None = None,
+        exit_reason:    str | None = None,
+        source:         str | None = None,
+    ) -> None:
+        self.trade_id       = trade_id
+        self.logged_at      = logged_at
+        self.ticker         = ticker
+        self.side           = side          # "yes" | "no"
+        self.count          = count
+        self.limit_price    = limit_price   # yes_price in cents
+        self.score          = score
+        self.kelly_fraction = kelly_fraction
+        self.p_estimate     = p_estimate
+        self.source         = source or ""
+
+        # Exit state — locked-in P&L from early exit.
+        self.exited      = exited_at is not None
+        self.exit_pnl    = exit_pnl_cents   # signed cents, or None
+        self.exit_reason = exit_reason      # 'profit_take' | 'stop_loss' | None
+
+        # Settlement state — pre-fill from DB outcome if already settled.
+        if outcome in ("won", "lost"):
+            self.settled = True
+            self.result  = side if outcome == "won" else ("no" if side == "yes" else "yes")
+        else:
+            self.settled = False
+            self.result  = None
+
+        # Live market data populated by _enrich().
+        self.current_mid: float | None = None
+        self.yes_bid:     int | None   = None
+        self.yes_ask:     int | None   = None
+        self.close_time:  str | None   = None
+
+    # -----------------------------------------------------------------------
+    # Derived values
+    # -----------------------------------------------------------------------
+
+    @property
+    def cost_per_contract(self) -> int:
+        """Amount paid per contract in cents."""
+        return self.limit_price if self.side == "yes" else (100 - self.limit_price)
+
+    @property
+    def total_cost_cents(self) -> int:
+        return self.cost_per_contract * self.count
+
+    @property
+    def pnl_cents(self) -> float | None:
+        """Signed P&L in cents.  Priority: exited > settled > unrealized > None."""
+        if self.exited:
+            return self.exit_pnl            # locked exit P&L
+        if self.settled and self.result is not None:
+            return self._realized_cents()   # settlement outcome
+        if self.current_mid is not None:
+            return self._unrealized_cents() # mark-to-market
+        return None
+
+    @property
+    def status_label(self) -> str:
+        if self.exited:
+            tag = "PROFIT-TAKE" if self.exit_reason == "profit_take" else "STOP-LOSS"
+            gain = (self.exit_pnl or 0) > 0
+            return f"EXITED {tag} ({'GAIN' if gain else 'LOSS'})"
+        if self.settled and self.result is not None:
+            win = (
+                (self.side == "yes" and self.result == "yes") or
+                (self.side == "no"  and self.result == "no")
+            )
+            return f"SETTLED {'WIN ' if win else 'LOSS'}"
+        if self.current_mid is not None:
+            return "OPEN"
+        return "PENDING"
+
+    def _realized_cents(self) -> float:
+        if self.side == "yes":
+            per = (100 - self.limit_price) if self.result == "yes" else (-self.limit_price)
+        else:
+            per = (self.limit_price) if self.result == "no" else (self.limit_price - 100)
+        return per * self.count
+
+    def _unrealized_cents(self) -> float:
+        mid = self.current_mid  # caller must check not None
+        if self.side == "yes":
+            # YES: current bid minus entry YES price
+            per = mid - self.limit_price
+        else:
+            # NO: current NO exit price (= 100 - yes_ask) minus entry NO cost (= 100 - limit_price)
+            per = mid - (100 - self.limit_price)
+        return per * self.count
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+_CREATE_SNAPSHOTS_SQL = """
+CREATE TABLE IF NOT EXISTS price_snapshots (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id         INTEGER NOT NULL,
+    snapshot_at      TEXT    NOT NULL,
+    yes_bid          INTEGER,
+    yes_ask          INTEGER,
+    exit_price       INTEGER,
+    unrealized_cents REAL,
+    pct_gain         REAL,
+    days_to_close    REAL
+)
+"""
+
+_CREATE_SNAPSHOTS_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_snapshots_trade_time
+    ON price_snapshots (trade_id, snapshot_at)
+"""
+
+# Columns added to price_snapshots after initial release.
+_SNAPSHOT_MIGRATIONS: list[tuple[str, str]] = [
+    ("pct_gain",      "REAL"),
+    ("days_to_close", "REAL"),
+]
+
+
+class DryRunLedger:
+    """Reads dry-run trades from SQLite, enriches with live market data,
+    checks exit thresholds, and writes a human-readable overview file.
+
+    Also persists a price_snapshots row for every open position on each cycle,
+    building the time-series dataset needed to evaluate exit strategy
+    performance.
+
+    Usage::
+
+        ledger = DryRunLedger()
+        await ledger.refresh_and_write(session)
+        ledger.close()
+    """
+
+    def __init__(
+        self,
+        db_path: Path | str = _DEFAULT_DB_PATH,
+        overview_path: Path | str = OVERVIEW_PATH,
+        starting_capital_cents: int = STARTING_CAPITAL_CENTS,
+    ) -> None:
+        self._db_path = Path(db_path)
+        self._overview_path = Path(overview_path)
+        self._starting_capital = starting_capital_cents
+        self._conn = sqlite3.connect(
+            str(self._db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(_CREATE_SNAPSHOTS_SQL)
+        self._conn.execute(_CREATE_SNAPSHOTS_IDX_SQL)
+        self._migrate_snapshots()
+
+        # ExitManager shares our connection so all writes land in the same DB.
+        self._exit_manager = ExitManager(self._conn, dry_run=TRADE_DRY_RUN)
+
+        logging.info(
+            "DryRunLedger — overview=%s  starting_capital=$%.2f",
+            self._overview_path, starting_capital_cents / 100,
+        )
+
+    def _migrate_snapshots(self) -> None:
+        """Add new columns to price_snapshots if they are missing."""
+        existing = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(price_snapshots)"
+            ).fetchall()
+        }
+        for col, defn in _SNAPSHOT_MIGRATIONS:
+            if col not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE price_snapshots ADD COLUMN {col} {defn}"
+                )
+
+    async def refresh_and_write(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        numeric_opps: list | None = None,
+        poly_opps: list | None = None,
+    ) -> None:
+        """Load all trades, enrich with market data, check exits, write overview.
+
+        Args:
+            session:      Shared aiohttp session.
+            numeric_opps: Current cycle's numeric opportunities (post quality-gate),
+                          passed to ExitManager for counter-signal exit checking.
+                          None means counter-signal check is skipped this call.
+            poly_opps:    Current cycle's external-forecast opportunities,
+                          also used for counter-signal exits.
+        """
+        trades = self._load_trades()
+        if not trades:
+            return
+
+        await self._enrich(session, trades)
+
+        # Check P&L-based exit thresholds BEFORE writing snapshots so exited
+        # positions are excluded from the snapshot (we no longer hold them).
+        await self._exit_manager.check_exits(session, trades)
+
+        # Check counter-signal exits when current opportunity data is provided.
+        if numeric_opps is not None or poly_opps is not None:
+            await self._exit_manager.check_counter_signals(
+                session,
+                trades,
+                numeric_opps=numeric_opps or [],
+                poly_opps=poly_opps or [],
+            )
+
+        # Re-load exit state so the overview and snapshot logic see updated flags.
+        self._reload_exit_state(trades)
+
+        self._write_snapshots(trades)
+        overview = self._build_overview(trades)
+
+        try:
+            self._overview_path.write_text(overview + "\n", encoding="utf-8")
+        except OSError as exc:
+            logging.error("DryRunLedger: could not write overview file: %s", exc)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
+
+    def open_tickers(self) -> set[str]:
+        """Return the set of tickers with currently open (unsettled, unexited) dry-run positions."""
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ticker FROM trades
+                WHERE mode = 'dry_run'
+                  AND outcome IS NULL
+                  AND exited_at IS NULL
+                """
+            ).fetchall()
+            return {row[0] for row in rows}
+        except Exception:
+            return set()
+
+    def recently_exited_tickers(self, cooldown_minutes: int) -> set[str]:
+        """Return tickers exited via stop_loss or trailing_stop within cooldown_minutes.
+
+        These tickers are temporarily blocked from re-entry to prevent cascading
+        losses from repeatedly entering a position after the market has moved
+        against us.  Profit-take exits are excluded — a market that hit its
+        profit target may still have upside worth re-entering.
+        """
+        if cooldown_minutes <= 0:
+            return set()
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ticker FROM trades
+                WHERE mode = 'dry_run'
+                  AND exit_reason IN ('stop_loss', 'trailing_stop')
+                  AND exited_at > datetime('now', ? || ' minutes')
+                """,
+                (f"-{cooldown_minutes}",),
+            ).fetchall()
+            return {row[0] for row in rows}
+        except Exception:
+            return set()
+
+    def _load_trades(self) -> list[_Trade]:
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT id, logged_at, ticker, side, count, limit_price,
+                       score, kelly_fraction, p_estimate, outcome,
+                       exited_at, exit_pnl_cents, exit_reason, source
+                FROM trades
+                WHERE mode = 'dry_run'
+                ORDER BY logged_at ASC
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        return [
+            _Trade(
+                trade_id       = row[0],
+                logged_at      = row[1],
+                ticker         = row[2],
+                side           = row[3],
+                count          = row[4],
+                limit_price    = row[5],
+                score          = row[6],
+                kelly_fraction = row[7],
+                p_estimate     = row[8],
+                outcome        = row[9],
+                exited_at      = row[10],
+                exit_pnl_cents = row[11],
+                exit_reason    = row[12],
+                source         = row[13],
+            )
+            for row in rows
+        ]
+
+    def _reload_exit_state(self, trades: list[_Trade]) -> None:
+        """After ExitManager runs, refresh exit fields on any newly exited trades."""
+        rows = self._conn.execute(
+            "SELECT id, exited_at, exit_pnl_cents, exit_reason FROM trades WHERE exited_at IS NOT NULL"
+        ).fetchall()
+        exited = {row[0]: (row[1], row[2], row[3]) for row in rows}
+        for t in trades:
+            if not t.exited and t.trade_id in exited:
+                _, pnl, reason = exited[t.trade_id]
+                t.exited      = True
+                t.exit_pnl    = pnl
+                t.exit_reason = reason
+
+    async def _enrich(
+        self, session: aiohttp.ClientSession, trades: list[_Trade]
+    ) -> None:
+        """Fetch live market state for every open, unexited ticker."""
+        import asyncio
+
+        # Only fetch tickers still needing live data: not settled, not exited.
+        active_tickers = list({
+            t.ticker for t in trades
+            if not t.settled and not t.exited
+        })
+
+        # Serial with 0.5s gap — avoids Kalshi 429s on large portfolios.
+        sem = asyncio.Semaphore(1)
+
+        async def _fetch(ticker: str):
+            async with sem:
+                result = await fetch_market_detail(session, ticker)
+                await asyncio.sleep(0.5)
+                return result
+
+        results = await asyncio.gather(
+            *[_fetch(t) for t in active_tickers],
+            return_exceptions=True,
+        )
+
+        market_by_ticker: dict[str, dict[str, Any]] = {}
+        for ticker, result in zip(active_tickers, results):
+            if isinstance(result, dict):
+                market_by_ticker[ticker] = result
+
+        for trade in trades:
+            if trade.settled or trade.exited:
+                continue
+            mkt = market_by_ticker.get(trade.ticker)
+            if mkt is None:
+                continue
+            status       = mkt.get("status", "")
+            result_field = mkt.get("result", "")
+            if status in ("settled", "finalized") and result_field in ("yes", "no"):
+                trade.settled = True
+                trade.result  = result_field
+            else:
+                bid = mkt.get("yes_bid")
+                ask = mkt.get("yes_ask")
+                if bid is not None and ask is not None:
+                    trade.yes_bid = int(bid)
+                    trade.yes_ask = int(ask)
+                    if trade.side == "yes":
+                        trade.current_mid = float(bid)
+                    else:
+                        trade.current_mid = float(100 - ask)
+                # Capture close_time for days_to_close calculation in snapshots.
+                ct = mkt.get("close_time") or mkt.get("expiration_time")
+                if ct:
+                    trade.close_time = ct
+
+    def _write_snapshots(self, trades: list[_Trade]) -> None:
+        """Persist a price snapshot row for every open, unexited position.
+
+        Columns written per row:
+          - trade_id, snapshot_at, yes_bid, yes_ask, exit_price
+          - unrealized_cents  — signed P&L at conservative exit price
+          - pct_gain          — unrealized / total_cost  (ratio, e.g. 0.5 = +50%)
+          - days_to_close     — fractional days until market close (None if unavailable)
+
+        Exited and settled positions are excluded — their price history is
+        no longer actionable.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        rows = []
+
+        for t in trades:
+            if t.settled or t.exited or t.current_mid is None:
+                continue
+
+            exit_price = int(t.current_mid)
+            unrealized = t._unrealized_cents()
+            cost       = t.total_cost_cents
+            pct_gain   = unrealized / cost if cost > 0 else None
+
+            days_to_close: float | None = None
+            if t.close_time:
+                try:
+                    ct = datetime.fromisoformat(
+                        t.close_time.replace("Z", "+00:00")
+                    )
+                    days_to_close = (ct - now).total_seconds() / 86400
+                except (ValueError, TypeError):
+                    pass
+
+            rows.append((
+                t.trade_id, now_iso,
+                t.yes_bid, t.yes_ask,
+                exit_price, unrealized,
+                pct_gain, days_to_close,
+            ))
+
+        if not rows:
+            return
+
+        self._conn.executemany(
+            """
+            INSERT INTO price_snapshots
+                (trade_id, snapshot_at, yes_bid, yes_ask, exit_price,
+                 unrealized_cents, pct_gain, days_to_close)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        logging.debug("Price snapshots: wrote %d row(s) for open positions.", len(rows))
+
+    def _build_overview(self, trades: list[_Trade]) -> str:
+        W = "=" * 68
+        S = "-" * 68
+
+        exited_trades  = [t for t in trades if t.exited]
+        settled_trades = [t for t in trades if t.settled and t.result is not None and not t.exited]
+        open_trades    = [t for t in trades if not t.settled and not t.exited]
+
+        def _d(cents: float) -> str:
+            sign = "+" if cents >= 0 else ""
+            return f"{sign}${cents / 100:.2f}"
+
+        # --- Realized P&L: settled (normal) + exited (early close) ---
+        settled_gains  = sum(max(0.0, t._realized_cents()) for t in settled_trades)
+        settled_losses = sum(min(0.0, t._realized_cents()) for t in settled_trades)
+        exit_gains     = sum(max(0.0, t.exit_pnl) for t in exited_trades if t.exit_pnl is not None)
+        exit_losses    = sum(min(0.0, t.exit_pnl) for t in exited_trades if t.exit_pnl is not None)
+
+        realized_gains_cents  = settled_gains  + exit_gains
+        realized_losses_cents = settled_losses + exit_losses
+
+        unrealized_cents = sum(
+            t._unrealized_cents()
+            for t in open_trades
+            if t.current_mid is not None
+        )
+
+        current_balance_cents = (
+            self._starting_capital
+            + realized_gains_cents
+            + realized_losses_cents   # already negative
+            + unrealized_cents
+        )
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        buf: list[str] = [
+            W,
+            "  DRY-RUN LIVE TRADING OVERVIEW",
+            f"  Last updated: {now}",
+            W,
+            f"  Starting capital :  ${self._starting_capital / 100:>8.2f}",
+            f"  Realized gains   :  {_d(realized_gains_cents):>9}  "
+            f"(settled wins: {_d(settled_gains)}  exits: {_d(exit_gains)})",
+            f"  Realized losses  :  {_d(realized_losses_cents):>9}  "
+            f"(settled losses: {_d(settled_losses)}  exits: {_d(exit_losses)})",
+            f"  Unrealized P&L   :  {_d(unrealized_cents):>9}  (mark-to-market on open trades)",
+            S,
+            f"  Current balance  :  ${current_balance_cents / 100:>8.2f}",
+            S,
+            f"  Total trades     :  {len(trades)}",
+            f"  Settled (normal) :  {len(settled_trades)}",
+            f"  Exited (early)   :  {len(exited_trades)}",
+            f"  Open / pending   :  {len(open_trades)}",
+            W,
+            "  TRADE HISTORY  (oldest → newest)",
+            W,
+        ]
+
+        running_balance = self._starting_capital
+        for i, t in enumerate(trades, 1):
+            date_str  = t.logged_at[:16].replace("T", " ")
+            side_str  = t.side.upper()
+            profit_per = 100 - t.cost_per_contract
+            cost_str  = f"paid {t.cost_per_contract}¢ × {t.count}"
+            entry_str = f"(+{profit_per}¢ profit/ea)"
+
+            pnl = t.pnl_cents
+            if pnl is not None:
+                pnl_tag = f"  P&L {_d(pnl)}"
+                running_balance += pnl
+            else:
+                pnl_tag = "  P&L pending"
+
+            bal_str = f"  balance ${running_balance / 100:.2f}"
+
+            buf.append(
+                f"  #{i:<4} {date_str}  {side_str:<3}  {t.ticker:<32}"
+                f"  {cost_str:<12}  {entry_str}"
+            )
+            buf.append(
+                f"         score={t.score:.2f}  p={t.p_estimate or '?'}"
+                f"  [{t.status_label}]{pnl_tag}{bal_str}"
+            )
+            if t.exited:
+                buf.append(
+                    f"         → exited @ {int(t.exit_pnl / t.count + t.cost_per_contract) if t.exit_pnl is not None else '?'}¢"
+                    f"  (held to expiry would be unknown until settlement)"
+                )
+            elif t.settled and t.result is not None:
+                buf.append(f"         → resolved {t.result.upper()}")
+            elif t.current_mid is not None:
+                pct = (t._unrealized_cents() / t.total_cost_cents * 100) if t.total_cost_cents > 0 else 0
+                buf.append(f"         → current exit {t.current_mid:.0f}¢  ({pct:+.0f}% on cost)")
+            buf.append("")
+
+        buf.extend([
+            S,
+            f"  Total realized gains  : {_d(realized_gains_cents)}",
+            f"  Total realized losses : {_d(realized_losses_cents)}",
+            f"  Net realized P&L      : {_d(realized_gains_cents + realized_losses_cents)}",
+            W,
+        ])
+
+        return "\n".join(buf)
