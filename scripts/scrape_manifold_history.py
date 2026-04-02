@@ -248,6 +248,7 @@ async def _fetch_market_detail(
 async def _paginate(
     session: aiohttp.ClientSession,
     out_fh: Any,
+    existing_tickers: set[str],
 ) -> tuple[int, int]:
     """Fetch all resolved binary markets and write usable ones to out_fh.
 
@@ -285,7 +286,11 @@ async def _paginate(
             # Re-validate after detail fetch (data might differ)
             if detail.get("resolution") not in ("YES", "NO"):
                 continue
-            out_fh.write(json.dumps(_extract_fields(detail)) + "\n")
+            fields = _extract_fields(detail)
+            if fields["ticker"] in existing_tickers:
+                continue
+            existing_tickers.add(fields["ticker"])
+            out_fh.write(json.dumps(fields) + "\n")
             page_written += 1
             total_written += 1
             if total_written >= MAX_MARKETS:
@@ -319,12 +324,23 @@ async def main() -> None:
     )
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing tickers to avoid overwriting or duplicating
+    existing_tickers: set[str] = set()
+    if OUTPUT_FILE.exists():
+        for line in OUTPUT_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                existing_tickers.add(json.loads(line)["ticker"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+    logging.info("Existing markets in file: %d — will append new only.", len(existing_tickers))
+
     t0 = time.monotonic()
 
     connector = aiohttp.TCPConnector(limit=DETAIL_CONCURRENCY + 5)
-    with OUTPUT_FILE.open("w", encoding="utf-8") as fh:
+    with OUTPUT_FILE.open("a", encoding="utf-8") as fh:
         async with aiohttp.ClientSession(connector=connector) as session:
-            total_seen, total_written = await _paginate(session, fh)
+            total_seen, total_written = await _paginate(session, fh, existing_tickers)
 
     elapsed = time.monotonic() - t0
     logging.info(

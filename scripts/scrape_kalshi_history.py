@@ -202,18 +202,6 @@ NUMERIC_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _is_text_market(market: dict[str, Any]) -> bool:
-    """Return True if this is a text/event market (not numeric or sports).
-
-    Checks series_ticker first.  Falls back to the ticker field itself when
-    series_ticker is empty — some Kalshi sports markets have a blank
-    series_ticker but a ticker that clearly starts with a numeric prefix.
-    """
-    series = (market.get("series_ticker") or "").upper()
-    ticker = (market.get("ticker") or "").upper()
-    check  = series if series else ticker
-    return not any(check.startswith(p) for p in NUMERIC_PREFIXES)
-
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -250,20 +238,22 @@ def _extract_fields(market: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_EVENTS_PATH = "/trade-api/v2/events"
+
+
 async def _paginate_settled(
     session: aiohttp.ClientSession,
     out_fh: Any,
+    existing_tickers: set[str],
 ) -> tuple[int, int]:
-    """Cursor-paginate all settled markets from the Kalshi API.
-
-    Filters numeric/sports markets and fully-resolved (result=yes/no) markets
-    in-flight.  Each qualifying market is written to out_fh immediately so a
-    crash mid-run does not discard already-collected pages.
+    """Page through the Events API, and for each text/event event fetch and
+    write its markets immediately.  Interleaving discovery + writing means
+    output starts appearing on the first page rather than after full discovery.
 
     Returns:
-        (total_seen, total_written) counts.
+        (total_events_processed, total_markets_written) counts.
     """
-    total_seen = 0
+    total_events = 0
     total_written = 0
     cursor: str | None = None
     page_num = 0
@@ -273,71 +263,99 @@ async def _paginate_settled(
             logging.info("Reached MAX_MARKETS=%d — stopping.", MAX_MARKETS)
             break
 
-        page_size = 100
-        params: dict[str, Any] = {"status": "settled", "limit": page_size}
+        params: dict[str, Any] = {"status": "settled", "limit": 200}
         if cursor:
             params["cursor"] = cursor
 
-        headers = generate_headers("GET", _MARKETS_PATH)
-
+        headers = generate_headers("GET", _EVENTS_PATH)
         try:
             async with session.get(
-                f"{KALSHI_API_BASE}/markets",
+                f"{KALSHI_API_BASE}/events",
                 params=params,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 429:
-                    logging.warning("Rate limited (429) — waiting 60s then retrying.")
+                    logging.warning("Rate limited (429) — waiting 60s.")
                     await asyncio.sleep(60)
                     continue
                 if resp.status == 401:
-                    logging.error(
-                        "Authentication failed (401). Check KALSHI_KEY_ID and "
-                        "KALSHI_PRIVATE_KEY_STR in your .env, and confirm "
-                        "KALSHI_ENVIRONMENT=%s is correct.",
-                        KALSHI_ENVIRONMENT,
-                    )
+                    logging.error("Auth failed (401). Check credentials.")
                     break
                 resp.raise_for_status()
                 data = await resp.json()
-        except aiohttp.ClientResponseError as exc:
-            logging.error("HTTP error %s: %s", exc.status, exc.message)
-            break
-        except aiohttp.ClientError as exc:
-            logging.error("Request error: %s", exc)
+        except (aiohttp.ClientResponseError, aiohttp.ClientError) as exc:
+            logging.warning("Events API error: %s", exc)
             break
 
-        page = data.get("markets", [])
-        if not page:
-            logging.info("Empty page — done.")
+        events = data.get("events", [])
+        if not events:
             break
 
         page_num += 1
-        total_seen += len(page)
 
-        # Filter: text/event markets with a known result only
+        # For each text/event on this page, fetch its markets immediately
         page_written = 0
-        for m in page:
-            if _is_text_market(m) and m.get("result") in ("yes", "no"):
-                out_fh.write(json.dumps(_extract_fields(m)) + "\n")
-                page_written += 1
-        out_fh.flush()  # ensure page is on disk before fetching the next
-        total_written += page_written
+        for ev in events:
+            et = (ev.get("event_ticker") or "")
+            if not et or any(et.upper().startswith(p) for p in NUMERIC_PREFIXES):
+                continue
+
+            total_events += 1
+            # Fetch all markets for this event
+            mkt_cursor: str | None = None
+            while True:
+                mparams: dict[str, Any] = {
+                    "status": "settled", "limit": 200, "event_ticker": et,
+                }
+                if mkt_cursor:
+                    mparams["cursor"] = mkt_cursor
+                mheaders = generate_headers("GET", _MARKETS_PATH)
+                try:
+                    async with session.get(
+                        f"{KALSHI_API_BASE}/markets",
+                        params=mparams,
+                        headers=mheaders,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as mr:
+                        if mr.status == 429:
+                            await asyncio.sleep(60)
+                            continue
+                        mr.raise_for_status()
+                        mdata = await mr.json()
+                except (aiohttp.ClientResponseError, aiohttp.ClientError):
+                    break
+                for m in mdata.get("markets", []):
+                    if m.get("result") in ("yes", "no"):
+                        fields = _extract_fields(m)
+                        if fields["ticker"] not in existing_tickers:
+                            existing_tickers.add(fields["ticker"])
+                            out_fh.write(json.dumps(fields) + "\n")
+                            page_written += 1
+                            total_written += 1
+                            if total_written % 50 == 0:
+                                logging.info(
+                                    "  ... %d markets written (event: %s)",
+                                    total_written, et,
+                                )
+                out_fh.flush()
+                mkt_cursor = mdata.get("cursor")
+                if not mkt_cursor:
+                    break
+                await asyncio.sleep(PAGE_DELAY)
 
         logging.info(
-            "Page %3d: %3d fetched, %3d written (total written: %d, total seen: %d)",
-            page_num, len(page), page_written, total_written, total_seen,
+            "Events page %3d | events page=%3d text=%5d | markets written this page=%3d | total=%d",
+            page_num, len(events), total_events, page_written, total_written,
         )
 
         cursor = data.get("cursor")
         if not cursor:
-            logging.info("No more pages.")
+            logging.info("No more event pages.")
             break
-
         await asyncio.sleep(PAGE_DELAY)
 
-    return total_seen, total_written
+    return total_events, total_written
 
 
 async def main() -> None:
@@ -355,13 +373,23 @@ async def main() -> None:
         )
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing tickers to avoid overwriting or duplicating
+    existing_tickers: set[str] = set()
+    if OUTPUT_FILE.exists():
+        for line in OUTPUT_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                existing_tickers.add(json.loads(line)["ticker"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+    logging.info("Existing markets in file: %d — will append new only.", len(existing_tickers))
+
     t0 = time.monotonic()
 
-    # Open for writing before pagination starts — incremental flush per page.
-    # If the script is interrupted, already-written pages are preserved.
-    with OUTPUT_FILE.open("w", encoding="utf-8") as fh:
+    # Open for appending — incremental flush per page preserves progress on crash.
+    with OUTPUT_FILE.open("a", encoding="utf-8") as fh:
         async with aiohttp.ClientSession() as session:
-            total_seen, total_written = await _paginate_settled(session, fh)
+            total_seen, total_written = await _paginate_settled(session, fh, existing_tickers)
 
     elapsed = time.monotonic() - t0
     logging.info(

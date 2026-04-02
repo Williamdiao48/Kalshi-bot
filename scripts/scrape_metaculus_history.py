@@ -148,42 +148,48 @@ def _clean_text(text: str | None) -> str | None:
 
 def _extract_fields(q: dict[str, Any]) -> dict[str, Any]:
     """Map a Metaculus question to the training record format."""
+    # Metaculus v2 API: type/resolution are nested under q["question"]
+    inner      = q.get("question") or q  # fall back to top-level for old API
     qid        = q.get("id", "")
     categories = q.get("categories") or []
     category   = _get_category(categories)
     series     = categories[0].get("slug", "") if categories else ""
-    resolution = (q.get("resolution") or "").lower()   # "yes" | "no"
+    resolution = (inner.get("resolution") or "").lower()   # "yes" | "no"
 
     return {
         "ticker":           f"MET-{qid}",
         "series_ticker":    series,
         "category":         category,
-        "title":            q.get("title", ""),
+        "title":            q.get("title", "") or inner.get("title", ""),
         "subtitle":         None,
-        "rules_primary":    _clean_text(q.get("resolution_criteria")),
-        "rules_secondary":  _clean_text(q.get("fine_print")),
+        "rules_primary":    _clean_text(q.get("resolution_criteria") or inner.get("resolution_criteria")),
+        "rules_secondary":  _clean_text(q.get("fine_print") or inner.get("fine_print")),
         "result":           resolution,
-        "open_time":        q.get("publish_time") or q.get("created_time"),
-        "close_time":       q.get("close_time"),
-        "resolution_time":  q.get("resolution_time") or q.get("close_time"),
+        "open_time":        q.get("open_time") or q.get("publish_time") or q.get("created_at"),
+        "close_time":       q.get("actual_close_time") or q.get("scheduled_close_time"),
+        "resolution_time":  q.get("actual_resolve_time") or q.get("scheduled_resolve_time"),
         "settlement_value": 1 if resolution == "yes" else 0,
     }
 
 
 def _is_usable(q: dict[str, Any]) -> bool:
     """Return True if this question is suitable for training data."""
-    # Must be a binary question resolved yes or no (not ambiguous/annulled)
-    if q.get("type") not in ("binary", None):
+    # Metaculus v2 API: type/resolution are nested under q["question"]
+    inner = q.get("question") or q
+    qtype = inner.get("type") or q.get("type")
+    if qtype not in ("binary", None):
         return False
-    resolution = (q.get("resolution") or "").lower()
+    resolution = (inner.get("resolution") or "").lower()
     if resolution not in ("yes", "no"):
         return False
     # Require minimum forecaster engagement for quality
-    forecasters = q.get("number_of_forecasters") or q.get("predictions_count") or 0
+    forecasters = (q.get("nr_forecasters") or q.get("number_of_forecasters")
+                   or q.get("forecasts_count") or q.get("predictions_count") or 0)
     if forecasters < MIN_FORECASTERS:
         return False
     # Must have a resolution date for the temporal window
-    if not (q.get("resolution_time") or q.get("close_time")):
+    if not (q.get("actual_resolve_time") or q.get("scheduled_resolve_time")
+            or q.get("resolution_time") or q.get("close_time")):
         return False
     return True
 
@@ -192,31 +198,34 @@ def _is_usable(q: dict[str, Any]) -> bool:
 # API pagination
 # ---------------------------------------------------------------------------
 
-async def _paginate(
+async def _paginate_resolution(
     session: aiohttp.ClientSession,
-    token: str,
+    headers: dict,
     out_fh: Any,
+    existing_tickers: set[str],
+    resolution: str,           # "yes" or "no"
+    max_to_write: int,
 ) -> tuple[int, int]:
-    """Fetch all resolved binary questions from Metaculus.
+    """Paginate one resolution bucket ("yes" or "no") and write usable records.
+
+    Metaculus's API no longer populates the `resolution` field in responses,
+    but filtering by `resolution=yes/no` works correctly.  We infer the answer
+    from which bucket the question came from.
 
     Returns (total_seen, total_written).
     """
-    headers = {
-        "Authorization": f"Token {token}",
-        "Accept": "application/json",
-    }
     total_seen    = 0
     total_written = 0
     offset        = 0
     page_num      = 0
 
-    while total_written < MAX_MARKETS:
+    while total_written < max_to_write:
         params = {
             "type":       "binary",
+            "resolution": resolution,
             "limit":      PAGE_SIZE,
             "offset":     offset,
         }
-
         try:
             async with session.get(
                 f"{METACULUS_API_BASE}/questions/",
@@ -225,59 +234,79 @@ async def _paginate(
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 401:
-                    logging.error(
-                        "Authentication failed (401). "
-                        "Check METACULUS_TOKEN in your .env.\n"
-                        "Get a free token at: metaculus.com/accounts/profile/"
-                    )
-                    break
+                    logging.error("Auth failed (401). Check METACULUS_TOKEN.")
+                    return total_seen, total_written
                 if resp.status == 429:
                     logging.warning("Rate limited (429) — waiting 30s.")
                     await asyncio.sleep(30)
                     continue
                 if resp.status >= 400:
                     body = await resp.text()
-                    logging.error("HTTP error %s — response body: %s", resp.status, body[:500])
-                    break
+                    logging.error("HTTP %s: %s", resp.status, body[:300])
+                    return total_seen, total_written
                 data = await resp.json()
-        except aiohttp.ClientResponseError as exc:
-            logging.error("HTTP error %s: %s", exc.status, exc.message)
-            break
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientResponseError, aiohttp.ClientError) as exc:
             logging.error("Request error: %s", exc)
-            break
+            return total_seen, total_written
 
         results = data.get("results") or []
         if not results:
-            logging.info("No more results.")
+            logging.info("resolution=%s: no more results.", resolution)
             break
 
-        page_num  += 1
+        page_num += 1
         page_written = 0
         for q in results:
             total_seen += 1
+            # Inject resolution since the API omits it from responses
+            inner = q.get("question") or q
+            inner["resolution"] = resolution
             if _is_usable(q):
-                out_fh.write(json.dumps(_extract_fields(q)) + "\n")
-                page_written += 1
-                total_written += 1
-                if total_written >= MAX_MARKETS:
-                    break
+                fields = _extract_fields(q)
+                if fields["ticker"] not in existing_tickers:
+                    existing_tickers.add(fields["ticker"])
+                    out_fh.write(json.dumps(fields) + "\n")
+                    page_written += 1
+                    total_written += 1
+                    if total_written >= max_to_write:
+                        break
         out_fh.flush()
 
         logging.info(
-            "Page %3d | offset %5d | page written: %2d | total written: %d | total seen: %d",
-            page_num, offset, page_written, total_written, total_seen,
+            "resolution=%-3s  page %3d | offset %5d | written: %2d | total: %d",
+            resolution, page_num, offset, page_written, total_written,
         )
 
-        # Check if there are more pages
         if not data.get("next"):
-            logging.info("Last page reached.")
+            logging.info("resolution=%s: last page.", resolution)
             break
 
         offset += PAGE_SIZE
         await asyncio.sleep(PAGE_DELAY)
 
     return total_seen, total_written
+
+
+async def _paginate(
+    session: aiohttp.ClientSession,
+    token: str,
+    out_fh: Any,
+    existing_tickers: set[str],
+) -> tuple[int, int]:
+    """Fetch resolved binary questions from Metaculus (yes + no buckets).
+
+    Returns (total_seen, total_written).
+    """
+    headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
+    half = MAX_MARKETS // 2
+
+    yes_seen, yes_written = await _paginate_resolution(
+        session, headers, out_fh, existing_tickers, "yes", half,
+    )
+    no_seen, no_written = await _paginate_resolution(
+        session, headers, out_fh, existing_tickers, "no", MAX_MARKETS - yes_written,
+    )
+    return yes_seen + no_seen, yes_written + no_written
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +330,22 @@ async def main() -> None:
     )
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing tickers to avoid overwriting or duplicating
+    existing_tickers: set[str] = set()
+    if OUTPUT_FILE.exists():
+        for line in OUTPUT_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                existing_tickers.add(json.loads(line)["ticker"])
+            except (json.JSONDecodeError, KeyError):
+                pass
+    logging.info("Existing markets in file: %d — will append new only.", len(existing_tickers))
+
     t0 = time.monotonic()
 
-    with OUTPUT_FILE.open("w", encoding="utf-8") as fh:
+    with OUTPUT_FILE.open("a", encoding="utf-8") as fh:
         async with aiohttp.ClientSession() as session:
-            total_seen, total_written = await _paginate(session, token, fh)
+            total_seen, total_written = await _paginate(session, token, fh, existing_tickers)
 
     elapsed = time.monotonic() - t0
     logging.info(
