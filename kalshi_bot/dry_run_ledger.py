@@ -101,7 +101,7 @@ class _Trade:
     __slots__ = (
         "trade_id", "logged_at", "ticker", "side", "count",
         "limit_price", "score", "kelly_fraction", "p_estimate",
-        "source",
+        "opportunity_kind", "source", "note",
         # exit state (loaded from DB)
         "exited", "exit_pnl", "exit_reason",
         # settlement state (loaded from DB outcome / live API)
@@ -112,20 +112,22 @@ class _Trade:
 
     def __init__(
         self,
-        trade_id:       int,
-        logged_at:      str,
-        ticker:         str,
-        side:           str,
-        count:          int,
-        limit_price:    int,
-        score:          float,
-        kelly_fraction: float | None,
-        p_estimate:     float | None,
-        outcome:        str | None = None,
-        exited_at:      str | None = None,
-        exit_pnl_cents: float | None = None,
-        exit_reason:    str | None = None,
-        source:         str | None = None,
+        trade_id:         int,
+        logged_at:        str,
+        ticker:           str,
+        side:             str,
+        count:            int,
+        limit_price:      int,
+        score:            float,
+        kelly_fraction:   float | None,
+        p_estimate:       float | None,
+        outcome:          str | None = None,
+        exited_at:        str | None = None,
+        exit_pnl_cents:   float | None = None,
+        exit_reason:      str | None = None,
+        source:           str | None = None,
+        note:             str | None = None,
+        opportunity_kind: str | None = None,
     ) -> None:
         self.trade_id       = trade_id
         self.logged_at      = logged_at
@@ -136,7 +138,9 @@ class _Trade:
         self.score          = score
         self.kelly_fraction = kelly_fraction
         self.p_estimate     = p_estimate
-        self.source         = source or ""
+        self.source           = source or ""
+        self.note             = note or ""
+        self.opportunity_kind = opportunity_kind or ""
 
         # Exit state — locked-in P&L from early exit.
         self.exited      = exited_at is not None
@@ -386,7 +390,7 @@ class DryRunLedger:
                 SELECT DISTINCT ticker FROM trades
                 WHERE mode = 'dry_run'
                   AND exit_reason IN ('stop_loss', 'trailing_stop')
-                  AND exited_at > datetime('now', ? || ' minutes')
+                  AND datetime(exited_at) > datetime('now', ? || ' minutes')
                 """,
                 (f"-{cooldown_minutes}",),
             ).fetchall()
@@ -400,7 +404,8 @@ class DryRunLedger:
                 """
                 SELECT id, logged_at, ticker, side, count, limit_price,
                        score, kelly_fraction, p_estimate, outcome,
-                       exited_at, exit_pnl_cents, exit_reason, source
+                       exited_at, exit_pnl_cents, exit_reason, source, note,
+                       opportunity_kind
                 FROM trades
                 WHERE mode = 'dry_run'
                 ORDER BY logged_at ASC
@@ -411,20 +416,22 @@ class DryRunLedger:
 
         return [
             _Trade(
-                trade_id       = row[0],
-                logged_at      = row[1],
-                ticker         = row[2],
-                side           = row[3],
-                count          = row[4],
-                limit_price    = row[5],
-                score          = row[6],
-                kelly_fraction = row[7],
-                p_estimate     = row[8],
-                outcome        = row[9],
-                exited_at      = row[10],
-                exit_pnl_cents = row[11],
-                exit_reason    = row[12],
-                source         = row[13],
+                trade_id         = row[0],
+                logged_at        = row[1],
+                ticker           = row[2],
+                side             = row[3],
+                count            = row[4],
+                limit_price      = row[5],
+                score            = row[6],
+                kelly_fraction   = row[7],
+                p_estimate       = row[8],
+                outcome          = row[9],
+                exited_at        = row[10],
+                exit_pnl_cents   = row[11],
+                exit_reason      = row[12],
+                source           = row[13],
+                note             = row[14],
+                opportunity_kind = row[15],
             )
             for row in rows
         ]
@@ -615,7 +622,8 @@ class DryRunLedger:
         ]
 
         running_balance = self._starting_capital
-        for i, t in enumerate(trades, 1):
+        for t in trades:
+            trade_label = str(t.trade_id)
             date_str  = t.logged_at[:16].replace("T", " ")
             side_str  = t.side.upper()
             profit_per = 100 - t.cost_per_contract
@@ -632,13 +640,15 @@ class DryRunLedger:
             bal_str = f"  balance ${running_balance / 100:.2f}"
 
             buf.append(
-                f"  #{i:<4} {date_str}  {side_str:<3}  {t.ticker:<32}"
+                f"  #{trade_label:<4} {date_str}  {side_str:<3}  {t.ticker:<32}"
                 f"  {cost_str:<12}  {entry_str}"
             )
             buf.append(
                 f"         score={t.score:.2f}  p={t.p_estimate or '?'}"
                 f"  [{t.status_label}]{pnl_tag}{bal_str}"
             )
+            if t.note:
+                buf.append(f"         note: {t.note}")
             if t.exited:
                 buf.append(
                     f"         → exited @ {int(t.exit_pnl / t.count + t.cost_per_contract) if t.exit_pnl is not None else '?'}¢"

@@ -40,11 +40,12 @@ Rationale for compiled-in defaults:
                             rise); give those more room.
   nws_alert          0.80 — high-confidence but not yet ground truth.
   eia                0.95 — WTI oil contracts have extreme intraday volatility
-                            but consistently converge to their true value by
+  eia_inventory      0.95   but consistently converge to their true value by
                             settlement.  Only cut if position is nearly
                             worthless (95% loss = essentially terminal).
-                            History: 3/3 stop-losses were premature — all
-                            settled as wins.
+                            History: 3/3 stop-losses on eia_inventory were
+                            premature — all settled as wins.  Raised from
+                            0.50 to 0.95 to match eia behavior.
 
 Exit columns added to the ``trades`` table
 ------------------------------------------
@@ -221,7 +222,7 @@ EXIT_PROFIT_TAKE_LONGSHOT_MULT: float = float(
 _pt_raw = os.environ.get(
     "EXIT_SOURCE_PROFIT_TAKE",
     '{"noaa_observed:yes": 0.50, "noaa_observed": 0.75, "metar:yes": 0.50, "metar": 0.80, "nws_alert": 0.80,'
-    ' "eia": 0.90, "eia_inventory": 0.70, "noaa_day2:no": 0.07, "noaa_day2_early:no": 0.07,'
+    ' "eia": 0.90, "eia_inventory": 0.90, "noaa_day2:no": 0.07, "noaa_day2_early:no": 0.07,'
     ' "noaa_day2:yes": 0.35, "noaa_day2_early:yes": 0.35,'
     ' "noaa": 0.40, "noaa_day2": 0.20, "polymarket": 0.25,'
     ' "binance": 0.35, "coinbase": 0.35}',
@@ -230,7 +231,7 @@ _sl_raw = os.environ.get(
     "EXIT_SOURCE_STOP_LOSS",
     '{"noaa_observed:yes": 0.15, "metar:yes": 0.05, "nws_climo:yes": 0.05, "nws_alert:yes": 0.05,'
     ' "noaa_observed": 0.70, "metar": 0.60, "noaa": 0.30, "owm": 0.50, "open_meteo": 0.50,'
-    ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.95, "eia_inventory": 0.50,'
+    ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.95, "eia_inventory": 0.95,'
     ' "noaa_day2:yes": 0.45, "noaa_day2_early:yes": 0.45,'
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
@@ -426,6 +427,13 @@ class ExitManager:
 
             cost = trade.total_cost_cents
             if cost <= 0:
+                continue
+
+            # Numeric markets (EIA, Fed, CPI, crypto prices, etc.) resolve on a
+            # single external data release.  Price moves before settlement are
+            # noise — thin books, not new information.  Hold all numeric trades
+            # to settlement; no stop_loss, profit_take, or trailing stop.
+            if getattr(trade, "opportunity_kind", "") == "numeric":
                 continue
 
             pnl = trade._unrealized_cents()
