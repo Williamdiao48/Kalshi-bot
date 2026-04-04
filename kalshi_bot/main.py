@@ -45,7 +45,7 @@ from .news import polymarket, metaculus, manifold, edgar, predictit
 from .dry_run_ledger import DryRunLedger
 from .opportunity_log import OpportunityLog
 from .portfolio import fetch_positions, build_position_index, summarise_portfolio
-from .trade_executor import TRADE_DRY_RUN, TradeExecutor
+from .trade_executor import TRADE_DRY_RUN, TradeExecutor, set_drawdown_factor, POLY_ENABLED
 from .scoring import (
     score_text_opportunity,
     score_numeric_opportunity,
@@ -296,9 +296,10 @@ NUMERIC_MIN_EDGE_FRACTION: float = float(os.environ.get("NUMERIC_MIN_EDGE_FRACTI
 # TEMP_FORECAST_MIN_EDGE — Minimum edge (°F) required for raw NWS forecast
 #   signals (source="noaa").  NWS day-1 forecasts have MAE ≈ 3–4°F, so a
 #   7°F edge (≈ 2σ) is the threshold where the signal likely reflects genuine
-#   information rather than forecast noise.  Raising this from the old 4°F
-#   significantly cuts the false-positive rate on temperature trades.
-TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "9.0"))
+#   information rather than forecast noise.  Downstream gates (corroboration
+#   requiring 2+ sources, score gate at 0.75) handle residual false positives;
+#   a higher threshold is no longer needed to maintain trade quality.
+TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "7.0"))
 
 # Minimum edge (°F) for observed-temperature YES signals, split by direction:
 #
@@ -2522,6 +2523,13 @@ async def _poll(
     # market every poll cycle while a dry-run position is still live.
     dry_run_held: set[str] = set()
     if TRADE_DRY_RUN and ledger is not None:
+        set_drawdown_factor(ledger.current_drawdown_factor())
+        for src, stats in ledger.source_performance_summary().items():
+            if stats["win_rate"] < 0.25 and stats["net_pnl_cents"] < 0:
+                logging.warning(
+                    "Source %s: last-20 win rate %.0f%%, P&L $%.2f — consider blocking it.",
+                    src, stats["win_rate"] * 100, stats["net_pnl_cents"] / 100,
+                )
         dry_run_held = ledger.open_tickers()
         if dry_run_held:
             logging.info(
@@ -2628,7 +2636,8 @@ async def _poll(
         existing = positions.get(opp.kalshi_ticker, {}).get("position", 0)
         _print_poly_opportunity(idx, opp, detail, score, existing_position=existing)
         opp_log.log_poly(opp, detail, score, dtc)
-        await executor.maybe_trade_poly_opportunity(session, opp, detail, score)
+        if POLY_ENABLED:
+            await executor.maybe_trade_poly_opportunity(session, opp, detail, score)
 
     # ---- spread detection (synthetic range positions) ----------------------
     # Run on the post-gate numeric opportunities so both legs have already

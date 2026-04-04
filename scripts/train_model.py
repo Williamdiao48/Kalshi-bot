@@ -283,7 +283,7 @@ def main(max_epochs: int) -> None:
         )
         val_loss, val_acc = _run_epoch(
             model, val_loader, optimizer, scheduler, device, train=False,
-            class_weights=class_weights,
+            class_weights=None,  # unweighted — honest early-stop signal
         )
         val_metrics = _evaluate_full(model, val_loader, device)
 

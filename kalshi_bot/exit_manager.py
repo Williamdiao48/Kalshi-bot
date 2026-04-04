@@ -248,12 +248,6 @@ except json.JSONDecodeError:
     logging.warning("EXIT_SOURCE_STOP_LOSS is not valid JSON — using global default.")
     EXIT_SOURCE_STOP_LOSS = {}
 
-# Minimum edge (numeric) or divergence (poly) for a counter-direction signal
-# to trigger an early exit.  0 = disabled (default).  Once enabled, set this
-# to at least the same threshold used for entry (NUMERIC_MIN_EDGE / analogues)
-# so noise signals below that floor don't force premature exits.
-# Example: COUNTER_SIGNAL_MIN_EDGE=1.0 requires the flipped signal to be at
-# least 1 unit above the strike before exiting.
 # Minimum hold time before any exit trigger (profit_take, stop_loss, trailing)
 # fires on a newly-logged position.  Prevents the exit manager from stopping out
 # a trade on the same cycle it was entered — which happens when the current
@@ -264,8 +258,33 @@ EXIT_MIN_HOLD_MINUTES: float = float(
     os.environ.get("EXIT_MIN_HOLD_MINUTES", "2.0")
 )
 
+# Counter-signal exit: exit a position when live forecast data has flipped
+# direction against the open trade.
+#
+# COUNTER_SIGNAL_MIN_EDGE — minimum edge (°F for temp, % for crypto/forex) that
+#   the new counter-direction signal must exceed.  Set well above the entry
+#   threshold so marginal model disagreements don't force premature exits.
+#   Default 6.0 — a 6°F opposite-direction edge is roughly 2× the minimum
+#   entry edge (5°F), meaning the forecast has shifted convincingly past the
+#   strike in the wrong direction.  0 = disabled.
+#
+# COUNTER_SIGNAL_MIN_SOURCES — number of independent forecast sources that must
+#   simultaneously show a counter-direction signal with edge ≥ MIN_EDGE.
+#   Default 2: requires at least two models (e.g. HRRR + NWS hourly) to agree
+#   before exiting.  A single outlier model never triggers an exit.
+#
+# COUNTER_SIGNAL_MAX_PROFIT_PCT — if the position is already up by this fraction
+#   of cost, skip the counter-signal exit.  The trailing stop will handle
+#   re-entry of profits without abandoning a near-settled winner.
+#   Default 0.40 (40% gain).  Set to 1.0 to disable this guard.
 COUNTER_SIGNAL_MIN_EDGE: float = float(
-    os.environ.get("COUNTER_SIGNAL_MIN_EDGE", "0")
+    os.environ.get("COUNTER_SIGNAL_MIN_EDGE", "6.0")
+)
+COUNTER_SIGNAL_MIN_SOURCES: int = int(
+    os.environ.get("COUNTER_SIGNAL_MIN_SOURCES", "2")
+)
+COUNTER_SIGNAL_MAX_PROFIT_PCT: float = float(
+    os.environ.get("COUNTER_SIGNAL_MAX_PROFIT_PCT", "0.40")
 )
 
 _ORDERS_PATH = "/trade-api/v2/orders"
@@ -595,29 +614,41 @@ class ExitManager:
                     pass
 
             # ---- Numeric counter-signal check --------------------------------
-            for opp in numeric_lookup.get(trade.ticker, []):
-                if opp.edge < COUNTER_SIGNAL_MIN_EDGE:
-                    continue
-                flipped = (
-                    (trade.side == "yes" and opp.implied_outcome == "NO") or
-                    (trade.side == "no"  and opp.implied_outcome == "YES")
-                )
-                if not flipped:
-                    continue
+            # Require COUNTER_SIGNAL_MIN_SOURCES independent models to agree
+            # on a counter-direction signal before exiting.  A single outlier
+            # model (e.g. one HRRR update) can never force an exit alone.
+            # Also skip if the position is already deep in profit — the trailing
+            # stop will protect those gains without abandoning a near-settled
+            # winner on a late noisy signal.
+            pnl_cs = trade._unrealized_cents()
+            profit_pct = pnl_cs / max(trade.total_cost_cents, 1)
+            if profit_pct <= COUNTER_SIGNAL_MAX_PROFIT_PCT:
+                counter_sources: list[str] = []
+                for opp in numeric_lookup.get(trade.ticker, []):
+                    if opp.edge < COUNTER_SIGNAL_MIN_EDGE:
+                        continue
+                    flipped = (
+                        (trade.side == "yes" and opp.implied_outcome == "NO") or
+                        (trade.side == "no"  and opp.implied_outcome == "YES")
+                    )
+                    if flipped:
+                        counter_sources.append(opp.source)
 
-                pnl = trade._unrealized_cents()
-                logging.info(
-                    "[COUNTER-SIGNAL] trade #%d %s %s"
-                    " — data now implies %s  (edge=%.3f >= min=%.3f)",
-                    trade.trade_id, trade.side.upper(), trade.ticker,
-                    opp.implied_outcome, opp.edge, COUNTER_SIGNAL_MIN_EDGE,
-                )
-                event = await self._execute_exit(
-                    session, trade, pnl, "counter_signal"
-                )
-                events.append(event)
-                exited_ids.add(trade.trade_id)
-                break  # one exit per trade; stop checking further opps
+                if len(counter_sources) >= COUNTER_SIGNAL_MIN_SOURCES:
+                    logging.info(
+                        "[COUNTER-SIGNAL] trade #%d %s %s"
+                        " — %d sources imply %s (edge>=%.1f): %s",
+                        trade.trade_id, trade.side.upper(), trade.ticker,
+                        len(counter_sources),
+                        "NO" if trade.side == "yes" else "YES",
+                        COUNTER_SIGNAL_MIN_EDGE,
+                        ", ".join(counter_sources),
+                    )
+                    event = await self._execute_exit(
+                        session, trade, pnl_cs, "counter_signal"
+                    )
+                    events.append(event)
+                    exited_ids.add(trade.trade_id)
 
             if trade.trade_id in exited_ids:
                 continue  # already handled above

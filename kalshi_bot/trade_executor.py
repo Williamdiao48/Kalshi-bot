@@ -133,10 +133,13 @@ TRADE_DRY_RUN: bool = os.environ.get("TRADE_DRY_RUN", "true").lower() != "false"
 TRADE_MAX_CONTRACTS: int = int(os.environ.get("TRADE_MAX_CONTRACTS", "10"))
 
 # Minimum composite score required to attempt a trade.
-# Raised from 0.50 → 0.65: the 0.50–0.65 score band had a <5% settled win
-# rate across 136 trades and was net negative P&L.  Only the 0.65+ band
-# shows meaningful edge; the lower range was producing stop-loss fodder.
-TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.65"))
+# Raised 0.50 → 0.65 → 0.75: each band below the current threshold showed
+# near-zero win rate and negative P&L across all resolved trades.
+#   0.65–0.70: 35 trades, 2.86% win rate, -$3.80 (polymarket-free)
+#   0.70–0.75: 26 trades, 11.54% win rate, -$7.31 (polymarket-free)
+# Recent 14-day data confirms: <0.75 is 0% win rate, -$2.80.
+# The 0.75–0.80 band shows 63–83% win rate in both windows.
+TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.75"))
 
 # Higher minimum score for forex (rate_eur_usd, rate_usd_jpy) markets.
 # Forex short-duration contracts are driven by intraday moves that the ECB
@@ -162,6 +165,22 @@ POLY_MAX_OPEN_PER_UNDERLYING: int = int(
     os.environ.get("POLY_MAX_OPEN_PER_UNDERLYING", "1")
 )
 
+# Enable/disable polymarket (and Metaculus/Manifold/PredictIt) trade execution.
+# Disabled by default: 67 dry-run trades at 21% win rate produced -$15.04 P&L
+# even with POLY_MIN_SCORE=0.82.  The text-similarity matching introduces too
+# much noise.  Re-enable with POLY_ENABLED=true once matching quality improves.
+POLY_ENABLED: bool = os.environ.get("POLY_ENABLED", "false").lower() == "true"
+
+# Metrics to skip entirely, regardless of score or edge.
+# Comma-separated.  Based on observed 0% win rate across all dry-run trades.
+# price_doge: 0W/5L (-$1.00).  rate_usd: 0W/5L (-$3.74).
+# Override via BLOCKED_METRICS env var (empty string to disable).
+BLOCKED_METRICS: set[str] = set(
+    m.strip()
+    for m in os.environ.get("BLOCKED_METRICS", "rate_usd,price_doge").split(",")
+    if m.strip()
+)
+
 # Score threshold for "patient" limit entry — posts one tick inside the bid
 # (bid+1¢) rather than at the midpoint.  Only applies to non-urgent sources;
 # urgent sources (noaa_observed, binance) always cross the spread immediately.
@@ -180,6 +199,27 @@ PASSIVE_PATIENT_SCORE_THRESHOLD: float = float(
 # Maximum dollars (in cents) to allocate to a single trade.  Kelly fraction
 # scales down from this ceiling.  Default $5.00 = 500 cents.
 MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "500"))
+
+# Drawdown-based position scaling.
+# When the equity curve falls below its peak, MAX_POSITION_CENTS is multiplied
+# by a factor that decays linearly from 1.0 (at 0% drawdown) to
+# DRAWDOWN_MIN_FACTOR (at DRAWDOWN_FULL_REDUCE_PCT drawdown or worse).
+# This reduces exposure during losing streaks and restores it automatically
+# as equity recovers.  Set DRAWDOWN_SCALING_ENABLED=false to disable.
+DRAWDOWN_FULL_REDUCE_PCT: float = float(os.environ.get("DRAWDOWN_FULL_REDUCE_PCT", "0.20"))
+DRAWDOWN_MIN_FACTOR: float      = float(os.environ.get("DRAWDOWN_MIN_FACTOR",       "0.25"))
+DRAWDOWN_ENABLED: bool          = os.environ.get("DRAWDOWN_SCALING_ENABLED", "true").lower() == "true"
+
+# Module-level drawdown factor, updated each cycle by main.py via
+# set_drawdown_factor().  Applied to pos_max_cents in all trade paths.
+_dd_factor: float = 1.0
+
+
+def set_drawdown_factor(factor: float) -> None:
+    """Update the global drawdown sizing factor.  Called once per poll cycle."""
+    global _dd_factor
+    _dd_factor = max(DRAWDOWN_MIN_FACTOR, min(1.0, factor))
+
 
 # Fractional Kelly multiplier.  1.0 = full Kelly (aggressive).
 # 0.25 = quarter-Kelly (conservative, recommended before calibration).
@@ -205,6 +245,12 @@ LOCKED_OBS_MAX_POSITION_CENTS: int = int(os.environ.get("LOCKED_OBS_MAX_POSITION
 LOCKED_OBS_KELLY_FRACTION: float    = float(os.environ.get("LOCKED_OBS_KELLY_FRACTION",  "0.75"))
 LOCKED_OBS_MAX_CONTRACTS: int       = int(os.environ.get("LOCKED_OBS_MAX_CONTRACTS",      "30"))
 _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({"noaa_observed", "metar", "nws_climo", "nws_alert"})
+
+# Maximum concurrent open positions allowed on the same underlying prefix
+# when entering same-direction adjacent strikes.  Prevents unlimited stacking
+# while allowing the bot to capture edge on 2-3 strikes of a temp ladder.
+# Set to 1 to restore the old behavior (single position per underlying).
+MAX_SAME_UNDERLYING_OPEN: int = int(os.environ.get("MAX_SAME_UNDERLYING_OPEN", "3"))
 
 # Score-weighted position sizing.  When enabled, the Kelly count is multiplied
 # by (score − TRADE_MIN_SCORE) / (1.0 − TRADE_MIN_SCORE), linearly scaling
@@ -278,7 +324,7 @@ ADVERSE_PEAK_SOURCES: frozenset[str] = frozenset(
 # NWS day-1 forecasts have MAE ≈ 3–4°F, so edges smaller than this are
 # within normal forecast noise and carry no real signal.
 # Set to 0 to disable. Only applies to "temp_high" metrics.
-NUMERIC_MIN_TEMP_EDGE: float = float(os.environ.get("NUMERIC_MIN_TEMP_EDGE", "4.0"))
+NUMERIC_MIN_TEMP_EDGE: float = float(os.environ.get("NUMERIC_MIN_TEMP_EDGE", "5.0"))
 
 # Late-day UTC hour cutoff for daily temperature-high NO trades.
 # After this UTC hour the daily maximum temperature for US ET cities is
@@ -904,6 +950,13 @@ class TradeExecutor:
             self.stats.filtered_score += 1
             return
 
+        if BLOCKED_METRICS and opp.metric in BLOCKED_METRICS:
+            logging.debug(
+                "Trade skip (metric %s in BLOCKED_METRICS): %s",
+                opp.metric, opp.market_ticker,
+            )
+            return
+
         if opp.implied_outcome not in ("YES", "NO"):
             logging.debug(
                 "Trade skip (implied_outcome=%s, no clear edge): %s",
@@ -1149,6 +1202,7 @@ class TradeExecutor:
         pos_max_cents  = LOCKED_OBS_MAX_POSITION_CENTS if _is_locked_obs else MAX_POSITION_CENTS
         pos_kelly      = LOCKED_OBS_KELLY_FRACTION     if _is_locked_obs else effective_kelly
         pos_hard_cap   = LOCKED_OBS_MAX_CONTRACTS      if _is_locked_obs else TRADE_MAX_CONTRACTS
+        pos_max_cents  = max(1, int(pos_max_cents * _dd_factor))
 
         count = kelly_contracts(
             win_prob=win_prob,
@@ -1210,25 +1264,43 @@ class TradeExecutor:
                 opp.market_ticker, cross_strike=_cross_strike
             )
             if last_time is not None:
-                age_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
-                # Three-tier cooldown: open position → full; exited same side → short;
-                # exited opposite side (direction flip) → medium.
-                if not last_exited:
-                    effective_cooldown = TRADE_TICKER_COOLDOWN_MINUTES
-                elif last_side == side:
-                    effective_cooldown = TRADE_TICKER_COOLDOWN_EXITED_MINUTES
+                # Same-side open trade on a different strike of the same underlying =
+                # a complementary position, not a direction flip.  Bypass the time-based
+                # cooldown; enforce a per-underlying cap instead.
+                _same_side_open_complement = (
+                    _cross_strike and not last_exited and last_side == side
+                )
+                if _same_side_open_complement:
+                    _underlying_prefix = opp.market_ticker.rsplit("-", 1)[0] + "-"
+                    _open_count = self._count_open_on_underlying(_underlying_prefix)
+                    if _open_count >= MAX_SAME_UNDERLYING_OPEN:
+                        logging.info(
+                            "Trade skip (underlying cap %d/%d open): %s",
+                            _open_count, MAX_SAME_UNDERLYING_OPEN, opp.market_ticker,
+                        )
+                        self.stats.filtered_ticker_cool += 1
+                        return
+                    # else: fall through — allow the complementary same-direction trade
                 else:
-                    effective_cooldown = TRADE_TICKER_COOLDOWN_FLIP_MINUTES
-                if age_minutes < effective_cooldown:
-                    logging.info(
-                        "Trade skip (ticker cooldown %.0f min remaining,"
-                        " last=%s→new=%s exited=%s): %s",
-                        effective_cooldown - age_minutes,
-                        last_side or "?", side, last_exited,
-                        opp.market_ticker,
-                    )
-                    self.stats.filtered_ticker_cool += 1
-                    return
+                    age_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
+                    # Three-tier cooldown: open position → full; exited same side → short;
+                    # exited opposite side (direction flip) → medium.
+                    if not last_exited:
+                        effective_cooldown = TRADE_TICKER_COOLDOWN_MINUTES
+                    elif last_side == side:
+                        effective_cooldown = TRADE_TICKER_COOLDOWN_EXITED_MINUTES
+                    else:
+                        effective_cooldown = TRADE_TICKER_COOLDOWN_FLIP_MINUTES
+                    if age_minutes < effective_cooldown:
+                        logging.info(
+                            "Trade skip (ticker cooldown %.0f min remaining,"
+                            " last=%s→new=%s exited=%s): %s",
+                            effective_cooldown - age_minutes,
+                            last_side or "?", side, last_exited,
+                            opp.market_ticker,
+                        )
+                        self.stats.filtered_ticker_cool += 1
+                        return
 
         if TEMP_HIGH_NO_CUTOFF_UTC > 0 and side == "no" and "KXHIGH" in opp.market_ticker:
             # Block NO entries on daily temp-high markets after the cutoff hour.
@@ -1409,7 +1481,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=win_prob,
             cost_cents=cost_cents,
-            max_cents=MAX_POSITION_CENTS,
+            max_cents=max(1, int(MAX_POSITION_CENTS * _dd_factor)),
             kelly_fraction=KELLY_FRACTION,  # poly trades use standard fraction (no score tiering)
             hard_cap=TRADE_MAX_CONTRACTS,
         )
@@ -1946,7 +2018,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=p_win,
             cost_cents=signal.no_ask,
-            max_cents=LOCKED_OBS_MAX_POSITION_CENTS,
+            max_cents=max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor)),
             kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
             hard_cap=LOCKED_OBS_MAX_CONTRACTS,
         )
@@ -2208,6 +2280,14 @@ class TradeExecutor:
             tripped_until.strftime("%Y-%m-%d %H:%M"),
         )
         return True
+
+    def _count_open_on_underlying(self, underlying_prefix: str) -> int:
+        """Count open (not yet exited) trades on any strike of the given underlying prefix."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE ticker LIKE ? AND exited_at IS NULL",
+            (underlying_prefix + "%",),
+        ).fetchone()
+        return row[0] if row else 0
 
     def _last_trade_context(
         self, ticker: str, cross_strike: bool = True

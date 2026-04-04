@@ -36,8 +36,10 @@ Environment variables
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -331,6 +333,84 @@ def _section(
 
 
 # ---------------------------------------------------------------------------
+# Risk metrics
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_STARTING_CAPITAL: float = float(os.environ.get("DRY_RUN_STARTING_CAPITAL", "100")) * 100
+
+
+def _compute_risk_metrics(trades: list[_ResolvedTrade]) -> dict:
+    """Compute risk-adjusted return metrics over a list of resolved trades.
+
+    Returns a dict with keys: n, sharpe, sortino, max_dd, win_rate, wins,
+    losses, avg_gain, avg_loss, profit_factor.  Returns empty dict if fewer
+    than 5 trades are provided.
+    """
+    if len(trades) < 5:
+        return {}
+
+    starting = _ANALYTICS_STARTING_CAPITAL
+    pnl_list = [t.pnl_cents for t in trades]
+    costs    = [
+        (t.limit_price if t.side == "yes" else (100 - t.limit_price)) * t.count
+        for t in trades
+    ]
+    returns  = [
+        pnl / cost for pnl, cost in zip(pnl_list, costs) if cost > 0
+    ]
+
+    if len(returns) < 5:
+        return {}
+
+    # Equity curve and max drawdown
+    equity = starting
+    peak   = equity
+    max_dd = 0.0
+    for pnl in pnl_list:
+        equity += pnl
+        peak    = max(peak, equity)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - equity) / peak)
+
+    # Annualisation based on date range
+    n = len(returns)
+    try:
+        t0 = datetime.fromisoformat(trades[0].logged_at.replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(trades[-1].logged_at.replace("Z", "+00:00"))
+        years = max((t1 - t0).total_seconds() / 31_557_600, 1 / 365)
+        tpy   = n / years
+    except (ValueError, AttributeError):
+        tpy = 365.0
+
+    mean_r = statistics.mean(returns)
+    std_r  = statistics.pstdev(returns)
+    sharpe = (mean_r / std_r * math.sqrt(tpy)) if std_r > 0 else None
+
+    neg     = [r for r in returns if r < 0]
+    dn_std  = statistics.pstdev(neg) if len(neg) >= 2 else 0.0
+    sortino = (mean_r / dn_std * math.sqrt(tpy)) if dn_std > 0 else None
+
+    wins     = [p for p in pnl_list if p > 0]
+    loss     = [p for p in pnl_list if p <= 0]
+    gain_sum = sum(wins)
+    loss_sum = abs(sum(loss))
+    pf       = gain_sum / loss_sum if loss_sum > 0 else None
+
+    return {
+        "n":             n,
+        "sharpe":        sharpe,
+        "sortino":       sortino,
+        "max_dd":        max_dd,
+        "win_rate":      len(wins) / n,
+        "wins":          len(wins),
+        "losses":        len(loss),
+        "avg_gain":      statistics.mean(wins) if wins else 0.0,
+        "avg_loss":      statistics.mean(loss) if loss else 0.0,
+        "profit_factor": pf,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -411,6 +491,22 @@ def _build_report(
         f"  Overall win rate: {overall_wr * 100:.1f}%",
         f"  Net P&L         : {_fmt_pnl(total_pnl)}",
     ]
+
+    rm = _compute_risk_metrics(trades)
+    if rm:
+        def _pct(v: float) -> str: return f"{v * 100:.1f}%"
+        def _opt(v: object, fmt: str) -> str: return fmt % v if v is not None else "n/a"
+        lines += [
+            "",
+            "  Risk metrics:",
+            f"    Sharpe ratio   : {_opt(rm['sharpe'],  '%.2f')}  (annualized per-trade)",
+            f"    Sortino ratio  : {_opt(rm['sortino'], '%.2f')}",
+            f"    Max drawdown   : -{_pct(rm['max_dd'])}",
+            f"    Win rate       : {_pct(rm['win_rate'])}  ({rm['wins']}W / {rm['losses']}L)",
+            f"    Avg gain       : {_fmt_pnl(rm['avg_gain'])}",
+            f"    Avg loss       : {_fmt_pnl(rm['avg_loss'])}",
+            f"    Profit factor  : {_opt(rm['profit_factor'], '%.2f')}",
+        ]
 
     # --- By metric category ---
     lines += _section(

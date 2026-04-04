@@ -66,8 +66,10 @@ with exit event data in the ``trades`` table, it enables queries such as:
 """
 
 import logging
+import math
 import os
 import sqlite3
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -88,7 +90,12 @@ OVERVIEW_PATH: Path = Path(
     os.environ.get("DRY_RUN_OVERVIEW_PATH", str(_DEFAULT_OVERVIEW_PATH))
 )
 
-from .trade_executor import TRADE_DRY_RUN
+from .trade_executor import (
+    TRADE_DRY_RUN,
+    DRAWDOWN_FULL_REDUCE_PCT,
+    DRAWDOWN_MIN_FACTOR,
+    DRAWDOWN_ENABLED,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +381,193 @@ class DryRunLedger:
         except Exception:
             return set()
 
+    def _compute_risk_metrics(self, trades: list["_Trade"]) -> dict:
+        """Compute risk-adjusted return metrics over resolved (settled + exited) trades.
+
+        Returns a dict with keys: n, sharpe, sortino, max_dd, current_dd,
+        win_rate, wins, losses, avg_gain, avg_loss, profit_factor.
+        Returns empty dict if fewer than 5 resolved trades exist.
+        """
+        resolved = [
+            t for t in trades
+            if (t.exited or (t.settled and t.result is not None))
+            and t.total_cost_cents > 0
+        ]
+        if len(resolved) < 5:
+            return {}
+
+        pnl_list: list[float] = []
+        returns:  list[float] = []
+        for t in resolved:
+            pnl = t.exit_pnl if t.exited else t._realized_cents()
+            if pnl is None:
+                continue
+            pnl_list.append(pnl)
+            returns.append(pnl / t.total_cost_cents)
+
+        if len(returns) < 5:
+            return {}
+
+        # Equity curve and drawdown
+        equity = float(self._starting_capital)
+        peak   = equity
+        max_dd = 0.0
+        for pnl in pnl_list:
+            equity += pnl
+            peak    = max(peak, equity)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - equity) / peak)
+        current_dd = max(0.0, (peak - equity) / peak) if peak > 0 else 0.0
+
+        # Annualisation factor based on actual date range
+        n = len(returns)
+        try:
+            t0 = datetime.fromisoformat(resolved[0].logged_at.replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(resolved[-1].logged_at.replace("Z", "+00:00"))
+            years = max((t1 - t0).total_seconds() / 31_557_600, 1 / 365)
+            tpy   = n / years
+        except (ValueError, AttributeError):
+            tpy = 365.0
+
+        mean_r = statistics.mean(returns)
+        std_r  = statistics.pstdev(returns)
+        sharpe = (mean_r / std_r * math.sqrt(tpy)) if std_r > 0 else None
+
+        neg     = [r for r in returns if r < 0]
+        dn_std  = statistics.pstdev(neg) if len(neg) >= 2 else 0.0
+        sortino = (mean_r / dn_std * math.sqrt(tpy)) if dn_std > 0 else None
+
+        wins = [p for p in pnl_list if p > 0]
+        loss = [p for p in pnl_list if p <= 0]
+        gain_sum = sum(wins)
+        loss_sum = abs(sum(loss))
+        pf = gain_sum / loss_sum if loss_sum > 0 else None
+
+        return {
+            "n":             n,
+            "sharpe":        sharpe,
+            "sortino":       sortino,
+            "max_dd":        max_dd,
+            "current_dd":    current_dd,
+            "win_rate":      len(wins) / n,
+            "wins":          len(wins),
+            "losses":        len(loss),
+            "avg_gain":      statistics.mean(wins) if wins else 0.0,
+            "avg_loss":      statistics.mean(loss) if loss else 0.0,
+            "profit_factor": pf,
+        }
+
+    def current_drawdown_factor(self) -> float:
+        """Return a position-size multiplier in [DRAWDOWN_MIN_FACTOR, 1.0].
+
+        Reads resolved trades from the DB, builds the equity curve, and maps
+        the current drawdown linearly to a sizing factor.  Returns 1.0 (no
+        scaling) when drawdown scaling is disabled or fewer than 5 resolved
+        trades exist.
+        """
+        if not DRAWDOWN_ENABLED:
+            return 1.0
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT exit_pnl_cents, outcome, side, count, limit_price
+                FROM trades
+                WHERE mode = 'dry_run'
+                  AND (outcome IN ('won', 'lost') OR exited_at IS NOT NULL)
+                  AND outcome IS NOT 'void'
+                ORDER BY logged_at ASC
+                """
+            ).fetchall()
+        except Exception:
+            return 1.0
+
+        if len(rows) < 5:
+            return 1.0
+
+        equity = float(self._starting_capital)
+        peak   = equity
+        for exit_pnl, outcome, side, count, limit_price in rows:
+            if exit_pnl is not None:
+                pnl = float(exit_pnl)
+            elif outcome == "won":
+                pnl = float((100 - limit_price) * count if side == "yes" else limit_price * count)
+            elif outcome == "lost":
+                pnl = float(-limit_price * count if side == "yes" else -(100 - limit_price) * count)
+            else:
+                continue
+            equity += pnl
+            peak    = max(peak, equity)
+
+        if peak <= 0:
+            return DRAWDOWN_MIN_FACTOR
+
+        current_dd = max(0.0, (peak - equity) / peak)
+        if current_dd <= 0:
+            return 1.0
+
+        # Linear: 0% drawdown → 1.0, DRAWDOWN_FULL_REDUCE_PCT → DRAWDOWN_MIN_FACTOR
+        t      = min(1.0, current_dd / DRAWDOWN_FULL_REDUCE_PCT)
+        factor = 1.0 - t * (1.0 - DRAWDOWN_MIN_FACTOR)
+        factor = max(DRAWDOWN_MIN_FACTOR, factor)
+        logging.info(
+            "Drawdown scaling: equity %.1f%% below peak → sizing at %.0f%% of normal",
+            current_dd * 100, factor * 100,
+        )
+        return factor
+
+    def source_performance_summary(self, n_recent: int = 20) -> dict[str, dict]:
+        """Return per-source performance stats over the last n_recent resolved trades.
+
+        Returns a dict keyed by source with:
+          n            — total resolved trades for this source
+          win_rate     — fraction of trades that were wins (pnl > 0)
+          net_pnl_cents — sum of P&L in cents
+        Only sources with ≥3 resolved trades are included.
+        """
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT COALESCE(source, 'unknown') as src,
+                       side, "count", limit_price, outcome, exit_reason,
+                       exit_pnl_cents
+                FROM trades
+                WHERE mode = 'dry_run'
+                  AND (outcome IS NOT NULL OR exited_at IS NOT NULL)
+                  AND outcome IS NOT 'void'
+                ORDER BY logged_at ASC
+                """
+            ).fetchall()
+        except Exception:
+            return {}
+
+        # Build per-source lists of (is_win, pnl_cents)
+        from collections import defaultdict
+        buckets: dict[str, list[tuple[bool, float]]] = defaultdict(list)
+        for src, side, count, limit_price, outcome, exit_reason, exit_pnl in rows:
+            if exit_pnl is not None:
+                pnl = float(exit_pnl)
+            elif outcome == "won":
+                pnl = float((100 - limit_price) * count if side == "yes" else limit_price * count)
+            elif outcome == "lost":
+                pnl = float(-limit_price * count if side == "yes" else -(100 - limit_price) * count)
+            else:
+                continue
+            buckets[src].append((pnl > 0, pnl))
+
+        result: dict[str, dict] = {}
+        for src, records in buckets.items():
+            if len(records) < 3:
+                continue
+            recent = records[-n_recent:]
+            wins = sum(1 for is_win, _ in recent if is_win)
+            net_pnl = sum(pnl for _, pnl in recent)
+            result[src] = {
+                "n": len(records),
+                "win_rate": wins / len(recent),
+                "net_pnl_cents": net_pnl,
+            }
+        return result
+
     def recently_exited_tickers(self, cooldown_minutes: int) -> set[str]:
         """Return tickers exited via stop_loss or trailing_stop within cooldown_minutes.
 
@@ -617,9 +811,31 @@ class DryRunLedger:
             f"  Exited (early)   :  {len(exited_trades)}",
             f"  Open / pending   :  {len(open_trades)}",
             W,
+        ]
+
+        rm = self._compute_risk_metrics(trades)
+        if rm:
+            def _pct(v: float) -> str: return f"{v * 100:.1f}%"
+            def _opt(v: object, fmt: str) -> str: return fmt % v if v is not None else "n/a"
+            buf.extend([
+                "  RISK METRICS",
+                S,
+                f"  Resolved trades  :  {rm['n']}",
+                f"  Sharpe ratio     :  {_opt(rm['sharpe'],  '%.2f')}  (annualized per-trade)",
+                f"  Sortino ratio    :  {_opt(rm['sortino'], '%.2f')}",
+                f"  Max drawdown     :  -{_pct(rm['max_dd'])}  (from equity peak)",
+                f"  Current drawdown :  -{_pct(rm['current_dd'])}",
+                f"  Win rate         :  {_pct(rm['win_rate'])}  ({rm['wins']}W / {rm['losses']}L)",
+                f"  Avg gain         :  {_d(rm['avg_gain'])}",
+                f"  Avg loss         :  {_d(rm['avg_loss'])}",
+                f"  Profit factor    :  {_opt(rm['profit_factor'], '%.2f')}  (total gains / total losses)",
+                W,
+            ])
+
+        buf.extend([
             "  TRADE HISTORY  (oldest → newest)",
             W,
-        ]
+        ])
 
         running_balance = self._starting_capital
         for t in trades:
