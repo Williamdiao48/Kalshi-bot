@@ -302,18 +302,20 @@ def main() -> None:
     ]
     kept = [p for p in all_pairs if p.get("kept")]
     kept.sort(key=lambda p: float(p.get("claude_score") or 0), reverse=True)
-    candidates = kept[:MAX_PAIRS]
-    logging.info(
-        "Total kept pairs: %d. Processing top %d by heuristic score.",
-        len(kept), len(candidates),
-    )
 
+    # Filter already-done pairs BEFORE applying MAX_PAIRS so that each run
+    # processes the next batch of top-scored pairs rather than re-selecting
+    # the same top-N and finding them all done.
     done = _load_done_pairs(OUTPUT_FILE)
-    remaining = [
-        p for p in candidates
+    remaining_all = [
+        p for p in kept
         if (p.get("market_ticker", ""), p.get("article_url", "")) not in done
     ]
-    logging.info("Already labeled: %d. Remaining: %d.", len(done), len(remaining))
+    remaining = remaining_all[:MAX_PAIRS]
+    logging.info(
+        "Total kept: %d. Already labeled: %d. Queued this session: %d (of %d remaining).",
+        len(kept), len(done), len(remaining), len(remaining_all),
+    )
 
     if not remaining:
         logging.info("Nothing to do.")

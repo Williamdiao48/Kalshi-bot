@@ -197,8 +197,10 @@ PASSIVE_PATIENT_SCORE_THRESHOLD: float = float(
 )
 
 # Maximum dollars (in cents) to allocate to a single trade.  Kelly fraction
-# scales down from this ceiling.  Default $5.00 = 500 cents.
-MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "500"))
+# scales down from this ceiling.  Default $7.50 = 750 cents.
+# Raised from $5.00 after last-10-trade WR hit 80% (+$3.40 net); revisit at
+# $10.00 after another 20 trades sustain ≥55% WR.
+MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "750"))
 
 # Drawdown-based position scaling.
 # When the equity curve falls below its peak, MAX_POSITION_CENTS is multiplied
@@ -209,6 +211,12 @@ MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "500"))
 DRAWDOWN_FULL_REDUCE_PCT: float = float(os.environ.get("DRAWDOWN_FULL_REDUCE_PCT", "0.20"))
 DRAWDOWN_MIN_FACTOR: float      = float(os.environ.get("DRAWDOWN_MIN_FACTOR",       "0.25"))
 DRAWDOWN_ENABLED: bool          = os.environ.get("DRAWDOWN_SCALING_ENABLED", "true").lower() == "true"
+# How many recent resolved trades to use when computing the drawdown equity curve.
+# Using all-time history unfairly penalises sizing for losses incurred when the
+# bot's signal quality was much lower (e.g. pre-score-gate legacy trades).
+# Default 50: covers ~5–7 weeks of recent history at current trade frequency.
+# Set to 0 to use all-time history (original behaviour).
+DRAWDOWN_LOOKBACK_TRADES: int = int(os.environ.get("DRAWDOWN_LOOKBACK_TRADES", "50"))
 
 # Module-level drawdown factor, updated each cycle by main.py via
 # set_drawdown_factor().  Applied to pos_max_cents in all trade paths.
@@ -555,7 +563,10 @@ CREATE TABLE IF NOT EXISTS trades (
     order_id         TEXT,               -- Kalshi order ID (live only; NULL in dry-run)
     error_msg        TEXT,               -- populated on status = 'error'; NULL otherwise
     source           TEXT,               -- data source that triggered the trade
-    outcome          TEXT                -- 'won' | 'lost' | 'void' (NULL = unresolved)
+    outcome          TEXT,               -- 'won' | 'lost' | 'void' (NULL = unresolved)
+    market_p_entry   REAL,               -- (yes_bid + yes_ask) / 200 at entry; for calibration
+    yes_bid_entry    INTEGER,            -- yes_bid cents at entry
+    yes_ask_entry    INTEGER             -- yes_ask cents at entry
 )
 """
 
@@ -880,6 +891,9 @@ class TradeExecutor:
             ("outcome",          "TEXT"),
             ("fill_price_cents", "INTEGER"),  # actual fill price from Kalshi (live only)
             ("spread_id",        "TEXT"),     # UUID shared by both legs of a spread trade
+            ("market_p_entry",   "REAL"),     # (yes_bid + yes_ask) / 200 at entry
+            ("yes_bid_entry",    "INTEGER"),  # yes_bid cents at entry
+            ("yes_ask_entry",    "INTEGER"),  # yes_ask cents at entry
         ]:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
@@ -1377,6 +1391,8 @@ class TradeExecutor:
             score=score,
             p_estimate=p,
             source=opp.source,
+            yes_bid=int(detail["yes_bid"]) if detail and detail.get("yes_bid") is not None else None,
+            yes_ask=int(detail["yes_ask"]) if detail and detail.get("yes_ask") is not None else None,
         )
 
     async def maybe_trade_poly_opportunity(
@@ -2528,6 +2544,8 @@ class TradeExecutor:
         p_estimate: float,
         source: str = "",
         spread_id: str | None = None,
+        yes_bid: int | None = None,
+        yes_ask: int | None = None,
     ) -> None:
         """Place the order (or log it in dry-run mode) and persist to SQLite."""
         mode = "dry_run" if self._dry_run else "live"
@@ -2551,18 +2569,25 @@ class TradeExecutor:
                 session, ticker, side, count, limit_price
             )
 
+        market_p_entry = (
+            (float(yes_bid) + float(yes_ask)) / 200.0
+            if yes_bid is not None and yes_ask is not None else None
+        )
+
         self._conn.execute(
             """
             INSERT INTO trades (
                 logged_at, mode, ticker, side, count, limit_price,
                 opportunity_kind, score, kelly_fraction, p_estimate,
-                status, order_id, error_msg, source, spread_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, order_id, error_msg, source, spread_id,
+                market_p_entry, yes_bid_entry, yes_ask_entry
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 logged_at, mode, ticker, side, count, limit_price,
                 opportunity_kind, score, KELLY_FRACTION, p_estimate,
                 status, order_id, error_msg, source or None, spread_id,
+                market_p_entry, yes_bid, yes_ask,
             ),
         )
 

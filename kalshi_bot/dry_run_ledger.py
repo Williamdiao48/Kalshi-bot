@@ -95,6 +95,7 @@ from .trade_executor import (
     DRAWDOWN_FULL_REDUCE_PCT,
     DRAWDOWN_MIN_FACTOR,
     DRAWDOWN_ENABLED,
+    DRAWDOWN_LOOKBACK_TRADES,
 )
 
 
@@ -115,6 +116,8 @@ class _Trade:
         "settled", "result",
         # live market data (populated by _enrich)
         "current_mid", "yes_bid", "yes_ask", "close_time",
+        # market state at entry (for calibration)
+        "market_p_entry", "yes_bid_entry", "yes_ask_entry",
     )
 
     def __init__(
@@ -135,6 +138,9 @@ class _Trade:
         source:           str | None = None,
         note:             str | None = None,
         opportunity_kind: str | None = None,
+        market_p_entry:   float | None = None,
+        yes_bid_entry:    int   | None = None,
+        yes_ask_entry:    int   | None = None,
     ) -> None:
         self.trade_id       = trade_id
         self.logged_at      = logged_at
@@ -148,6 +154,9 @@ class _Trade:
         self.source           = source or ""
         self.note             = note or ""
         self.opportunity_kind = opportunity_kind or ""
+        self.market_p_entry   = market_p_entry
+        self.yes_bid_entry    = yes_bid_entry
+        self.yes_ask_entry    = yes_ask_entry
 
         # Exit state — locked-in P&L from early exit.
         self.exited      = exited_at is not None
@@ -468,16 +477,21 @@ class DryRunLedger:
         if not DRAWDOWN_ENABLED:
             return 1.0
         try:
+            limit_clause = (
+                f"LIMIT {DRAWDOWN_LOOKBACK_TRADES}" if DRAWDOWN_LOOKBACK_TRADES > 0 else ""
+            )
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT exit_pnl_cents, outcome, side, count, limit_price
                 FROM trades
                 WHERE mode = 'dry_run'
                   AND (outcome IN ('won', 'lost') OR exited_at IS NOT NULL)
                   AND outcome IS NOT 'void'
-                ORDER BY logged_at ASC
+                ORDER BY logged_at DESC
+                {limit_clause}
                 """
             ).fetchall()
+            rows = list(reversed(rows))  # restore chronological order
         except Exception:
             return 1.0
 
@@ -599,7 +613,7 @@ class DryRunLedger:
                 SELECT id, logged_at, ticker, side, count, limit_price,
                        score, kelly_fraction, p_estimate, outcome,
                        exited_at, exit_pnl_cents, exit_reason, source, note,
-                       opportunity_kind
+                       opportunity_kind, market_p_entry, yes_bid_entry, yes_ask_entry
                 FROM trades
                 WHERE mode = 'dry_run'
                 ORDER BY logged_at ASC
@@ -626,6 +640,9 @@ class DryRunLedger:
                 source           = row[13],
                 note             = row[14],
                 opportunity_kind = row[15],
+                market_p_entry   = row[16],
+                yes_bid_entry    = row[17],
+                yes_ask_entry    = row[18],
             )
             for row in rows
         ]
