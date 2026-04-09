@@ -77,6 +77,8 @@ class CrossedBookArb:
     yes_ask: int    # cents — cost to buy YES
     no_ask: int     # cents = 100 − yes_bid — cost to buy NO
     profit: int     # cents = 100 − yes_ask − no_ask (guaranteed at settlement)
+    # Min depth across both sides; None if absent from API response.
+    available_depth: int | None = None
 
 
 def find_crossed_book_opportunities(
@@ -111,11 +113,18 @@ def find_crossed_book_opportunities(
         no_ask = 100 - yes_bid
         profit = 100 - yes_ask - no_ask   # = yes_bid - yes_ask
         if profit >= min_profit:
+            # Depth: minimum contracts available on each side of the book.
+            d_yes = m.get("yes_ask_size")
+            d_no  = m.get("yes_bid_size")
+            depth: int | None = None
+            if d_yes is not None and d_no is not None:
+                depth = min(int(d_yes), int(d_no))
             result.append(CrossedBookArb(
                 ticker=m.get("ticker", ""),
                 yes_ask=yes_ask,
                 no_ask=no_ask,
                 profit=profit,
+                available_depth=depth,
             ))
     result.sort(key=lambda x: x.profit, reverse=True)
     return result
@@ -160,6 +169,11 @@ class ArbOpportunity:
 
     guaranteed_profit_cents: int   # min profit regardless of outcome
 
+    # Minimum available depth across both legs at the limit prices.
+    # None when depth data is absent from the ticker_detail dict.
+    # Used by execute_arb() to cap contract count at actual book liquidity.
+    available_depth: int | None = None
+
 
 def _yes_bid(detail: dict[str, Any] | None) -> int | None:
     if detail is None:
@@ -172,6 +186,20 @@ def _yes_ask(detail: dict[str, Any] | None) -> int | None:
     if detail is None:
         return None
     v = detail.get("yes_ask")
+    return int(v) if v is not None else None
+
+
+def _depth(detail: dict[str, Any] | None, side: str) -> int | None:
+    """Return the order book depth (contracts available) for a given side.
+
+    'yes' → yes_ask_size (contracts available to buy YES)
+    'no'  → yes_bid_size (contracts available to buy NO, expressed as YES bid depth)
+    Returns None if the field is absent.
+    """
+    if detail is None:
+        return None
+    field = "yes_ask_size" if side == "yes" else "yes_bid_size"
+    v = detail.get(field)
     return int(v) if v is not None else None
 
 
@@ -255,6 +283,10 @@ def find_arb_opportunities(
                     # Execution:
                     #   buy YES on lo @ yes_ask (yes_price = ask_lo)
                     #   buy NO  on hi @ no_ask  (yes_price = yes_bid = bid_hi)
+                    # Depth: YES side needs ask depth on lo; NO side needs bid depth on hi.
+                    d_lo = _depth(detail_lo, "yes")
+                    d_hi = _depth(detail_hi, "no")
+                    depth = min(d_lo, d_hi) if d_lo is not None and d_hi is not None else None
                     arbs.append(ArbOpportunity(
                         metric=metric,
                         direction=direction,
@@ -270,6 +302,7 @@ def find_arb_opportunities(
                         cost_lo_cents=ask_lo,
                         cost_hi_cents=100 - bid_hi,
                         guaranteed_profit_cents=profit,
+                        available_depth=depth,
                     ))
 
         else:  # "under"
@@ -295,6 +328,10 @@ def find_arb_opportunities(
                     # Execution:
                     #   buy YES on hi @ yes_ask (yes_price = ask_hi)
                     #   buy NO  on lo @ no_ask  (yes_price = yes_bid = bid_lo)
+                    # Depth: NO side needs bid depth on lo; YES side needs ask depth on hi.
+                    d_lo = _depth(detail_lo, "no")
+                    d_hi = _depth(detail_hi, "yes")
+                    depth = min(d_lo, d_hi) if d_lo is not None and d_hi is not None else None
                     arbs.append(ArbOpportunity(
                         metric=metric,
                         direction=direction,
@@ -310,6 +347,7 @@ def find_arb_opportunities(
                         cost_lo_cents=100 - bid_lo,
                         cost_hi_cents=ask_hi,
                         guaranteed_profit_cents=profit,
+                        available_depth=depth,
                     ))
 
     # Return highest-profit first

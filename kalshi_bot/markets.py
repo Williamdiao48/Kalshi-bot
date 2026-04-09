@@ -29,18 +29,43 @@ NUMERIC_SERIES: tuple[str, ...] = (
     "KXBTCD", "KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M",
     "KXDOGE15M", "KXDOGE", "KXADA15M", "KXADA",
     "KXAVAX15M", "KXAVAX", "KXLINK15M", "KXLINK",
+    "KXBNB15M", "KXBNB",
     # Forex
     "KXEURUSD", "KXUSDJPY", "KXGBPUSD",
-    # Economics (BLS / DOL / ISM)
-    "KXCPI", "KXNFP", "KXUNRATE", "KXPPI", "KXPCE",
+    # Economics (BLS / DOL / ISM / BEA)
+    "KXCPI", "KXNFP", "KXADP", "KXUNRATE", "KXPPI", "KXPCE",
     "KXJOBLESS", "KXICSA",                            # weekly initial jobless claims
     "KXISM", "KXISMMFG", "KXISMSVC",                  # ISM PMI indices
+    "KXGDP",                                           # Real GDP growth rate (BEA)
     # Interest rates (FRED)
     "KXFED", "KXFFR", "KXDGS10", "KXDGS2",
     # Energy (EIA)
     "KXWTI", "KXOIL", "KXNATGAS", "KXNG",
     # Equity indices
     "KXSPX", "KXSPXD", "KXNDX", "KXINXD", "KXDOW",
+)
+
+# Text/keyword series fetched directly by series_ticker to bypass KXMVE flood.
+# Kalshi's default pagination returns thousands of KXMVE esports markets first;
+# paginating through them to reach politics/economics/entertainment is too slow.
+# Add series tickers here as new text-matchable Kalshi series are launched.
+TEXT_SERIES: tuple[str, ...] = (
+    # Politics / executive
+    "KXTRUMPS", "KXTRUMPM", "KXTRUMPA", "KXTRUTHS", "KXPRESME",
+    "KXCABOUT", "KXCONGRE", "KXWHVISI", "KXSCOTUS",
+    "KXGOVTSH", "KXGOVTFU", "KXHORMUZ",
+    # International / foreign policy
+    "KXDENMAR", "KXJPNPM-", "KXJAPANH", "KXHOCHUL",
+    # Entertainment
+    "KXTOPSONG", "KXTOP10BIL", "KXOSCARS", "KXOSCARN",
+    # Sports (season winners / championships — text matchable)
+    "KXMLBHRR", "KXNBACHMP", "KXNHLCHMP", "KXNCAAMB",
+    "KXNBA", "KXNHL", "KXMLB",            # alternate championship series
+    "KXF1",                                # Formula 1 drivers/constructors championship
+    # Entertainment / film scores
+    "KXRT",                                # Rotten Tomatoes critic scores
+    # Macro economics (text: CPI releases, Fed announcements, etc.)
+    "KXFEDDEC", "KXFOMCRAT", "KXCPIREL",
 )
 
 # General markets to fetch via pagination for text/political matching.

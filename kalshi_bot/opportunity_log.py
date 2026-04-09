@@ -54,6 +54,77 @@ from .polymarket_matcher import PolyOpportunity
 
 _DEFAULT_DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
 
+_CREATE_RAW_FORECASTS_SQL = """
+CREATE TABLE IF NOT EXISTS raw_forecasts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at   TEXT    NOT NULL,
+    source      TEXT    NOT NULL,   -- e.g. "weatherapi", "noaa", "open_meteo"
+    metric      TEXT    NOT NULL,   -- e.g. "temp_high_lax"
+    ticker      TEXT    NOT NULL,   -- e.g. "KXHIGHLAX-26APR06-T75"
+    data_value  REAL    NOT NULL,   -- forecast temperature (°F)
+    strike      REAL,               -- market strike threshold
+    direction   TEXT,               -- "over" | "under" | "between"
+    edge        REAL                -- |forecast - strike| (°F)
+)
+"""
+
+_CREATE_RAW_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_raw_forecasts_ticker_source
+    ON raw_forecasts (ticker, source, logged_at)
+"""
+
+# View: de-duplicate raw_forecasts by collapsing all intra-day cycles into one
+# row per (date, ticker, source, direction).  avg_forecast and avg_edge are
+# averaged across cycles; n_cycles shows how many poll cycles contributed.
+_CREATE_RAW_DAILY_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS raw_forecasts_daily AS
+SELECT
+    DATE(logged_at)          AS date,
+    ticker,
+    source,
+    direction,
+    ROUND(AVG(data_value), 1) AS avg_forecast,
+    ROUND(AVG(edge), 1)       AS avg_edge,
+    COUNT(*)                  AS n_cycles
+FROM raw_forecasts
+GROUP BY DATE(logged_at), ticker, source, direction
+"""
+
+# View: join trades to raw_forecasts_daily so every trade row shows ALL
+# forecast sources that were present on that ticker that day — not just the
+# primary source stored in trades.source.
+#
+# Usage examples:
+#   -- All sources that corroborated trade #220:
+#   SELECT signal_source, direction, avg_forecast, avg_edge
+#   FROM trade_context WHERE trade_id = 220;
+#
+#   -- Summary: sources grouped per trade:
+#   SELECT trade_id, ticker, side, GROUP_CONCAT(signal_source) AS sources
+#   FROM trade_context GROUP BY trade_id;
+_CREATE_TRADE_CONTEXT_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS trade_context AS
+SELECT
+    t.id                     AS trade_id,
+    DATE(t.logged_at)        AS trade_date,
+    t.ticker,
+    t.side,
+    t.limit_price,
+    t.status,
+    t.outcome,
+    t.exit_pnl_cents,
+    t.source                 AS primary_source,
+    rf.source                AS signal_source,
+    rf.direction,
+    rf.avg_forecast,
+    rf.avg_edge
+FROM trades t
+JOIN raw_forecasts_daily rf
+    ON  rf.ticker = t.ticker
+    AND rf.date   = DATE(t.logged_at)
+WHERE t.opportunity_kind = 'numeric'
+"""
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS opportunities (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +201,10 @@ class OpportunityLog:
         self._conn.execute(_CREATE_TABLE_SQL)
         self._conn.execute(_CREATE_IDX_TICKER_SQL)
         self._conn.execute(_CREATE_IDX_LOGGED_SQL)
+        self._conn.execute(_CREATE_RAW_FORECASTS_SQL)
+        self._conn.execute(_CREATE_RAW_IDX_SQL)
+        self._conn.execute(_CREATE_RAW_DAILY_VIEW_SQL)
+        self._conn.execute(_CREATE_TRADE_CONTEXT_VIEW_SQL)
 
     # -----------------------------------------------------------------------
     # Cross-cycle deduplication
@@ -168,6 +243,42 @@ class OpportunityLog:
     # -----------------------------------------------------------------------
     # Logging
     # -----------------------------------------------------------------------
+
+    def log_raw_forecasts(self, opps: "list[NumericOpportunity]") -> None:
+        """Log ALL numeric weather opportunities before edge/spread gating.
+
+        Called once per poll cycle with the full pre-gate opportunity list so
+        every source's forecast is captured regardless of whether it passes the
+        edge threshold.  This builds the training dataset needed for per-source
+        accuracy calibration in scripts/backtest_source_accuracy.py.
+
+        Duplicate (ticker, source) pairs within the same calendar day are
+        intentionally kept — they show how forecasts evolve intraday.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                now,
+                opp.source,
+                opp.metric,
+                opp.market_ticker,
+                opp.data_value,
+                opp.strike,
+                opp.direction,
+                opp.edge,
+            )
+            for opp in opps
+            if opp.metric.startswith("temp_high_")
+        ]
+        if rows:
+            self._conn.executemany(
+                """
+                INSERT INTO raw_forecasts
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
     def log_text(
         self,

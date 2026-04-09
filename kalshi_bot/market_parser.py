@@ -45,6 +45,8 @@ TICKER_TO_METRIC: dict[str, str] = {
     "KXAVAX":    "price_avax_usd",
     "KXLINK15M": "price_link_usd",
     "KXLINK":    "price_link_usd",
+    "KXBNB15M":  "price_bnb_usd",
+    "KXBNB":     "price_bnb_usd",
     # Forex
     "KXEURUSD": "rate_eur_usd",
     "KXUSDJPY": "rate_usd_jpy",
@@ -52,14 +54,16 @@ TICKER_TO_METRIC: dict[str, str] = {
     # Economics (production markets)
     "KXCPI":     "bls_cpi_u",
     "KXNFP":     "bls_nfp",
+    "KXADP":     "bls_nfp",          # ADP private payrolls (pre-signal for NFP)
     "KXUNRATE":  "bls_unrate",
     "KXJOBLESS": "fred_icsa",        # weekly initial jobless claims (DOL/FRED ICSA)
     "KXICSA":    "fred_icsa",        # alternate Kalshi ticker prefix for same series
-    "KXPPI":     "bls_ppi_fd",         # PPI Final Demand
-    "KXPCE":     "fred_pce",          # PCE price index (BEA via FRED PCEPI)
+    "KXPPI":     "bls_ppi_fd",       # PPI Final Demand
+    "KXPCE":     "fred_pce",         # PCE price index (BEA via FRED PCEPI)
     "KXISM":     "ism_manufacturing", # ISM Manufacturing PMI (generic prefix)
     "KXISMMFG":  "ism_manufacturing", # ISM Manufacturing PMI (explicit)
-    "KXISMSVC":  "ism_services",      # ISM Services PMI
+    "KXISMSVC":  "ism_services",     # ISM Services PMI
+    "KXGDP":     "fred_gdp_growth",  # Real GDP growth rate % (BEA advance/revised via FRED)
     # Interest rates (FRED)
     "KXFED":    "fred_fedfunds",
     "KXFFR":    "fred_fedfunds",
@@ -203,9 +207,10 @@ def parse_all_markets(markets: list[dict[str, Any]]) -> list[ParsedMarket]:
 _NUMERIC_PATTERN_PREFIXES: tuple[str, ...] = (
     "KXHIGH",                          # temperature by city
     "KXBTC", "KXETH", "KXSOL", "KXXRP",   # crypto prices (BTC/ETH/SOL/XRP)
-    "KXDOGE", "KXADA", "KXAVAX", "KXLINK",  # crypto prices (DOGE/ADA/AVAX/LINK)
+    "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",  # crypto prices
     "KXEUR", "KXUSD", "KXGBP", "KXJPY",  # forex
-    "KXCPI", "KXNFP", "KXUNRATE", "KXPPI", "KXPCE",  # BLS / BEA economic data
+    "KXCPI", "KXNFP", "KXADP", "KXUNRATE", "KXPPI", "KXPCE",  # BLS / BEA economic data
+    "KXGDP",                           # Real GDP growth rate (BEA via FRED)
     "KXJOBLESS", "KXICSA",            # DOL weekly jobless claims
     "KXISM",                           # ISM PMI indices
     "KXFED", "KXFFR", "KXDGS",        # interest rates / FRED

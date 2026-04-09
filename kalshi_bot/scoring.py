@@ -164,6 +164,9 @@ _DEFAULT_EDGE_SCALE: float = 1.0
 # Ground-truth observed data scores 1.0; play-money/noisy forecasts score 0.5.
 _SOURCE_SCORES: dict[str, float] = {
     "noaa_observed": 1.00,   # station-observed temperature — ground truth
+    "metar":         0.90,   # FAA real-time station observed max — same ground-truth tier as noaa_observed;
+                             # slight discount vs noaa_observed because METAR station may differ from
+                             # the NWS CLI station Kalshi uses for settlement
     "nws_alert":     0.95,   # NWS official warning/alert — high-confidence
     "cme_fedwatch":  0.90,   # CME FedWatch futures-implied FOMC probabilities
     "polymarket":    0.90,   # real-money global prediction market
@@ -264,16 +267,40 @@ def _temporal_score(days_to_close: float) -> float:
     return math.exp(-days_to_close / TEMPORAL_HALFLIFE)
 
 
+_HIGH_SPEC_SINGLE_WORDS: frozenset[str] = frozenset({
+    # Crypto
+    "bitcoin", "btc", "ethereum", "eth", "solana", "xrp", "dogecoin", "doge",
+    # Economics
+    "cpi", "gdp", "nfp", "fomc", "tariff", "inflation", "recession",
+    # Politics
+    "shutdown", "impeachment", "ceasefire", "filibuster",
+    # Sports leagues
+    "nba", "nfl", "nhl", "mlb", "ncaa", "wnba",
+    # Entertainment
+    "billboard", "grammy", "oscar",
+})
+
+
 def _specificity_score(term: str) -> float:
     """Score [0, 1] for matched-term specificity (text opportunities only).
 
     Word count of the matched phrase, capped at 3:
-      1 word  → 0.33  (e.g. "Bitcoin", "NHL")
+      1 word  → 0.33  (generic) or 0.67 (well-known specific term)
       2 words → 0.67  (e.g. "Trump tariff", "Senate vote")
       3+ words → 1.0  (e.g. "Trump executive order")
+
+    Well-known single-word domain terms (e.g. "bitcoin", "nba", "cpi") are
+    scored at 0.67 because they are unambiguously specific despite being one word.
     """
-    word_count = len(term.strip().split())
-    return min(1.0, word_count / 3.0)
+    words = term.strip().lower().split()
+    if len(words) >= 3:
+        return 1.0
+    elif len(words) == 2:
+        return 0.67
+    elif words and words[0] in _HIGH_SPEC_SINGLE_WORDS:
+        return 0.67
+    else:
+        return 0.33
 
 
 def _edge_score(metric: str, edge: float, implied_outcome: str) -> float:
@@ -353,9 +380,43 @@ def score_numeric_opportunity(
     ask = detail.get("yes_ask") if detail else None
 
     s_spread      = _spread_score(bid, ask)
-    s_uncertainty = _uncertainty_score(bid, ask)
     s_temporal    = _temporal_score(days_to_close)
     s_source      = _source_score(opp.source)
+
+    # Locked-observation signals override the uncertainty sub-score to 1.0
+    # when the observation DIRECTLY CONFIRMS the outcome — the market hasn't
+    # fully repriced yet, but ground truth has already settled it.
+    #
+    # Locked YES:
+    #   direction=over:    observed max exceeds the strike → YES locked anytime.
+    #   direction=between: observed max is inside the band → YES confirmed after
+    #                      the 4:30 PM local gate (peak is past).
+    #   direction=under:   intentionally excluded — observation only shows the max
+    #                      is still below the ceiling, not that the peak is done.
+    #                      The market often correctly prices further warming risk.
+    #
+    # Locked NO (opp.peak_past set by _filter_weather_opportunities()):
+    #   direction=over, after 4:30 PM local: observed max is BELOW the strike and
+    #   the day's peak is established — outcome is locked NO.  A market pricing
+    #   YES at 15¢ still offers 85¢ profit on the NO side; override the penalty.
+    _locked_obs_sources = {"noaa_observed", "metar", "nws_alert"}
+    _locked_directions  = {"over", "between"}
+    if (
+        opp.source in _locked_obs_sources
+        and opp.implied_outcome == "YES"
+        and opp.direction in _locked_directions
+    ):
+        s_uncertainty = 1.0
+    elif (
+        opp.source in _locked_obs_sources
+        and opp.implied_outcome == "NO"
+        and opp.direction == "over"
+        and opp.peak_past
+    ):
+        # Peak is confirmed past 4:30 PM local; observed max < strike → locked NO.
+        s_uncertainty = 1.0
+    else:
+        s_uncertainty = _uncertainty_score(bid, ask)
 
     # Between-market YES: opp.edge is the clearance (minimum distance from
     # either boundary), as set by numeric_matcher._implied_outcome.  Normalise

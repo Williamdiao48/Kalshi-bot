@@ -308,18 +308,27 @@ class DryRunLedger:
         )
 
     def _migrate_snapshots(self) -> None:
-        """Add new columns to price_snapshots if they are missing."""
-        existing = {
+        """Add new columns to price_snapshots and trades if they are missing."""
+        snap_existing = {
             row[1]
             for row in self._conn.execute(
                 "PRAGMA table_info(price_snapshots)"
             ).fetchall()
         }
         for col, defn in _SNAPSHOT_MIGRATIONS:
-            if col not in existing:
+            if col not in snap_existing:
                 self._conn.execute(
                     f"ALTER TABLE price_snapshots ADD COLUMN {col} {defn}"
                 )
+
+        # Columns that may be missing from the trades table (added over time).
+        trade_existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        for col, defn in [("note", "TEXT")]:
+            if col not in trade_existing:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
 
     async def refresh_and_write(
         self,
@@ -340,33 +349,30 @@ class DryRunLedger:
         """
         trades = self._load_trades()
         if not trades:
+            logging.warning("DryRunLedger: _load_trades returned 0 trades — skipping overview write.")
             return
 
-        await self._enrich(session, trades)
-
-        # Check P&L-based exit thresholds BEFORE writing snapshots so exited
-        # positions are excluded from the snapshot (we no longer hold them).
-        await self._exit_manager.check_exits(session, trades)
-
-        # Check counter-signal exits when current opportunity data is provided.
-        if numeric_opps is not None or poly_opps is not None:
-            await self._exit_manager.check_counter_signals(
-                session,
-                trades,
-                numeric_opps=numeric_opps or [],
-                poly_opps=poly_opps or [],
-            )
-
-        # Re-load exit state so the overview and snapshot logic see updated flags.
-        self._reload_exit_state(trades)
-
-        self._write_snapshots(trades)
-        overview = self._build_overview(trades)
-
         try:
+            await self._enrich(session, trades)
+            await self._exit_manager.check_exits(session, trades)
+
+            if numeric_opps is not None or poly_opps is not None:
+                await self._exit_manager.check_counter_signals(
+                    session,
+                    trades,
+                    numeric_opps=numeric_opps or [],
+                    poly_opps=poly_opps or [],
+                )
+
+            self._reload_exit_state(trades)
+            self._write_snapshots(trades)
+            overview = self._build_overview(trades)
             self._overview_path.write_text(overview + "\n", encoding="utf-8")
-        except OSError as exc:
-            logging.error("DryRunLedger: could not write overview file: %s", exc)
+            logging.info(
+                "DryRunLedger: wrote %d bytes to %s", len(overview), self._overview_path
+            )
+        except Exception as exc:
+            logging.error("DryRunLedger: refresh_and_write failed: %s", exc, exc_info=True)
 
     def close(self) -> None:
         self._conn.close()
@@ -619,7 +625,8 @@ class DryRunLedger:
                 ORDER BY logged_at ASC
                 """
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            logging.error("DryRunLedger: _load_trades failed: %s", exc, exc_info=True)
             return []
 
         return [

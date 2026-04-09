@@ -287,6 +287,29 @@ COUNTER_SIGNAL_MAX_PROFIT_PCT: float = float(
     os.environ.get("COUNTER_SIGNAL_MAX_PROFIT_PCT", "0.40")
 )
 
+# Sources where intraday price moves are noise — hold to settlement, skip all exits.
+# EIA/BLS/Fed/crypto: single data-release resolution; thin books before release
+# don't reflect new information.
+_HOLD_TO_SETTLEMENT_SOURCES: frozenset[str] = frozenset({
+    "eia", "eia_inventory",
+    "bls", "fred", "cme_fedwatch", "adp", "chicago_pmi",
+    "binance", "coinbase", "coingecko",
+    "frankfurter", "yahoo_forex",
+    "polymarket", "metaculus", "manifold", "predictit",
+})
+
+# Weather sources: hold winners to settlement (intraday repricing on a correct
+# signal is noise), but allow stop_loss when the market moves decisively against
+# the position (observed temps rising = real information, not noise).
+# Profit-take and trailing-stop are suppressed — same-day markets resolve within
+# hours so there's no reason to exit a winning position early.
+_WEATHER_STOP_LOSS_ONLY_SOURCES: frozenset[str] = frozenset({
+    "noaa", "noaa_day1", "noaa_day2",
+    "noaa_observed", "nws_hourly", "nws_climo", "nws_alert",
+    "metar", "hrrr", "open_meteo", "weatherapi", "owm",
+    "band_arb",   # METAR+NOAA confirmed band crossing — hold to 100¢, stop-loss only
+})
+
 _ORDERS_PATH = "/trade-api/v2/orders"
 
 
@@ -448,11 +471,18 @@ class ExitManager:
             if cost <= 0:
                 continue
 
-            # Numeric markets (EIA, Fed, CPI, crypto prices, etc.) resolve on a
-            # single external data release.  Price moves before settlement are
-            # noise — thin books, not new information.  Hold all numeric trades
-            # to settlement; no stop_loss, profit_take, or trailing stop.
-            if getattr(trade, "opportunity_kind", "") == "numeric":
+            # Numeric markets resolve on a single external data release.
+            # For data-release sources (EIA, Fed, BLS, crypto, forex), intraday
+            # price moves are noise — thin books reacting to speculation, not new
+            # information.  Hold those to settlement.
+            #
+            # Weather trades are different: the market continuously reprices as
+            # observed temperatures update throughout the day.  A NO position
+            # moving from 40¢ to 80¢ YES is the market reacting to real observed
+            # data — that IS new information.  Weather trades should be subject to
+            # stop_loss and trailing_stop so we don't ride losers to 0¢.
+            src = getattr(trade, "source", "") or ""
+            if getattr(trade, "opportunity_kind", "") == "numeric" and src in _HOLD_TO_SETTLEMENT_SOURCES:
                 continue
 
             pnl = trade._unrealized_cents()
@@ -482,12 +512,14 @@ class ExitManager:
                 except (ValueError, TypeError):
                     pass
 
+            is_weather = src in _WEATHER_STOP_LOSS_ONLY_SOURCES
+
             reason: str | None = None
-            if pct >= profit_take_thresh:
+            if not is_weather and pct >= profit_take_thresh:
                 reason = "profit_take"
             elif stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
                 reason = "stop_loss"
-            elif EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN):
+            elif not is_weather and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)):
                 peak = self._get_peak_pct_gain(trade.trade_id)
                 if peak is not None and peak > 0:
                     # Resolve trailing drawdown threshold: source-specific

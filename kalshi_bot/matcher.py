@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,12 +17,25 @@ class Opportunity:
     source: str = "federal_register"
     matched_terms: list[str] = field(default_factory=list)
     n_alternatives: int = 0  # other markets that matched this same (doc, term) pair
+    doc_body: str = ""       # article abstract/summary for classifier inference
 
 
 def _extract_searchable_text(doc: dict[str, Any]) -> str:
     title = doc.get("title", "")
     abstract = doc.get("abstract") or ""
     return f"{title} {abstract}".lower()
+
+
+def _term_in_text(term: str, text: str) -> bool:
+    """Word-boundary-aware substring match (text must already be lowercased).
+
+    Multi-word phrases use bare substring matching (spaces act as natural
+    boundaries).  Single words use \\b regex to prevent short acronyms like
+    "SEC" from matching "sector" or "ban" from matching "band".
+    """
+    if " " in term:
+        return term in text
+    return bool(re.search(r"\b" + re.escape(term) + r"\b", text))
 
 
 def _price_distance_from_50(market: dict[str, Any]) -> float:
@@ -74,7 +88,7 @@ def find_opportunities(
         doc_full_text = _extract_searchable_text(doc)
 
         # Phase 1: topic must appear somewhere in the article (title or abstract)
-        body_matched = [t for t in lower_topics if t in doc_full_text]
+        body_matched = [t for t in lower_topics if _term_in_text(t, doc_full_text)]
         if not body_matched:
             continue
 
@@ -82,7 +96,7 @@ def find_opportunities(
         # Skipped for sources (e.g. EDGAR) whose title is a structured stub
         # rather than enriched prose — content lives in the abstract instead.
         if require_title_match:
-            title_confirmed = [t for t in body_matched if t in doc_title_lower]
+            title_confirmed = [t for t in body_matched if _term_in_text(t, doc_title_lower)]
             if not title_confirmed:
                 continue
         else:
@@ -92,12 +106,14 @@ def find_opportunities(
         doc_title = doc.get("title", "")
         doc_url = doc.get("html_url", "")
         doc_source = doc.get("feed_name") or doc.get("_source", "unknown")
+        doc_body = doc.get("abstract") or doc.get("summary") or ""
 
         # Phase 3: for each confirmed topic, find all matching markets and pick the best one
         for term in title_confirmed:
             matching = [
                 m for m in markets
-                if term in m.get("title", "").lower() or term in m.get("ticker", "").lower()
+                if _term_in_text(term, m.get("title", "").lower())
+                or _term_in_text(term, m.get("ticker", "").lower())
             ]
             if not matching:
                 continue
@@ -117,6 +133,7 @@ def find_opportunities(
                     source=doc_source,
                     matched_terms=[term],
                     n_alternatives=len(matching) - 1,
+                    doc_body=doc_body,
                 )
             )
 
