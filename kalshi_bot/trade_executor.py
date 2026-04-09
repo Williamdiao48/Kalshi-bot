@@ -107,6 +107,7 @@ import aiohttp
 
 from .auth import generate_headers
 from .matcher import Opportunity
+from .market_parser import TICKER_TO_METRIC as _TICKER_TO_METRIC
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 from .news import cme_fedwatch
@@ -117,7 +118,7 @@ from .arb_detector import (
     ArbOpportunity, ARB_EXECUTION_ENABLED,
     CrossedBookArb, CROSSED_BOOK_ARB_ENABLED,
 )
-from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED, BRACKET_ARB_MIN_PROFIT
+from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
 from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED
 
 
@@ -141,6 +142,19 @@ TRADE_MAX_CONTRACTS: int = int(os.environ.get("TRADE_MAX_CONTRACTS", "10"))
 # The 0.75–0.80 band shows 63–83% win rate in both windows.
 TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.75"))
 
+# Lower minimum score for text opportunities.  Text composite scores are
+# structurally capped below numeric ones (no edge component, specificity
+# limited to 0.67 for single-word terms) so a single threshold disadvantages
+# text unfairly.  Default 0.68 — just above the observed ceiling of crypto
+# noise (~0.68) while allowing genuine politics/economics signals through.
+# Set to 0 to fall back to TRADE_MIN_SCORE for all opportunity types.
+TEXT_TRADE_MIN_SCORE: float = float(os.environ.get("TEXT_TRADE_MIN_SCORE", "0.68"))
+
+# Minimum |p_yes - 0.5| required to act on a text opportunity's classifier signal.
+# At AUC 0.675, require at least 20pp confidence (p_yes < 0.30 or > 0.70).
+# Set to 0 to trade any non-NEUTRAL signal.
+TEXT_MIN_CONFIDENCE: float = float(os.environ.get("TEXT_MIN_CONFIDENCE", "0.20"))
+
 # Higher minimum score for forex (rate_eur_usd, rate_usd_jpy) markets.
 # Forex short-duration contracts are driven by intraday moves that the ECB
 # daily fix and Yahoo Forex intraday rate can't predict reliably.  All 5
@@ -149,12 +163,40 @@ TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.75"))
 # Set to 0 to disable (falls back to TRADE_MIN_SCORE for forex).
 FOREX_MIN_SCORE: float = float(os.environ.get("FOREX_MIN_SCORE", "0.80"))
 
+# Metric prefixes that text/RSS trades should never touch.  Price metrics
+# (crypto, forex) are driven by real-time exchange data — an RSS article
+# about Bitcoin's inventor carries zero information about the close price.
+# The numeric pipeline already handles these via Binance/Coinbase/Yahoo feeds.
+# Comma-separated prefixes; default blocks all price_ and rate_ metrics.
+_TEXT_SKIP_RAW: str = os.environ.get("TEXT_SKIP_METRIC_PREFIXES", "price_,rate_,eia_,fred_,bls_,ism_")
+TEXT_SKIP_METRIC_PREFIXES: tuple[str, ...] = tuple(
+    p.strip() for p in _TEXT_SKIP_RAW.split(",") if p.strip()
+)
+
 # Higher minimum score for Polymarket-divergence trades.
 # Post-improvement polymarket was 5W/38L (-$2.72) even at score ≥ 0.65.
 # Wins only appeared at score ≥ 0.82.  Below that the divergence signal
 # has shown no predictive value on Kalshi direction.
 # Set to 0 to disable (falls back to TRADE_MIN_SCORE for poly).
 POLY_MIN_SCORE: float = float(os.environ.get("POLY_MIN_SCORE", "0.82"))
+
+# Higher minimum score for day-ahead (noaa_day2) and longer-range (noaa_day3+)
+# temperature forecasts.  Historical win rate on noaa_day2 trades 186–210 was
+# ~25% — well below the breakeven rate for typical entry costs.  Raising the
+# gate to 0.90 retains only the strongest day-ahead consensus signals.
+# Set to 0 to disable (falls back to TRADE_MIN_SCORE).
+NOAA_DAY2_MIN_SCORE: float = float(os.environ.get("NOAA_DAY2_MIN_SCORE", "0.90"))
+
+# Minimum score for same-day NOAA forecast (noaa) and NOAA observed (noaa_observed)
+# trades.  Score reflects multi-source corroboration; 0.80 requires at least one
+# strong corroborating source.  Set to 0 to disable.
+NOAA_MIN_SCORE: float = float(os.environ.get("NOAA_MIN_SCORE", "0.80"))
+NOAA_OBSERVED_MIN_SCORE: float = float(os.environ.get("NOAA_OBSERVED_MIN_SCORE", "0.80"))
+
+# Block noaa_observed YES trades when the market prices YES at less than this
+# number of cents (i.e., market is ≥95% NO).  When YES ask < 5¢ the market has
+# already priced in near-certainty of NO; our p_estimate=1.0 always loses.
+NOAA_OBSERVED_MIN_YES_ASK: int = int(os.environ.get("NOAA_OBSERVED_MIN_YES_ASK", "5"))
 
 # POLY_MAX_OPEN_PER_UNDERLYING — Maximum number of concurrent open positions
 # allowed on the same underlying prefix (e.g. KXUSDJPY, KXBTCD).  Prevents
@@ -238,27 +280,49 @@ KELLY_FRACTION: float = float(os.environ.get("KELLY_FRACTION", "0.25"))
 # Applies a moderately higher fraction so signals we're most confident in get
 # meaningfully larger positions while low-score trades remain conservatively sized.
 # Default: 0.33 for scores ≥ 0.80; the standard KELLY_FRACTION applies below that.
-KELLY_FRACTION_HIGH: float = float(os.environ.get("KELLY_FRACTION_HIGH", "0.33"))
+KELLY_FRACTION_HIGH: float = float(os.environ.get("KELLY_FRACTION_HIGH", "0.40"))
 KELLY_HIGH_SCORE_THRESHOLD: float = float(os.environ.get("KELLY_HIGH_SCORE_THRESHOLD", "0.80"))
 
-# Position sizing overrides for locked-observation YES trades (noaa_observed, nws_climo,
-# nws_alert with implied_outcome == "YES").  These positions are near-certain by
-# definition (observed temperature already past the strike, or NWS alert confirmed).
-# Use a much larger position ceiling and aggressive Kelly fraction since the edge is
-# structurally locked rather than probabilistic.
-# LOCKED_OBS_MAX_POSITION_CENTS: $25 default (vs standard $5).
-# LOCKED_OBS_KELLY_FRACTION: 0.75 — aggressive but not full-Kelly (data is still proxy).
-# LOCKED_OBS_MAX_CONTRACTS: 30 — hard cap (vs standard 10).
-LOCKED_OBS_MAX_POSITION_CENTS: int = int(os.environ.get("LOCKED_OBS_MAX_POSITION_CENTS", "2500"))
+# Position sizing overrides for locked-observation trades (noaa_observed, metar,
+# nws_climo, nws_alert, eia, eia_inventory).  These positions are near-certain by
+# definition: either the observation already confirms the outcome (weather station
+# readings, EIA inventory report) or an NWS alert is in effect.  Use a larger
+# position ceiling and aggressive Kelly fraction since the edge is structurally
+# locked rather than probabilistic.
+# LOCKED_OBS_MAX_POSITION_CENTS: $50 (raised from $25 — EIA 100% hold-to-settlement WR).
+# LOCKED_OBS_KELLY_FRACTION: 0.75 — aggressive but not full-Kelly.
+# LOCKED_OBS_MAX_CONTRACTS: 50 — hard cap (raised from 30).
+LOCKED_OBS_MAX_POSITION_CENTS: int = int(os.environ.get("LOCKED_OBS_MAX_POSITION_CENTS", "5000"))
 LOCKED_OBS_KELLY_FRACTION: float    = float(os.environ.get("LOCKED_OBS_KELLY_FRACTION",  "0.75"))
-LOCKED_OBS_MAX_CONTRACTS: int       = int(os.environ.get("LOCKED_OBS_MAX_CONTRACTS",      "30"))
-_LOCKED_OBS_SOURCES: frozenset[str] = frozenset({"noaa_observed", "metar", "nws_climo", "nws_alert"})
+LOCKED_OBS_MAX_CONTRACTS: int       = int(os.environ.get("LOCKED_OBS_MAX_CONTRACTS",      "50"))
+_LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
+    "noaa_observed", "metar", "nws_climo", "nws_alert",
+    "eia", "eia_inventory",   # EIA reports are observed commodity data, not forecasts
+})
 
 # Maximum concurrent open positions allowed on the same underlying prefix
 # when entering same-direction adjacent strikes.  Prevents unlimited stacking
 # while allowing the bot to capture edge on 2-3 strikes of a temp ladder.
 # Set to 1 to restore the old behavior (single position per underlying).
 MAX_SAME_UNDERLYING_OPEN: int = int(os.environ.get("MAX_SAME_UNDERLYING_OPEN", "3"))
+
+# Maximum total cost basis across all currently open positions (cents).
+# Guards against correlated blowup when many weather markets are open
+# simultaneously (e.g. LAX + LAS + PHX all NO on a heat-dome day — all
+# lose together if the dome stalls).  The check fires AFTER Kelly sizing so
+# it can compare the exact cost of the proposed trade against the live total.
+# Default $150 (15000¢) — allows ~6 locked-obs trades at ~$23 each, or ~15
+# standard trades at ~$10 each.  Set to 0 to disable.
+MAX_TOTAL_EXPOSURE_CENTS: int = int(os.environ.get("MAX_TOTAL_EXPOSURE_CENTS", "15000"))
+
+# Maximum contracts per leg for guaranteed-profit arb trades.
+# Arb sizing is not Kelly-based (P(win)=1.0 by construction) — it is capped
+# by available order book depth and this hard limit.  The global
+# MAX_TOTAL_EXPOSURE_CENTS guard provides a secondary ceiling.
+# Default 20: EUR/USD 37¢ arb at 20 pairs = $12.60 invested, $7.40 guaranteed.
+# Bracket arb default is lower (ARB_MAX_CONTRACTS // 2) because it places N
+# legs simultaneously and the per-event cost multiplies by bracket count.
+ARB_MAX_CONTRACTS: int = int(os.environ.get("ARB_MAX_CONTRACTS", "20"))
 
 # Score-weighted position sizing.  When enabled, the Kelly count is multiplied
 # by (score − TRADE_MIN_SCORE) / (1.0 − TRADE_MIN_SCORE), linearly scaling
@@ -555,7 +619,7 @@ CREATE TABLE IF NOT EXISTS trades (
     side             TEXT    NOT NULL CHECK(side IN ('yes', 'no')),
     count            INTEGER NOT NULL,
     limit_price      INTEGER NOT NULL,   -- yes_price in cents (0–100)
-    opportunity_kind TEXT    NOT NULL CHECK(opportunity_kind IN ('text', 'numeric')),
+    opportunity_kind TEXT    NOT NULL,  -- 'text'|'numeric'|'arb'|'crossed_book'|'bracket_set'|'spread'|'band_arb'
     score            REAL    NOT NULL,
     kelly_fraction   REAL,               -- KELLY_FRACTION multiplier used
     p_estimate       REAL,               -- P(win) used in Kelly formula
@@ -566,7 +630,13 @@ CREATE TABLE IF NOT EXISTS trades (
     outcome          TEXT,               -- 'won' | 'lost' | 'void' (NULL = unresolved)
     market_p_entry   REAL,               -- (yes_bid + yes_ask) / 200 at entry; for calibration
     yes_bid_entry    INTEGER,            -- yes_bid cents at entry
-    yes_ask_entry    INTEGER             -- yes_ask cents at entry
+    yes_ask_entry    INTEGER,            -- yes_ask cents at entry
+    signal_p_yes     REAL,               -- raw _implied_p_yes() output, before Kelly floors/caps/overrides
+                                         -- NULL when no CDF model applies (text, poly, UNKNOWN direction)
+                                         -- Use this vs market_p_entry vs outcome for longshot bias calibration
+    corroborating_sources TEXT           -- comma-separated list of other sources that agreed with the primary
+                                         -- e.g. "weatherapi,open_meteo" when noaa_day2 was the anchor
+                                         -- NULL for single-source signals (crypto, EIA, arb, etc.)
 )
 """
 
@@ -803,6 +873,7 @@ class FilterStats:
     filtered_dead_market:  int = field(default=0)
     filtered_ticker_cool:  int = field(default=0)
     filtered_circuit_break: int = field(default=0)
+    filtered_exposure:     int = field(default=0)
     trades_attempted:      int = field(default=0)
 
     def reset(self) -> None:
@@ -816,7 +887,7 @@ class FilterStats:
             "Trade funnel: %d seen → %d traded"
             "  [score:%d  dir:%d  book:%d  edge:%d"
             "  disagree:%d  extreme:%d  cutoff:%d  kelly:%d"
-            "  depth:%d  dead:%d  cool:%d  circuit:%d]",
+            "  depth:%d  dead:%d  cool:%d  circuit:%d  exposure:%d]",
             self.seen, self.trades_attempted,
             self.filtered_score, self.filtered_no_direction,
             self.filtered_no_orderbook, self.filtered_temp_edge,
@@ -825,6 +896,7 @@ class FilterStats:
             self.filtered_kelly, self.filtered_depth,
             self.filtered_dead_market,
             self.filtered_ticker_cool, self.filtered_circuit_break,
+            self.filtered_exposure,
         )
 
 
@@ -880,6 +952,49 @@ class TradeExecutor:
 
     def _migrate_schema(self) -> None:
         """Add new columns to an existing trades table if they are missing."""
+        # Widen the opportunity_kind CHECK constraint if the old restrictive
+        # version is present.  The original constraint only allowed 'text' and
+        # 'numeric', which causes every arb/spread/band_arb trade to raise
+        # "CHECK constraint failed" and crash the poll cycle.  SQLite cannot
+        # ALTER a CHECK constraint in place — a full table rebuild is required.
+        tbl_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='trades'"
+        ).fetchone()
+        if tbl_row and "CHECK(opportunity_kind IN ('text', 'numeric'))" in (tbl_row[0] or ""):
+            logging.info(
+                "Schema migration: rebuilding trades table to remove "
+                "restrictive opportunity_kind CHECK constraint."
+            )
+            with self._conn:
+                self._conn.execute(
+                    "ALTER TABLE trades RENAME TO _trades_old"
+                )
+                self._conn.execute(_CREATE_TRADES_SQL)
+                # Copy all rows; spread_id / market_p_entry / yes_bid_entry /
+                # yes_ask_entry may not exist in the old table — use COALESCE
+                # via the pragma column list to copy only what exists.
+                old_cols = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(_trades_old)"
+                    ).fetchall()
+                }
+                shared = ", ".join(
+                    c for c in [
+                        "id", "logged_at", "mode", "ticker", "side", "count",
+                        "limit_price", "opportunity_kind", "score",
+                        "kelly_fraction", "p_estimate", "status", "order_id",
+                        "error_msg", "source", "outcome", "market_p_entry",
+                        "yes_bid_entry", "yes_ask_entry",
+                    ]
+                    if c in old_cols
+                )
+                self._conn.execute(
+                    f"INSERT INTO trades ({shared}) SELECT {shared} FROM _trades_old"
+                )
+                self._conn.execute("DROP TABLE _trades_old")
+            logging.info("Schema migration complete: trades table rebuilt.")
+
         existing = {
             row[1]
             for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
@@ -894,6 +1009,8 @@ class TradeExecutor:
             ("market_p_entry",   "REAL"),     # (yes_bid + yes_ask) / 200 at entry
             ("yes_bid_entry",    "INTEGER"),  # yes_bid cents at entry
             ("yes_ask_entry",    "INTEGER"),  # yes_ask cents at entry
+            ("signal_p_yes",            "REAL"),  # raw _implied_p_yes() before Kelly adjustments
+            ("corroborating_sources",   "TEXT"),  # comma-separated other sources that agreed
         ]:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
@@ -909,20 +1026,92 @@ class TradeExecutor:
         detail: dict | None,
         score: float,
     ) -> None:
-        """Text/keyword opportunities are display-only — no trades are placed.
+        """Evaluate and optionally execute a trade for a text/keyword opportunity.
 
-        RSS keyword matching cannot determine whether news is YES-bullish or
-        NO-bullish, and public news is already priced in by the time the bot
-        sees it.  These opportunities are shown in the report for situational
-        awareness only.  Structured government event sources (congress.py,
-        whitehouse.py, FDA PDUFA) produce DataPoints with explicit directional
-        signals instead of going through this text pipeline.
+        Uses the DistilBERT classifier to infer YES/NO direction from the
+        (market_title, article_abstract) pair.  Falls back to display-only if
+        the model is unavailable or the signal is below TEXT_MIN_CONFIDENCE.
         """
         self.stats.seen += 1
-        self.stats.filtered_no_direction += 1
-        logging.debug(
-            "Trade skip (text/no direction): ticker=%s  score=%.2f",
-            opp.market_ticker, score,
+
+        # Score gate — text uses its own (lower) threshold
+        _text_min = TEXT_TRADE_MIN_SCORE if TEXT_TRADE_MIN_SCORE > 0 else TRADE_MIN_SCORE
+        if score < _text_min:
+            self.stats.filtered_score += 1
+            return
+
+        # Metric filter — skip tickers whose metric is handled by the numeric
+        # pipeline (price_, rate_, eia_, fred_, bls_, ism_).  RSS articles
+        # about e.g. Bitcoin's inventor carry zero price-level information.
+        _ticker_prefix = opp.market_ticker.split("-")[0]
+        _metric = _TICKER_TO_METRIC.get(_ticker_prefix, "")
+        if any(_metric.startswith(p) for p in TEXT_SKIP_METRIC_PREFIXES):
+            logging.debug(
+                "Trade skip (text/numeric-metric): ticker=%s metric=%s",
+                opp.market_ticker, _metric,
+            )
+            self.stats.filtered_score += 1
+            return
+
+        # Classifier direction gate
+        from .classifier import get_classifier
+        direction, p_yes = get_classifier().predict(opp.market_title, opp.doc_body)
+        if direction == "NEUTRAL" or abs(p_yes - 0.5) < TEXT_MIN_CONFIDENCE:
+            self.stats.filtered_no_direction += 1
+            logging.debug(
+                "Trade skip (text/low confidence): ticker=%s  p_yes=%.3f  score=%.2f",
+                opp.market_ticker, p_yes, score,
+            )
+            return
+
+        side = "yes" if direction == "YES" else "no"
+
+        # Orderbook gate
+        if not detail:
+            self.stats.filtered_no_direction += 1
+            return
+        bid = detail.get("yes_bid")
+        ask = detail.get("yes_ask")
+        if bid is None or ask is None:
+            self.stats.filtered_no_direction += 1
+            return
+
+        # Kelly sizing (standard path — no locked-obs boost for text signals)
+        entry_cost = ask if side == "yes" else (100 - bid)
+        pos_max    = max(1, int(MAX_POSITION_CENTS * _dd_factor))
+        count = kelly_contracts(
+            win_prob=p_yes if side == "yes" else (1.0 - p_yes),
+            cost_cents=entry_cost,
+            max_cents=pos_max,
+            kelly_fraction=KELLY_FRACTION,
+            hard_cap=TRADE_MAX_CONTRACTS,
+        )
+        if SCORE_WEIGHTED_SIZING and TRADE_MIN_SCORE < 1.0 and count > 0:
+            score_factor = 0.25 + 0.75 * (score - TRADE_MIN_SCORE) / (1.0 - TRADE_MIN_SCORE)
+            count = max(1, math.floor(count * score_factor))
+        if count < 1:
+            self.stats.filtered_kelly += 1
+            return
+
+        limit_price = ask if side == "yes" else (100 - ask)
+
+        logging.info(
+            "Text opportunity: ticker=%s  side=%s  p_yes=%.3f  score=%.2f  count=%d  src=%s",
+            opp.market_ticker, side.upper(), p_yes, score, count, opp.source,
+        )
+
+        await self._execute(
+            session,
+            ticker=opp.market_ticker,
+            side=side,
+            count=count,
+            limit_price=limit_price,
+            opportunity_kind="text",
+            score=score,
+            p_estimate=p_yes,
+            source=opp.source,
+            yes_bid=int(bid),
+            yes_ask=int(ask),
         )
 
     async def maybe_trade_numeric(
@@ -964,6 +1153,34 @@ class TradeExecutor:
             self.stats.filtered_score += 1
             return
 
+        if (
+            NOAA_DAY2_MIN_SCORE > 0
+            and opp.source in ("noaa_day2", "noaa_day3", "noaa_day4", "noaa_day5", "noaa_day6", "noaa_day7")
+            and score < NOAA_DAY2_MIN_SCORE
+        ):
+            logging.debug(
+                "Trade skip (day-ahead score %.2f < NOAA_DAY2_MIN_SCORE %.2f): %s src=%s",
+                score, NOAA_DAY2_MIN_SCORE, opp.market_ticker, opp.source,
+            )
+            self.stats.filtered_score += 1
+            return
+
+        if NOAA_MIN_SCORE > 0 and opp.source == "noaa" and score < NOAA_MIN_SCORE:
+            logging.debug(
+                "Trade skip (noaa score %.2f < NOAA_MIN_SCORE %.2f): %s",
+                score, NOAA_MIN_SCORE, opp.market_ticker,
+            )
+            self.stats.filtered_score += 1
+            return
+
+        if NOAA_OBSERVED_MIN_SCORE > 0 and opp.source == "noaa_observed" and score < NOAA_OBSERVED_MIN_SCORE:
+            logging.debug(
+                "Trade skip (noaa_observed score %.2f < NOAA_OBSERVED_MIN_SCORE %.2f): %s",
+                score, NOAA_OBSERVED_MIN_SCORE, opp.market_ticker,
+            )
+            self.stats.filtered_score += 1
+            return
+
         if BLOCKED_METRICS and opp.metric in BLOCKED_METRICS:
             logging.debug(
                 "Trade skip (metric %s in BLOCKED_METRICS): %s",
@@ -983,6 +1200,23 @@ class TradeExecutor:
             logging.debug("Trade skip (no orderbook data): %s", opp.market_ticker)
             self.stats.filtered_no_orderbook += 1
             return
+
+        # Block noaa_observed YES when market prices YES at < NOAA_OBSERVED_MIN_YES_ASK¢.
+        # When YES ask < 5¢ the market is ≥95% certain of NO; our p_estimate=1.0 is
+        # almost always wrong in this regime and produces consistent losses.
+        if (
+            NOAA_OBSERVED_MIN_YES_ASK > 0
+            and opp.source == "noaa_observed"
+            and opp.implied_outcome == "YES"
+        ):
+            _yes_ask = detail.get("yes_ask", 0)
+            if _yes_ask < NOAA_OBSERVED_MIN_YES_ASK:
+                logging.debug(
+                    "Trade skip (noaa_observed YES ask %d¢ < min %d¢): %s",
+                    _yes_ask, NOAA_OBSERVED_MIN_YES_ASK, opp.market_ticker,
+                )
+                self.stats.filtered_score += 1
+                return
 
         # --- Minimum temperature edge filter ---
         if opp.metric.startswith("temp_high") and NUMERIC_MIN_TEMP_EDGE > 0:
@@ -1376,6 +1610,19 @@ class TradeExecutor:
             self.stats.filtered_circuit_break += 1
             return
 
+        if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            current_exposure = self._total_open_exposure_cents()
+            this_trade_cost  = count * cost_cents
+            if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                logging.info(
+                    "Trade skip (aggregate exposure cap: open=%d¢ + this=%d¢ = %d¢ > %d¢ limit): %s",
+                    current_exposure, this_trade_cost,
+                    current_exposure + this_trade_cost,
+                    MAX_TOTAL_EXPOSURE_CENTS, opp.market_ticker,
+                )
+                self.stats.filtered_exposure += 1
+                return
+
         logging.debug(
             "All filters passed — executing: %s %s %d×%d¢  p=%.3f  score=%.2f  src=%s",
             opp.market_ticker, side.upper(), count, limit_price, p, score, opp.source,
@@ -1393,6 +1640,9 @@ class TradeExecutor:
             source=opp.source,
             yes_bid=int(detail["yes_bid"]) if detail and detail.get("yes_bid") is not None else None,
             yes_ask=int(detail["yes_ask"]) if detail and detail.get("yes_ask") is not None else None,
+            kelly_fraction=pos_kelly,
+            signal_p_yes=implied_p,  # raw CDF model output, before noaa floor / fedwatch override
+            corroborating_sources=opp.corroborating_sources or None,
         )
 
     async def maybe_trade_poly_opportunity(
@@ -1727,7 +1977,7 @@ class TradeExecutor:
         self,
         session: aiohttp.ClientSession,
         arb: "ArbOpportunity",
-        count: int = 1,
+        count: int | None = None,
     ) -> None:
         """Execute both legs of a combinatorial arbitrage opportunity.
 
@@ -1747,11 +1997,12 @@ class TradeExecutor:
                       Caller can raise this after verifying the arb is real.
         """
         logging.info(
-            "ARB detected: %s [%s] k_lo=%s k_hi=%s  profit=%d¢/pair  "
-            "lo=%s %s@%d¢  hi=%s %s@%d¢",
+            "ARB detected: %s [%s] k_lo=%s k_hi=%s  profit=%d¢/pair"
+            "  depth=%s  lo=%s %s@%d¢  hi=%s %s@%d¢",
             arb.metric, arb.direction,
             arb.strike_lo, arb.strike_hi,
             arb.guaranteed_profit_cents,
+            arb.available_depth if arb.available_depth is not None else "?",
             arb.ticker_lo, arb.side_lo.upper(), arb.cost_lo_cents,
             arb.ticker_hi, arb.side_hi.upper(), arb.cost_hi_cents,
         )
@@ -1777,6 +2028,13 @@ class TradeExecutor:
                     _ticker_category(ticker), ticker,
                 )
                 return
+
+        # Size by available depth capped at ARB_MAX_CONTRACTS.
+        # Depth is the minimum contracts available across both legs at the
+        # limit prices; None means depth data was absent from the API response.
+        if count is None:
+            depth_cap = arb.available_depth if arb.available_depth is not None else ARB_MAX_CONTRACTS
+            count = max(1, min(ARB_MAX_CONTRACTS, depth_cap))
 
         if not ARB_EXECUTION_ENABLED:
             logging.info(
@@ -1820,7 +2078,7 @@ class TradeExecutor:
         self,
         session: aiohttp.ClientSession,
         arb: "CrossedBookArb",
-        count: int = 1,
+        count: int | None = None,
     ) -> None:
         """Execute both legs of a crossed-book arbitrage on a single market.
 
@@ -1861,6 +2119,10 @@ class TradeExecutor:
                 _ticker_category(arb.ticker), arb.ticker,
             )
             return
+
+        if count is None:
+            depth_cap = arb.available_depth if arb.available_depth is not None else ARB_MAX_CONTRACTS
+            count = max(1, min(ARB_MAX_CONTRACTS, depth_cap))
 
         if not CROSSED_BOOK_ARB_ENABLED:
             logging.info(
@@ -1903,7 +2165,7 @@ class TradeExecutor:
         self,
         session: aiohttp.ClientSession,
         arb: "BracketSetArb",
-        count: int = 1,
+        count: int | None = None,
     ) -> None:
         """Execute all legs of a series bracket arbitrage.
 
@@ -1936,11 +2198,16 @@ class TradeExecutor:
                 )
                 return
 
+        # Bracket arb places count contracts on EVERY bracket simultaneously.
+        # Total contracts = count × n_brackets, so use a lower per-bracket cap.
+        if count is None:
+            count = max(1, ARB_MAX_CONTRACTS // 2)
+
         if not BRACKET_ARB_ENABLED:
             logging.info(
                 "BRACKET ARB DETECT-ONLY (BRACKET_ARB_ENABLED=false): "
-                "%s  %d brackets  side=%s  profit=%d¢",
-                arb.event_ticker, arb.n_brackets, arb.side.upper(), arb.profit,
+                "%s  %d brackets  side=%s  profit=%d¢  count=%d/bracket",
+                arb.event_ticker, arb.n_brackets, arb.side.upper(), arb.profit, count,
             )
             return
 
@@ -2065,6 +2332,7 @@ class TradeExecutor:
             score=1.0,       # near-certain observed signal
             p_estimate=p_win,
             source="band_arb",
+            kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
         )
 
     # -----------------------------------------------------------------------
@@ -2374,6 +2642,29 @@ class TradeExecutor:
         dt, _, _ = self._last_trade_context(ticker)
         return dt
 
+    def _total_open_exposure_cents(self) -> int:
+        """Sum of cost basis (count × cost_per_contract) across all open positions.
+
+        For YES trades: cost = limit_price cents.
+        For NO  trades: cost = 100 − limit_price cents (limit_price is the YES-
+                        equivalent bid used to size the NO order).
+
+        Excludes rejected/error trades; includes dry_run, resting, and filled
+        trades that have not yet been exited (exited_at IS NULL).
+        """
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(
+                count * CASE WHEN side = 'yes' THEN limit_price
+                             ELSE 100 - limit_price END
+            ), 0)
+            FROM trades
+            WHERE exited_at IS NULL
+              AND status NOT IN ('rejected', 'error')
+            """
+        ).fetchone()
+        return int(row[0]) if row else 0
+
     def _open_positions_on_underlying(self, ticker: str) -> int:
         """Count open (not yet exited) positions on the same underlying prefix.
 
@@ -2546,6 +2837,9 @@ class TradeExecutor:
         spread_id: str | None = None,
         yes_bid: int | None = None,
         yes_ask: int | None = None,
+        kelly_fraction: float | None = None,
+        signal_p_yes: float | None = None,
+        corroborating_sources: list[str] | None = None,
     ) -> None:
         """Place the order (or log it in dry-run mode) and persist to SQLite."""
         mode = "dry_run" if self._dry_run else "live"
@@ -2555,13 +2849,14 @@ class TradeExecutor:
         error_msg: str | None = None
 
         cost_cents = limit_price if side == "yes" else (100 - limit_price)
+        _logged_kelly = kelly_fraction if kelly_fraction is not None else KELLY_FRACTION
 
         if self._dry_run:
             logging.info(
                 "[DRY-RUN] Would buy %d %s @ %d¢ (cost %d¢)  %s"
                 "  kelly=%.2f  p=%.2f  score=%.2f  src=%s",
                 count, side.upper(), limit_price, cost_cents, ticker,
-                KELLY_FRACTION, p_estimate, score, source or "unknown",
+                _logged_kelly, p_estimate, score, source or "unknown",
             )
             status = "pending"
         else:
@@ -2574,20 +2869,26 @@ class TradeExecutor:
             if yes_bid is not None and yes_ask is not None else None
         )
 
+        corroboration_str = (
+            ",".join(corroborating_sources) if corroborating_sources else None
+        )
+
         self._conn.execute(
             """
             INSERT INTO trades (
                 logged_at, mode, ticker, side, count, limit_price,
                 opportunity_kind, score, kelly_fraction, p_estimate,
                 status, order_id, error_msg, source, spread_id,
-                market_p_entry, yes_bid_entry, yes_ask_entry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                market_p_entry, yes_bid_entry, yes_ask_entry, signal_p_yes,
+                corroborating_sources
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 logged_at, mode, ticker, side, count, limit_price,
-                opportunity_kind, score, KELLY_FRACTION, p_estimate,
+                opportunity_kind, score, _logged_kelly, p_estimate,
                 status, order_id, error_msg, source or None, spread_id,
-                market_p_entry, yes_bid, yes_ask,
+                market_p_entry, yes_bid, yes_ask, signal_p_yes,
+                corroboration_str,
             ),
         )
 

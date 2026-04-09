@@ -27,8 +27,8 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
-from .markets import fetch_all_markets, fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES
-from .market_parser import scan_unknown_series
+from .markets import fetch_all_markets, fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES, TEXT_SERIES
+from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC
 from .matcher import find_opportunities, Opportunity
 from .numeric_matcher import find_numeric_opportunities, NumericOpportunity
 from .spread_matcher import find_spread_opportunities, SpreadOpportunity
@@ -42,6 +42,8 @@ from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi,
 from .news import federal_register
 from .news import noaa, owm, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar
 from .news import polymarket, metaculus, manifold, edgar, predictit
+from .news import box_office
+from .box_office_matcher import match_box_office_to_kalshi
 from .dry_run_ledger import DryRunLedger
 from .opportunity_log import OpportunityLog
 from .portfolio import fetch_positions, build_position_index, summarise_portfolio
@@ -68,6 +70,42 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 POLL_INTERVAL_SECONDS: int = int(os.environ.get("POLL_INTERVAL", "60"))
+
+# Faster poll interval used during high-opportunity windows.  Must be ≤
+# POLL_INTERVAL_SECONDS to have any effect; if larger, it is ignored.
+# Default 20s: catches EIA repricing and band arb crossings 3× more often.
+POLL_INTERVAL_FAST: int = int(os.environ.get("POLL_INTERVAL_FAST", "20"))
+
+# Number of minutes after each EIA/natgas release to use POLL_INTERVAL_FAST.
+# EIA KXWTI markets can reprice within 1–2 minutes of the 10:30 AM release —
+# a fast poll window of 10 minutes captures the full edge window.
+POLL_INTERVAL_EIA_WINDOW_MINUTES: int = int(
+    os.environ.get("POLL_INTERVAL_EIA_WINDOW_MINUTES", "10")
+)
+
+# ET hour range during which METAR band-arb crossings are most likely.
+# 13:00–21:00 ET covers the afternoon peak-heating window for all US time zones:
+#   Eastern cities: peak by ~4:30 PM ET
+#   Central cities: peak by ~4:30 PM CT = 5:30 PM ET
+#   Mountain cities: peak by ~4:30 PM MT = 6:30 PM ET
+#   Pacific cities:  peak by ~4:30 PM PT = 7:30 PM ET
+# Expressed as integer hours (start inclusive, end exclusive).
+POLL_BAND_ARB_START_ET_HOUR: int = int(os.environ.get("POLL_BAND_ARB_START_ET_HOUR", "13"))
+POLL_BAND_ARB_END_ET_HOUR:   int = int(os.environ.get("POLL_BAND_ARB_END_ET_HOUR",   "21"))
+
+# Fast inner loop: METAR + near-threshold KXHIGH price refresh between full cycles.
+# WATCH_THRESHOLD_F: cities within this many °F of a band ceiling go on the watchlist.
+# FAST_LOOP_INTERVAL: seconds between fast loop iterations during the sleep window.
+WATCH_THRESHOLD_F: float = float(os.environ.get("WATCH_THRESHOLD_F", "3.0"))
+FAST_LOOP_INTERVAL: float = float(os.environ.get("FAST_LOOP_INTERVAL", "10.0"))
+
+# Shared state between _poll() and _fast_loop().
+# _near_threshold_cities: metric keys (e.g. "temp_high_den") whose METAR reading
+#   was within WATCH_THRESHOLD_F of a band ceiling in the last full cycle.
+# _last_noaa_obs: NOAA observed values cached from the last full cycle for
+#   use as corroboration in _fast_loop() without re-fetching NOAA.
+_near_threshold_cities: set[str] = set()
+_last_noaa_obs: dict[str, float] = {}
 
 # How often to re-fetch the NUMERIC series markets (KXHIGH, KXBTCD, etc.).
 # These are the markets the bot actually trades; stale prices cause bad fills.
@@ -99,6 +137,10 @@ AGENCIES: list[str] = [
     "commodity-futures-trading-commission",     # CFTC — derivatives, crypto regulation
     "department-of-the-treasury",              # Treasury — sanctions, debt, tax rules
     "department-of-health-and-human-services", # HHS — Medicare, Medicaid, drug pricing
+    "securities-and-exchange-commission",       # SEC — earnings, disclosures, IPOs
+    "consumer-financial-protection-bureau",     # CFPB — consumer finance rules
+    "department-of-labor",                      # DOL — jobs, wages, OSHA
+    "federal-communications-commission",        # FCC — telecom, broadband rules
 ]
 
 # ---------------------------------------------------------------------------
@@ -115,9 +157,9 @@ AGENCIES: list[str] = [
 
 _SOURCE_GROUPS: list[dict] = [
     {
-        # ESPN feeds → all ball-sport markets (NBA, NHL, NCAA, MLB)
+        # ESPN + Motorsport feeds → ball-sport and F1 markets
         "name": "sports",
-        "feed_ids": {"espn_nba", "espn_top"},
+        "feed_ids": {"espn_nba", "espn_top", "espn_nhl", "espn_mlb", "motorsport_f1"},
         "topics": [
             # --- NBA ---
             # "NBA" intentionally omitted: too broad, hits every KXNBA ticker.
@@ -129,14 +171,24 @@ _SOURCE_GROUPS: list[dict] = [
             # --- NHL ---
             "NHL", "McDavid", "MacKinnon", "Draisaitl", "Ovechkin",
             "Pastrnak", "Tkachuk", "Crosby", "Kucherov",
+            "Matthews", "Marchessault", "Hughes", "Caufield",
             # --- NCAA March Madness ---
             "NCAA", "March Madness", "Final Four", "Elite Eight", "Sweet Sixteen",
             # --- MLB ---
             "MLB", "Ohtani", "Trout", "Judge", "Soto",
+            "Betts", "Freeman", "Schwarber",
+            # --- Formula 1 ---
+            "Formula 1", "Grand Prix", "Verstappen", "Hamilton", "Norris",
+            "Leclerc", "Sainz", "Russell", "Alonso", "Piastri",
+            "drivers championship", "constructors championship",
         ],
-        "include_prefixes": ("KXNBA", "KXNHL", "KXNCAAMB", "KXMLB"),
+        "include_prefixes": ("KXNBA", "KXNHL", "KXNCAAMB", "KXMLB", "KXF1"),
         "exclude_prefixes": (),
     },
+    # NOTE: crypto price markets (KXBTC, KXDOGE, etc.) are intentionally excluded
+    # from text matching — they are covered by the numeric matcher via live
+    # Binance/Coinbase prices.  Crypto news articles cannot reliably predict
+    # short-duration price strikes and were generating only noise here.
     {
         # Billboard → song chart markets only
         "name": "entertainment",
@@ -144,9 +196,25 @@ _SOURCE_GROUPS: list[dict] = [
         "topics": [
             "Billboard", "Hot 100", "#1 song", "number one",
             "Morgan Wallen", "Taylor Swift", "Drake", "Beyonce",
+            # Multi-word phrases for higher specificity scores
+            "Billboard Hot 100", "top song", "number one song",
         ],
         "include_prefixes": ("KXTOPSONG", "KXTOP10BIL"),
         "exclude_prefixes": (),
+    },
+    {
+        # Variety + Hollywood Reporter → Rotten Tomatoes score markets (KXRT)
+        # KXRT market titles always contain "Rotten Tomatoes" verbatim, so the
+        # keyword matches both the article and the market title automatically.
+        "name": "film_reviews",
+        "feed_ids": {"variety", "hollywood_reporter"},
+        "topics": [
+            "Rotten Tomatoes", "Tomatometer", "critics score",
+            "certified fresh", "box office", "opening weekend",
+        ],
+        "include_prefixes": ("KXRT",),
+        "exclude_prefixes": (),
+        "require_title_match": True,
     },
     {
         # Politics / economics feeds + Federal Register →
@@ -170,6 +238,7 @@ _SOURCE_GROUPS: list[dict] = [
             "politico_economy", "politico_energy", "politico_politics",
             "thehill", "npr", "bbc", "ap_top", "ap_politics", "reuters",
             "federal_register",
+            "cnbc_top", "marketwatch",
         },
         "topics": [
             # Environment / EPA
@@ -188,6 +257,7 @@ _SOURCE_GROUPS: list[dict] = [
             # Economics — data releases
             "Federal Reserve", "interest rate", "inflation",
             "CPI", "nonfarm payroll", "unemployment", "GDP", "recession",
+            "rate hike", "rate cut", "jobs report",
             # Trump — NOUN phrases that appear in both news and market titles
             "executive order", "pardon", "national emergency",
             "tariff", "trade deal", "trade war",
@@ -199,9 +269,19 @@ _SOURCE_GROUPS: list[dict] = [
             "impeachment", "Senate confirmation",
             # Foreign policy
             "ceasefire", "Ukraine", "NATO", "Iran nuclear",
+            # Trump Cabinet — person names map directly to open KXCABOUT markets
+            # ("Will [Name] be the next to leave the Trump Cabinet?")
+            "Gabbard", "Hegseth", "Rubio", "Bessent", "Kennedy",
+            "Wiles", "Vought", "Duffy", "Turner", "Waltz",
+            "Mullin", "Kratsios", "Zeldin", "McMahon", "Loeffler",
+            "Ratcliffe", "Greer", "Lutnick", "Burgum", "Wright",
+            "Rollins", "Collins", "Chavez-DeRemer",
             # Crypto (supplements numeric matching)
             "Bitcoin", "Ethereum", "crypto",
-            # Sports (supplements ESPN feed for political cross-over)
+            # Equities / financial markets (CNBC, MarketWatch)
+            "S&P 500", "Nasdaq", "earnings", "stock market", "IPO", "Fed rate",
+            # SEC / DOL / FCC (new Federal Register agencies)
+            "SEC", "securities", "CFPB", "OSHA", "FCC", "broadband",
         ],
         "include_prefixes": (),
         # Exclude all sports, entertainment, weather, and esports series
@@ -299,7 +379,83 @@ NUMERIC_MIN_EDGE_FRACTION: float = float(os.environ.get("NUMERIC_MIN_EDGE_FRACTI
 #   information rather than forecast noise.  Downstream gates (corroboration
 #   requiring 2+ sources, score gate at 0.75) handle residual false positives;
 #   a higher threshold is no longer needed to maintain trade quality.
-TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "7.0"))
+TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "5.0"))
+
+# Minimum edge (°F) for day-2+ NWS extended forecasts (source="noaa_day2" etc.).
+# Day-2 NWS MAE ≈ 5–6°F (1.4× day-1); the same 7°F edge represents only ~1.1σ
+# vs ~1.6σ for day-1. Requiring 9°F restores comparable entry quality.
+# Set to 0 to use TEMP_FORECAST_MIN_EDGE for all forecast sources uniformly.
+TEMP_DAY2_MIN_EDGE: float = float(os.environ.get("TEMP_DAY2_MIN_EDGE", "9.0"))
+
+# Per-source minimum edge overrides (°F), split by market direction.
+#
+# OVER thresholds — used when the market resolves YES if actual > strike.
+#   Sources with a cold bias (forecast < actual on average) are more conservative
+#   on over signals: a 5°F raw edge already implies ~10°F true edge for open_meteo.
+#
+# UNDER thresholds — used when the market resolves YES if actual < strike.
+#   Cold-biased sources overstate apparent under-edge: their forecast is already
+#   below actual, so a 7°F apparent edge may represent ~0°F true edge.
+#   Set to float("inf") to disable under signals from that source entirely.
+#
+# Justified by:
+#   noaa       — published NWS day-1 MAE ≈ 3–4°F, bias ≈ 0 → 5°F is ~1.4σ
+#   open_meteo — ERA5 backtest bias ≈ -5°F cold → over gains buffer, under loses it
+#   weatherapi — ERA5 backtest bias ≈ -8°F cold → under signals have ~-1°F true edge
+#
+# Override any value via env var (e.g. TEMP_EDGE_OVER_NOAA=4.0).
+TEMP_FORECAST_MIN_EDGE_OVER: dict[str, float] = {
+    "noaa":        5.0,
+    "noaa_day1":   5.0,
+    "nws_hourly":  5.0,  # NWS HRRR-driven hourly — same agency/station as settlement
+    "open_meteo":  5.0,
+    "weatherapi":  5.0,  # rarely fires; cold bias makes any over signal very reliable
+}
+
+TEMP_FORECAST_MIN_EDGE_UNDER: dict[str, float] = {
+    "noaa":        5.0,
+    "noaa_day1":   5.0,
+    "nws_hourly":  5.0,  # NWS product, near-zero bias expected
+    "open_meteo":  12.0, # need 12°F raw to net ~7°F true edge after -5°F cold bias
+    "weatherapi":  float("inf"),  # -8°F cold bias → under signals have ~-1°F true edge
+}
+
+# Load env-var overrides: TEMP_EDGE_OVER_{SOURCE} / TEMP_EDGE_UNDER_{SOURCE}
+for _src, _over_env, _under_env in [
+    ("noaa",       "TEMP_EDGE_OVER_NOAA",       "TEMP_EDGE_UNDER_NOAA"),
+    ("open_meteo", "TEMP_EDGE_OVER_OPEN_METEO",  "TEMP_EDGE_UNDER_OPEN_METEO"),
+    ("weatherapi", "TEMP_EDGE_OVER_WEATHERAPI",  "TEMP_EDGE_UNDER_WEATHERAPI"),
+    ("noaa_day2",  "TEMP_EDGE_OVER_NOAA_DAY2",   "TEMP_EDGE_UNDER_NOAA_DAY2"),
+    ("hrrr",       "TEMP_EDGE_OVER_HRRR",        "TEMP_EDGE_UNDER_HRRR"),
+    ("nws_hourly", "TEMP_EDGE_OVER_NWS_HOURLY",  "TEMP_EDGE_UNDER_NWS_HOURLY"),
+]:
+    for _d, _env in [("over", _over_env), ("under", _under_env)]:
+        _v = os.environ.get(_env)
+        if _v is not None:
+            try:
+                (_d == "over" and TEMP_FORECAST_MIN_EDGE_OVER or TEMP_FORECAST_MIN_EDGE_UNDER)[_src] = float(_v)
+            except ValueError:
+                pass
+del _src, _over_env, _under_env, _d, _env, _v  # type: ignore[name-defined]
+
+
+def _resolve_min_edge(source: str, direction: str) -> float:
+    """Return the calibrated minimum edge (°F) for a source + market direction.
+
+    Priority:
+      1. Per-source direction override (TEMP_FORECAST_MIN_EDGE_OVER/UNDER)
+      2. TEMP_DAY2_MIN_EDGE for noaa_day2+ (direction-agnostic legacy gate)
+      3. TEMP_FORECAST_MIN_EDGE global default
+    """
+    if direction == "over" and source in TEMP_FORECAST_MIN_EDGE_OVER:
+        return TEMP_FORECAST_MIN_EDGE_OVER[source]
+    if direction == "under" and source in TEMP_FORECAST_MIN_EDGE_UNDER:
+        return TEMP_FORECAST_MIN_EDGE_UNDER[source]
+    _day2 = source.startswith("noaa_day") and source != "noaa_day1"
+    if _day2 and TEMP_DAY2_MIN_EDGE > 0:
+        return TEMP_DAY2_MIN_EDGE
+    return TEMP_FORECAST_MIN_EDGE
+
 
 # Minimum edge (°F) for observed-temperature YES signals, split by direction:
 #
@@ -321,6 +477,16 @@ TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "
 TEMP_OBSERVED_MIN_EDGE_OVER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_OVER", "0.5"))
 TEMP_OBSERVED_MIN_EDGE_BETWEEN: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_BETWEEN", "0.2"))
 TEMP_OBSERVED_MIN_EDGE_UNDER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_UNDER", "2.0"))
+
+# TEMP_OBSERVED_MAX_EDGE — Upper edge cap for noaa_observed signals.
+#
+# Very large edges (>10°F) on an observed source indicate a faulty reading
+# (e.g. sensor error or station reporting a stale value), not a genuine market
+# mispricing: a real market rarely prices 10°F+ away from a temperature that has
+# already been recorded at settlement.  Post-fix backtest shows all losses on
+# noaa_observed were at edges ≥10°F (sensor errors), while all wins were ≤10°F.
+# Cap set at 10.0°F; set to a large number to disable.
+TEMP_OBSERVED_MAX_EDGE: float = float(os.environ.get("TEMP_OBSERVED_MAX_EDGE", "10.0"))
 
 # TEMP_OBSERVED_MAX_HOURS — For noaa_observed NO signals (observed max is still
 #   *below* the strike — the temperature may still rise to hit it), only surface
@@ -345,6 +511,16 @@ HRRR_MAX_SPREAD_F: float = float(os.environ.get("HRRR_MAX_SPREAD_F", "5.0"))
 #   Example: strike=92°F, gap=15°F → observed must be ≥ 77°F to trade YES.
 #   Set to 0 to disable (allow any observed gap).
 MORNING_OBS_GAP_F: float = float(os.environ.get("MORNING_OBS_GAP_F", "20.0"))
+
+# NWS_HOURLY_MAX_AGE_HOURS — Maximum age of an nws_hourly DataPoint before it
+#   is considered stale and dropped from corroboration.  nws_hourly updates every
+#   hour; a reading older than 3 hours means at least 2 update cycles were missed,
+#   indicating an API outage or network issue.  Stale readings can be dangerously
+#   wrong on warm days when the temperature rises several degrees per hour.
+#   The canonical failure is trade #224: nws_hourly last fetched at 2:15 AM ET
+#   but was used to corroborate a 9:55 AM entry — 7+ hours stale.
+#   Set to 0 to disable (allow DataPoints of any age).
+NWS_HOURLY_MAX_AGE_HOURS: float = float(os.environ.get("NWS_HOURLY_MAX_AGE_HOURS", "3.0"))
 
 # FORECAST_CORROBORATION_MIN — Minimum number of distinct forecast sources
 #   (from {noaa, owm, open_meteo}) that must independently agree on a YES
@@ -542,9 +718,16 @@ async def _get_markets(session: aiohttp.ClientSession) -> list[dict]:
             logging.warning("Numeric market sync returned empty.")
 
     if now - _general_cache_ts > GENERAL_MARKET_REFRESH_INTERVAL:
-        logging.info("General market cache stale — paginating text markets …")
-        from .markets import _paginate
-        fresh_general = await _paginate(session, status="open", total_limit=3000)
+        logging.info(
+            "General market cache stale — fetching %d text series …", len(TEXT_SERIES)
+        )
+        # Kalshi's default pagination returns thousands of KXMVE esports markets
+        # before any politics/economics/entertainment markets appear.  Fetching
+        # by series_ticker directly bypasses this and is far faster.
+        fresh_general = await fetch_markets_by_series(
+            session, series_tickers=TEXT_SERIES, status="open", limit_per_series=200
+        )
+        logging.info("General market cache: %d text-series markets fetched.", len(fresh_general))
         if fresh_general:
             _general_cache = fresh_general
             _general_cache_ts = now
@@ -937,6 +1120,15 @@ def _filter_weather_opportunities(
                 min_edge = TEMP_OBSERVED_MIN_EDGE_UNDER
             if opp.edge < min_edge:
                 continue
+            # noaa_observed max-edge cap: very high edges signal a faulty sensor
+            # reading (station reporting stale/wrong temp), not a genuine gap.
+            if opp.source == "noaa_observed" and opp.edge > TEMP_OBSERVED_MAX_EDGE:
+                logging.info(
+                    "noaa_observed max-edge cap: edge=%.1f°F > %.1f°F on %s — "
+                    "likely sensor error; suppressed",
+                    opp.edge, TEMP_OBSERVED_MAX_EDGE, opp.market_ticker,
+                )
+                continue
 
             if opp.implied_outcome == "YES":
                 # Time-of-day gate for confirmed-observation YES signals.
@@ -1045,7 +1237,38 @@ def _filter_weather_opportunities(
                     )
                 result.append(opp)
             else:
-                # NO signal: only surface within TEMP_OBSERVED_MAX_HOURS of close.
+                # NO signal.
+                #
+                # direction=over after 4:30 PM local: the observed max is BELOW
+                # the strike and the day's peak is established — this is a
+                # locked NO (mirror of the direction=between YES lock).  Flag it
+                # with peak_past=True so score_numeric_opportunity() can override
+                # the uncertainty sub-score to 1.0 instead of penalising the
+                # market's already-low YES price.
+                #
+                # All other NO signals: only surface within TEMP_OBSERVED_MAX_HOURS
+                # of close (market must be nearly over before a non-certain NO is
+                # worth acting on).
+                if opp.direction == "over":
+                    city_tz = _CITY_TZ.get(opp.metric)
+                    if city_tz is not None:
+                        local_dt = now.astimezone(city_tz)
+                        local_mins = local_dt.hour * 60 + local_dt.minute
+                        min_mins = (NOAA_OBS_PEAK_PAST_LOCAL_HOUR * 60
+                                    + NOAA_OBS_PEAK_PAST_LOCAL_MINUTE)
+                        _mkt_date = _ticker_date(opp.market_ticker)
+                        if _mkt_date == local_dt.date() and local_mins >= min_mins:
+                            opp.peak_past = True
+                            logging.info(
+                                "%s LOCKED-NO: %s  observed %.1f°F < strike %.1f°F"
+                                ", peak confirmed past %02d:%02d  (edge %.1f°F)",
+                                opp.source.upper(), opp.market_ticker,
+                                opp.data_value, opp.strike or 0.0,
+                                min_mins // 60, min_mins % 60, opp.edge,
+                            )
+                            result.append(opp)
+                            continue
+                # Standard NO gate: only surface within TEMP_OBSERVED_MAX_HOURS of close.
                 close_dt = close_dt_by_ticker.get(opp.market_ticker)
                 if close_dt is not None:
                     hours_remaining = (close_dt - now).total_seconds() / 3600
@@ -1053,8 +1276,10 @@ def _filter_weather_opportunities(
                         result.append(opp)
 
         else:
-            # Raw forecast (source="noaa", "owm", or "open_meteo"): require large edge.
-            if opp.edge < TEMP_FORECAST_MIN_EDGE:
+            # Raw forecast sources. Edge gate is per-source + direction calibrated
+            # via _resolve_min_edge() (falls back to TEMP_DAY2_MIN_EDGE /
+            # TEMP_FORECAST_MIN_EDGE for sources not in the override dicts).
+            if opp.edge < _resolve_min_edge(opp.source, opp.direction):
                 continue
 
             # Morning observation gate: block forecast YES signals when the
@@ -1173,6 +1398,7 @@ async def _poll(
         ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),
         ("adp",          adp.fetch_datapoints(session)),
         ("chicago_pmi",  chicago_pmi.fetch_datapoints(session)),
+        ("box_office",   box_office.fetch_weekend_chart(session, seen)),
         ("polymarket",   polymarket.fetch_markets(session)),
         ("metaculus",    metaculus.fetch_questions(session)),
         ("manifold",     manifold.fetch_markets(session)),
@@ -1208,8 +1434,9 @@ async def _poll(
     eia_result         = R["eia"]
     fedwatch_result    = R["fedwatch"]
     adp_result         = R["adp"]
-    chicago_pmi_result = R["chicago_pmi"]
-    poly_result        = R["polymarket"]
+    chicago_pmi_result  = R["chicago_pmi"]
+    box_office_result   = R["box_office"]
+    poly_result         = R["polymarket"]
     metaculus_result   = R["metaculus"]
     manifold_result    = R["manifold"]
     predictit_result   = R["predictit"]
@@ -1357,6 +1584,35 @@ async def _poll(
         hrrr_hourly_highs = hrrr_result  # type: ignore[assignment]
 
     # ---- numeric matching (NOAA, OWM, Binance, Frankfurter, BLS, FRED, EIA) -
+    # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
+    # is older than NWS_HOURLY_MAX_AGE_HOURS.  nws_hourly updates every hour so
+    # a 3-hour-old reading has missed ≥2 cycles and may be badly wrong on a
+    # rapidly warming day.  Stale DataPoints are dropped entirely — they should
+    # not count toward corroboration or trigger trades.
+    if not isinstance(nws_hourly_result, Exception) and nws_hourly_result and NWS_HOURLY_MAX_AGE_HOURS > 0:
+        _nws_cutoff = datetime.now(timezone.utc) - timedelta(hours=NWS_HOURLY_MAX_AGE_HOURS)
+        _nws_fresh, _nws_stale = [], []
+        for _dp in nws_hourly_result:
+            _fetched_at_str = (_dp.metadata or {}).get("fetched_at")
+            if _fetched_at_str:
+                try:
+                    _fetched_dt = datetime.fromisoformat(_fetched_at_str)
+                    if _fetched_dt < _nws_cutoff:
+                        _nws_stale.append(_dp)
+                        continue
+                except (ValueError, AttributeError):
+                    pass
+            _nws_fresh.append(_dp)
+        if _nws_stale:
+            logging.warning(
+                "nws_hourly staleness gate: dropped %d DataPoint(s) older than %.1fh"
+                " (cities: %s)",
+                len(_nws_stale),
+                NWS_HOURLY_MAX_AGE_HOURS,
+                ", ".join({dp.metadata.get("city", dp.metric) for dp in _nws_stale}),
+            )
+        nws_hourly_result = _nws_fresh
+
     data_points = []
     for label, result in [
         ("NOAA",        noaa_result),
@@ -1414,6 +1670,12 @@ async def _poll(
         logging.error("Chicago PMI fetch error: %s", chicago_pmi_result)
     elif chicago_pmi_result:
         data_points.extend(chicago_pmi_result)
+
+    # Box office — weekend gross estimates from The Numbers chart.
+    if isinstance(box_office_result, Exception):
+        logging.error("Box office fetch error: %s", box_office_result)
+    elif box_office_result:
+        data_points.extend(box_office_result)
 
     # NWS alert signals: parsed temperatures from active heat/cold warnings.
     # Treated as high-confidence numeric triggers (same confidence tier as
@@ -1519,6 +1781,12 @@ async def _poll(
         numeric_opps = find_numeric_opportunities(
             data_points, markets, min_edge=NUMERIC_MIN_EDGE
         )
+
+    # Box office custom matcher — bypasses ticker-prefix system, matches by title.
+    if box_office_result and not isinstance(box_office_result, Exception) and markets:
+        bo_opps = match_box_office_to_kalshi(box_office_result, markets)
+        if bo_opps:
+            numeric_opps.extend(bo_opps)
 
     # ---- Per-category minimum edge filter (noise reduction) -----------------
     # Drops non-weather opportunities whose edge is below a fraction of each
@@ -1803,12 +2071,18 @@ async def _poll(
             if forecast_outcome == "YES":
                 yes_sources = {o.source for o in forecasts if o.implied_outcome == "YES"}
                 noaa_yes = {s for s in yes_sources if s.startswith("noaa") or s == "hrrr"}
+                # Sources that may never trade solo (unreliable standalone forecasts):
+                # - open_meteo: raw GFS, systematically underestimates cold-front timing
+                # - weatherapi: commercial aggregator with demonstrated day+0/+1 errors
+                #   (7°F+ same-day, >16°F next-day). Can still vote in consensus.
+                _SOLO_BLOCKED = {"open_meteo", "weatherapi"}
                 gfs_only = not noaa_yes  # True when no NOAA/HRRR source is in YES set
-                if gfs_only and len(yes_sources) < 2:
+                solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
+                if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
                     logging.info(
-                        "Corroboration gate: lone open_meteo YES on %s %s — "
-                        "GFS may not trade solo; suppressed",
-                        metric, ticker,
+                        "Corroboration gate: lone %s YES on %s %s — "
+                        "unreliable source may not trade solo; suppressed",
+                        ", ".join(yes_sources), metric, ticker,
                     )
                     continue
                 if not gfs_only and FORECAST_CORROBORATION_MIN > 1:
@@ -1857,6 +2131,16 @@ async def _poll(
                 no_sources_fday = {
                     o.source for o in forecasts if o.implied_outcome == "NO"
                 }
+                # weatherapi is demoted to corroboration-only (same as open_meteo).
+                # A weatherapi-only NO on a future-day market is suppressed regardless
+                # of FORECAST_CORROBORATION_MIN.
+                if len(no_sources_fday) == 1 and no_sources_fday <= {"open_meteo", "weatherapi"}:
+                    logging.info(
+                        "Corroboration gate: lone %s NO on future-day %s %s — "
+                        "unreliable source may not trade solo; suppressed",
+                        ", ".join(no_sources_fday), metric, ticker,
+                    )
+                    continue
                 if len(no_sources_fday) < FORECAST_CORROBORATION_MIN:
                     logging.info(
                         "Corroboration gate: lone %s NO on future-day %s %s"
@@ -1871,7 +2155,8 @@ async def _poll(
             # on a same-day market carries substantial late-afternoon risk:
             # hourly forecast grids lag reality by 1–3 hours and the daily
             # high may already be locked in.  Require at least one daily
-            # source (noaa, weatherapi) to corroborate the NO direction.
+            # source (noaa) to corroborate the NO direction. weatherapi is demoted
+            # to corroboration-only and cannot act as a qualifying daily source here.
             # Trade #200 is the canonical failure: nws_hourly alone fired NO
             # at 4:11 PM ET; market resolved YES 7 minutes later.
             # HRRR is exempt: it runs hourly with data assimilation (no lag),
@@ -1892,9 +2177,39 @@ async def _poll(
                     )
                     continue
 
-            # Forecast consensus reached and no observed conflict — keep best one
-            consensus_opps.append(max(forecasts, key=lambda o: o.edge))
+            # Forecast consensus reached — select the most authoritative source
+            # as the primary, rather than max-edge (which would elevate
+            # weatherapi/open_meteo above NOAA/HRRR when their edge is higher).
+            # weatherapi and open_meteo are corroboration-only; they should never
+            # be the logged "source" that drove the trade.
+            _SRC_PRIORITY: dict[str, int] = {
+                "hrrr":       0,
+                "noaa":       1,
+                "nws_hourly": 2,
+                "noaa_day2":  3,
+                "noaa_day3":  4,
+                "noaa_day4":  5,
+                "noaa_day5":  6,
+                "noaa_day6":  7,
+                "noaa_day7":  8,
+                "open_meteo": 9,
+                "weatherapi": 10,
+            }
+            agreeing = [o for o in forecasts if o.implied_outcome == forecast_outcome]
+            best = min(agreeing, key=lambda o: _SRC_PRIORITY.get(o.source, 99))
+            best.corroborating_sources = [
+                o.source for o in agreeing if o.source != best.source
+            ]
+            consensus_opps.append(best)
         numeric_opps = consensus_opps
+
+    # ---- Log all pre-gate weather forecasts for calibration data -----------
+    # Must happen BEFORE _filter_weather_opportunities so that opportunities
+    # suppressed by the edge gate are still captured.  This feeds the backtest
+    # in scripts/backtest_source_accuracy.py with the full population of
+    # source forecasts, not just post-gate survivors.
+    if numeric_opps:
+        opp_log.log_raw_forecasts(numeric_opps)
 
     # ---- Weather-specific edge and time-to-close gates ---------------------
     # Applied after OWM consensus so both NOAA and OWM sources are already
@@ -1909,8 +2224,8 @@ async def _poll(
         if dropped:
             logging.info(
                 "Weather gate: suppressed %d temp opportunity(ies) "
-                "(forecast edge < %.0f°F, HRRR spread ≥ %.0f°F, or observed NO outside %.0fh window).",
-                dropped, TEMP_FORECAST_MIN_EDGE, HRRR_MAX_SPREAD_F, TEMP_OBSERVED_MAX_HOURS,
+                "(forecast edge below per-source threshold, HRRR spread ≥ %.0f°F, or observed NO outside %.0fh window).",
+                dropped, HRRR_MAX_SPREAD_F, TEMP_OBSERVED_MAX_HOURS,
             )
 
     # ---- Release window gate (Option D) ------------------------------------
@@ -1963,10 +2278,10 @@ async def _poll(
     # checking that the ticker segment after the prefix is a date (starts
     # with a digit), not "15M".
     _DAILY_CLOSE_PREFIXES: tuple[str, ...] = (
-        "KXBTCD", "KXDOGE", "KXADA", "KXAVAX", "KXLINK",
+        "KXBTCD", "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",
     )
     _EXEMPT_15M_PREFIXES: tuple[str, ...] = (
-        "KXDOGE15M", "KXADA15M", "KXAVAX15M", "KXLINK15M",
+        "KXDOGE15M", "KXADA15M", "KXAVAX15M", "KXLINK15M", "KXBNB15M",
     )
 
     def _is_daily_close_crypto(ticker: str) -> bool:
@@ -2599,12 +2914,54 @@ async def _poll(
                     temp_dropped, temp_open, TEMP_MAX_CONCURRENT_POSITIONS,
                 )
 
+    # ---- band-pass arbitrage must run even when all normal opportunities fail
+    # the score gate.  The second early-return below (total == 0) was previously
+    # skipping both band_arb and the end-of-poll ledger refresh, so those blocks
+    # are now hoisted here to run unconditionally before either return path.
+    # (The first early-return at line ~2472 still short-circuits before
+    # enrichment when there are literally zero opportunities of any kind.)
+
+    # ---- band-pass arbitrage (METAR observed high vs. KXHIGH band markets) --
+    # Duplicate of the identical block lower in _poll; this copy runs even when
+    # all text/numeric/poly signals fail the score gate.
+    _band_arb_obs_early: dict[str, float] = {
+        dp.metric: dp.value
+        for dp in metar_result
+        if dp.metric.startswith("temp_high")
+    }
+    _band_arb_noaa_obs_early: dict[str, float] = {
+        dp.metric: dp.value
+        for dp in data_points
+        if dp.source == "noaa_observed" and dp.metric.startswith("temp_high")
+    }
+    if _band_arb_obs_early:
+        _early_band_arb_signals = find_band_arbs(
+            markets,
+            _band_arb_obs_early,
+            noaa_obs_values=_band_arb_noaa_obs_early or None,
+        )
+        if _early_band_arb_signals:
+            logging.info(
+                "Band arb (pre-score-gate): %d signal(s) found (BAND_ARB_EXECUTION_ENABLED=%s).",
+                len(_early_band_arb_signals), BAND_ARB_EXECUTION_ENABLED,
+            )
+            for _barb in _early_band_arb_signals:
+                await executor.maybe_trade_band_arb(session, _barb)
+
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)
     if total == 0:
         logging.info("No new opportunities to surface this cycle.")
+        executor.stats.log_summary()
+        executor.stats.reset()
         if ledger is not None:
-            await ledger.refresh_and_write(session)
+            logging.info("DryRunLedger: refreshing overview (no-trade cycle).")
+            await ledger.refresh_and_write(
+                session,
+                numeric_opps=_exit_numeric_opps,
+                poly_opps=_exit_poly_opps,
+            )
+            logging.info("DryRunLedger: overview write complete.")
         return
 
     print(f"\n{_WIDE}")
@@ -2701,24 +3058,7 @@ async def _poll(
         for _ba in bracket_opps:
             await executor.execute_bracket_set_arb(session, _ba)
 
-    # ---- band-pass arbitrage (METAR observed high vs. KXHIGH band markets) --
-    # When METAR shows the daily max has already exceeded a band's upper bound,
-    # that band's YES contract resolves 0¢ — buy NO before the market reprices.
-    # METAR's 5–8 minute head-start over NOAA's aggregated feed is the edge.
-    _band_arb_obs: dict[str, float] = {
-        dp.metric: dp.value
-        for dp in metar_result
-        if dp.metric.startswith("temp_high")
-    }
-    if _band_arb_obs:
-        band_arb_signals = find_band_arbs(markets, _band_arb_obs)
-        if band_arb_signals:
-            logging.info(
-                "Band arb: %d signal(s) found (BAND_ARB_EXECUTION_ENABLED=%s).",
-                len(band_arb_signals), BAND_ARB_EXECUTION_ENABLED,
-            )
-            for _barb in band_arb_signals:
-                await executor.maybe_trade_band_arb(session, _barb)
+    # (band_arb runs unconditionally earlier in _poll — see pre-score-gate block)
 
     print(_WIDE + "\n")
 
@@ -2733,6 +3073,148 @@ async def _poll(
             numeric_opps=_exit_numeric_opps,
             poly_opps=_exit_poly_opps,
         )
+
+    # ---- populate fast-loop watchlist --------------------------------------
+    # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
+    # inner loop only refreshes series prices for cities that matter.
+    global _near_threshold_cities, _last_noaa_obs
+    _near_threshold_cities = set()
+    for _wl_mkt in markets:
+        _wl_parsed = parse_market(_wl_mkt)
+        if _wl_parsed is None or not _wl_parsed.metric.startswith("temp_high"):
+            continue
+        _wl_obs = _band_arb_obs_early.get(_wl_parsed.metric)
+        if _wl_obs is None:
+            continue
+        _wl_ceil: float | None = None
+        if _wl_parsed.direction == "between" and _wl_parsed.strike_hi is not None:
+            _wl_ceil = _wl_parsed.strike_hi
+        elif _wl_parsed.direction == "under" and _wl_parsed.strike is not None:
+            _wl_ceil = _wl_parsed.strike
+        if _wl_ceil is not None and abs(_wl_ceil - _wl_obs) <= WATCH_THRESHOLD_F:
+            _near_threshold_cities.add(_wl_parsed.metric)
+    _last_noaa_obs = _band_arb_noaa_obs_early.copy()
+    if _near_threshold_cities:
+        logging.debug(
+            "Fast-loop watchlist: %d near-threshold city(ies): %s",
+            len(_near_threshold_cities), sorted(_near_threshold_cities),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Adaptive poll interval
+# ---------------------------------------------------------------------------
+
+def _adaptive_poll_interval(now_utc: datetime) -> int:
+    """Return the sleep interval (seconds) appropriate for the current moment.
+
+    Two windows trigger POLL_INTERVAL_FAST instead of POLL_INTERVAL_SECONDS:
+
+    1. EIA/KXWTI release window
+       Within POLL_INTERVAL_EIA_WINDOW_MINUTES of any EIA WTI or natgas
+       release, KXWTI/KXNATGAS markets can reprice within 1–2 minutes.
+       A fast poll captures the information edge before the market closes.
+
+    2. Band-arb / METAR peak-heating window
+       Between POLL_BAND_ARB_START_ET_HOUR and POLL_BAND_ARB_END_ET_HOUR
+       (default 13:00–21:00 ET), METAR observed highs are most likely to
+       cross a band threshold and trigger a locked-NO arb signal.
+       Faster polling reduces the average delay from ~60s to ~20s.
+
+    Outside these windows the base POLL_INTERVAL_SECONDS applies.
+    POLL_INTERVAL_FAST is capped at POLL_INTERVAL_SECONDS so setting it
+    larger than the base has no effect.
+    """
+    fast = min(POLL_INTERVAL_FAST, POLL_INTERVAL_SECONDS)
+
+    # EIA release window
+    if POLL_INTERVAL_EIA_WINDOW_MINUTES > 0 and fast < POLL_INTERVAL_SECONDS:
+        if (
+            is_within_release_window("eia_wti", now_utc, POLL_INTERVAL_EIA_WINDOW_MINUTES)
+            or is_within_release_window("eia_natgas", now_utc, POLL_INTERVAL_EIA_WINDOW_MINUTES)
+        ):
+            logging.info(
+                "Adaptive poll: EIA release window active — using %ds interval.",
+                fast,
+            )
+            return fast
+
+    # Band-arb / METAR peak-heating window
+    if POLL_BAND_ARB_START_ET_HOUR < POLL_BAND_ARB_END_ET_HOUR and fast < POLL_INTERVAL_SECONDS:
+        et_hour = now_utc.astimezone(_ET).hour
+        if POLL_BAND_ARB_START_ET_HOUR <= et_hour < POLL_BAND_ARB_END_ET_HOUR:
+            return fast
+
+    return POLL_INTERVAL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Fast inner loop
+# ---------------------------------------------------------------------------
+
+async def _fast_loop(
+    session: aiohttp.ClientSession,
+    executor: "TradeExecutor",
+) -> None:
+    """Lightweight band-arb check that runs between full poll cycles.
+
+    Only fetches METAR (hits 30s cache most iterations) and refreshes KXHIGH
+    series prices for cities that were within WATCH_THRESHOLD_F of a band
+    ceiling in the last full cycle.  Uses cached NOAA observed values from
+    the last full cycle for corroboration — NOAA updates every 5–60 min so a
+    60s-stale value is always at least as fresh as NOAA's own cadence.
+    """
+    if not _near_threshold_cities:
+        return
+
+    # METAR fetch — usually returns from 30s cache, one HTTP call otherwise
+    try:
+        metar_result = await metar.fetch_city_forecasts(session)
+    except Exception as exc:
+        logging.debug("Fast loop: METAR fetch failed: %s", exc)
+        return
+
+    obs_values = {
+        dp.metric: dp.value
+        for dp in metar_result
+        if dp.metric.startswith("temp_high")
+    }
+    if not obs_values:
+        return
+
+    # Refresh prices only for near-threshold city series
+    _METRIC_TO_SERIES: dict[str, str] = {
+        v: k for k, v in TICKER_TO_METRIC.items() if k.startswith("KXHIGH")
+    }
+    series_to_fetch = [
+        _METRIC_TO_SERIES[m]
+        for m in _near_threshold_cities
+        if m in _METRIC_TO_SERIES
+    ]
+    if not series_to_fetch:
+        return
+
+    fresh_markets: list[dict] = []
+    for series in series_to_fetch:
+        try:
+            batch = await fetch_markets_by_series(session, [series], status="open")
+            fresh_markets.extend(batch)
+            await asyncio.sleep(0.2)
+        except Exception as exc:
+            logging.debug("Fast loop: series fetch failed %s: %s", series, exc)
+
+    if not fresh_markets:
+        return
+
+    signals = find_band_arbs(
+        fresh_markets,
+        obs_values,
+        noaa_obs_values=_last_noaa_obs or None,
+    )
+    if signals:
+        logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))
+    for signal in signals:
+        await executor.maybe_trade_band_arb(session, signal)
 
 
 # ---------------------------------------------------------------------------
@@ -2776,8 +3258,20 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                     except Exception as exc:
                         logging.error("Win-rate tracker error: %s", exc)
 
-                logging.info("Next poll in %ds …", poll_interval)
-                await asyncio.sleep(poll_interval)
+                _sleep = _adaptive_poll_interval(datetime.now(timezone.utc))
+                logging.info("Next poll in %ds …", _sleep)
+                # Interleave fast band-arb loops during the sleep window
+                _elapsed = 0.0
+                while _elapsed + FAST_LOOP_INTERVAL < _sleep:
+                    await asyncio.sleep(FAST_LOOP_INTERVAL)
+                    _elapsed += FAST_LOOP_INTERVAL
+                    try:
+                        await _fast_loop(session, executor)
+                    except Exception as exc:
+                        logging.debug("Fast loop error: %s", exc)
+                _remaining = _sleep - _elapsed
+                if _remaining > 0:
+                    await asyncio.sleep(_remaining)
     finally:
         seen.close()
         opp_log.close()

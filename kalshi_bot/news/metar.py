@@ -64,7 +64,7 @@ from .noaa import CITIES, KALSHI_STATION_IDS
 
 _BASE_URL = "https://aviationweather.gov/api/data/metar"
 
-METAR_CACHE_SECONDS: int = int(os.environ.get("METAR_CACHE_SECONDS", "90"))
+METAR_CACHE_SECONDS: int = int(os.environ.get("METAR_CACHE_SECONDS", "30"))
 METAR_LOOKBACK_HOURS: int = int(os.environ.get("METAR_LOOKBACK_HOURS", "24"))
 
 # Reverse map: ICAO station ID → metric key (e.g. "KNYC" → "temp_high_ny")
