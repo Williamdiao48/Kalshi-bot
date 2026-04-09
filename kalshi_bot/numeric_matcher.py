@@ -31,12 +31,19 @@ Environment variables
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from .data import DataPoint
 from .market_parser import ParsedMarket, parse_all_markets
+from .news.noaa import CITIES as _TEMP_HIGH_CITIES  # timezone lookup for date-alignment guard
+
+_MONTH_MAP: dict[str, int] = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
 
 # ---------------------------------------------------------------------------
 # Metrics to skip entirely (zero-liquidity / no signal)
@@ -104,6 +111,18 @@ class NumericOpportunity:
     hours_to_close: float | None = None
     # Extra source-specific fields from DataPoint.metadata (e.g. ensemble_spread)
     metadata: dict = field(default_factory=dict)
+    # Set to True by _filter_weather_opportunities() when a locked-observation
+    # "over NO" signal fires after 4:30 PM local city time — meaning the day's
+    # peak is confirmed below the strike.  Used by scoring.py to override the
+    # uncertainty sub-score to 1.0 (same treatment as locked YES signals).
+    peak_past: bool = False
+    # All sources that agreed with this opportunity's direction in the same
+    # consensus group (excluding the primary source itself).  Set by the
+    # consensus loop in main.py before the opportunity is forwarded to
+    # trade_executor.  Empty for single-source signals (crypto, EIA, etc.).
+    # Stored in trades.corroborating_sources (comma-separated) for win-rate
+    # analysis by source combination.
+    corroborating_sources: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +316,41 @@ def find_numeric_opportunities(
         pct_change: float | None = dp.metadata.get("pct_change") if dp.metadata else None
 
         for pm in candidates:
+            # --- Date-alignment guard for temperature markets ---------------
+            # A data point for "today" must not be matched against a market
+            # that resolves on a different date.  Observed sources (metar,
+            # noaa_observed, hrrr) use current UTC time as as_of but only
+            # carry today's city-local reading; forecast sources (weatherapi,
+            # open_meteo, noaa_day2…) set as_of to noon on the forecast date.
+            # Converting as_of → city local date handles both cases uniformly.
+            if dp.metric.startswith("temp_high"):
+                _city_info = _TEMP_HIGH_CITIES.get(dp.metric)
+                if _city_info is not None:
+                    _city_tz = _city_info[3]
+                    try:
+                        _as_of_dt = datetime.fromisoformat(dp.as_of.replace("Z", "+00:00"))
+                        _dp_local_date = _as_of_dt.astimezone(_city_tz).date()
+                    except (ValueError, AttributeError):
+                        _dp_local_date = None
+                    _mkt_date = None
+                    _tparts = pm.ticker.split("-")
+                    if len(_tparts) >= 2:
+                        _dm = re.fullmatch(r"(\d{2})([A-Z]{3})(\d{2})", _tparts[1])
+                        if _dm:
+                            _yr, _mon_str, _day = _dm.groups()
+                            _mon = _MONTH_MAP.get(_mon_str)
+                            if _mon:
+                                try:
+                                    _mkt_date = datetime(2000 + int(_yr), _mon, int(_day)).date()
+                                except ValueError:
+                                    pass
+                    if _dp_local_date is not None and _mkt_date is not None and _dp_local_date != _mkt_date:
+                        logging.debug(
+                            "DateGuard skip: %s source=%s dp_date=%s mkt_date=%s",
+                            pm.ticker, dp.source, _dp_local_date, _mkt_date,
+                        )
+                        continue
+
             outcome, raw_edge = _implied_outcome(dp.value, pm, pct_change)
             effective_edge = raw_edge * multiplier
             if effective_edge < min_edge:
