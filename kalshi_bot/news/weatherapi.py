@@ -57,7 +57,8 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -82,6 +83,7 @@ async def _fetch_city_forecast(
     lat: float,
     lon: float,
     api_key: str,
+    city_tz: "ZoneInfo",
 ) -> list[DataPoint]:
     """Fetch WeatherAPI forecast daily highs for one city.
 
@@ -123,7 +125,10 @@ async def _fetch_city_forecast(
         logging.warning("WeatherAPI: empty forecastday for %s", city_name)
         return []
 
-    today_utc = datetime.now(timezone.utc).date()
+    # Anchor to the city's local date, not UTC, because WeatherAPI returns
+    # forecastday dates in local time. Using UTC as anchor drops the local-today
+    # entry for PT cities during 0:00–8:00 UTC (day_offset computes as -1).
+    today_local = datetime.now(city_tz).date()
     points: list[DataPoint] = []
     summary_parts: list[str] = []
 
@@ -138,15 +143,16 @@ async def _fetch_city_forecast(
         except ValueError:
             continue
 
-        day_offset = (entry_date - today_utc).days
+        day_offset = (entry_date - today_local).days
         if day_offset < 0 or day_offset >= WEATHERAPI_FORECAST_DAYS:
             continue
 
         value = float(maxtemp_f)
+        # as_of = noon in the city's local timezone (matches NOAA convention).
         as_of = datetime(
             entry_date.year, entry_date.month, entry_date.day,
-            12, 0, 0, tzinfo=timezone.utc,
-        ).isoformat()
+            12, 0, 0, tzinfo=city_tz,
+        ).astimezone(timezone.utc).isoformat()
 
         label = "today" if day_offset == 0 else f"day+{day_offset}"
         summary_parts.append(f"{label}={value:.1f}°F")
@@ -188,8 +194,8 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         return []
 
     tasks = [
-        _fetch_city_forecast(session, metric, city_name, lat, lon, api_key)
-        for metric, (city_name, lat, lon, *_) in CITIES.items()
+        _fetch_city_forecast(session, metric, city_name, lat, lon, api_key, city_tz)
+        for metric, (city_name, lat, lon, city_tz) in CITIES.items()
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -64,7 +64,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-INPUT_FILE  = Path(__file__).parent.parent / "data" / "kalshi_markets.jsonl"
+INPUT_FILE  = Path(__file__).parent.parent / "data" / "kalshi_resolved_markets.jsonl"
 OUTPUT_FILE = Path(__file__).parent.parent / "data" / "gdelt_article_list.jsonl"
 
 GCP_PROJECT_ID    = os.environ.get("GCP_PROJECT_ID", "")
@@ -276,16 +276,17 @@ def _build_plan(market: dict[str, Any]) -> dict[str, Any] | None:
         return None  # too generic to query safely
 
     return {
-        "ticker":       ticker,
-        "title":        title,
-        "result":       market.get("result"),
-        "category":     market.get("category", "other"),
+        "ticker":          ticker,
+        "title":           title,
+        "result":          market.get("result"),
+        "category":        market.get("category", "other"),
+        "kalshi_category": market.get("kalshi_category", "other"),
         "resolution_time": res_time,
-        "patterns":     patterns,
-        "start_dt":     start_dt,
-        "end_dt":       end_dt,
-        "gdelt_start":  _gdelt_int(start_dt),
-        "gdelt_end":    _gdelt_int(end_dt),
+        "patterns":        patterns,
+        "start_dt":        start_dt,
+        "end_dt":          end_dt,
+        "gdelt_start":     _gdelt_int(start_dt),
+        "gdelt_end":       _gdelt_int(end_dt),
     }
 
 
@@ -461,6 +462,7 @@ def _run_batch(
                 "market_title":            plan["title"],
                 "market_result":           plan["result"],
                 "market_category":         plan["category"],
+                "kalshi_category":         plan["kalshi_category"],
                 "resolution_time":         plan["resolution_time"],
                 "gdelt_query":             " AND ".join(plan["patterns"][:2]),
                 "article_url":             url,

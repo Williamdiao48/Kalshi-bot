@@ -415,8 +415,8 @@ async def _fetch_high_temp(
     if obs_url:
         observed_max = await _fetch_observed_max_today(session, city_name, obs_url, city_tz)
 
-    today_noon_et = datetime.now(_ET).replace(hour=12, minute=0, second=0, microsecond=0)
-    as_of = today_noon_et.astimezone(timezone.utc).isoformat()
+    today_noon_local = datetime.now(city_tz).replace(hour=12, minute=0, second=0, microsecond=0)
+    as_of = today_noon_local.astimezone(timezone.utc).isoformat()
 
     # Build extended forecast DataPoints for days 2–7 (NWS returns up to 7
     # daytime periods in a single response).  Day N's as_of is set to noon ET

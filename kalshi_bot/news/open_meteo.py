@@ -68,7 +68,8 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -89,11 +90,22 @@ OPEN_METEO_CACHE_MINUTES: int = int(os.environ.get("OPEN_METEO_CACHE_MINUTES", "
 
 _BASE_URL = "https://api.open-meteo.com/v1/forecast"
 
-# ET timezone for as_of timestamps (matches NOAA convention).
-_ET = timezone(timedelta(hours=-5))  # EST; DST is handled by the date guard
+# Open-Meteo timezone strings for each city — used so the API returns daily
+# dates in local time rather than UTC, matching what Kalshi settles against.
+_CITY_TZ_STRINGS: dict[str, str] = {
+    "temp_high_lax": "America/Los_Angeles",
+    "temp_high_den": "America/Denver",
+    "temp_high_chi": "America/Chicago",
+    "temp_high_ny":  "America/New_York",
+    "temp_high_mia": "America/New_York",
+    "temp_high_aus": "America/Chicago",
+    "temp_high_dal": "America/Chicago",
+    "temp_high_bos": "America/New_York",
+    "temp_high_hou": "America/Chicago",
+}
 
 # ---------------------------------------------------------------------------
-# Module-level cache (avoids hammering the API every 60s)
+# Module-level cache
 # ---------------------------------------------------------------------------
 _cache_time: float = 0.0           # monotonic timestamp of last successful fetch
 _cache_points: list[DataPoint] = []  # last successful result set
@@ -104,19 +116,21 @@ _cache_points: list[DataPoint] = []  # last successful result set
 # ---------------------------------------------------------------------------
 
 async def _fetch_city_forecast(
-    session:   aiohttp.ClientSession,
-    metric:    str,
-    city_name: str,
-    lat:       float,
-    lon:       float,
+    session:      aiohttp.ClientSession,
+    metric:       str,
+    city_name:    str,
+    lat:          float,
+    lon:          float,
+    city_tz:      ZoneInfo,
+    city_tz_str:  str,
 ) -> list[DataPoint]:
     """Fetch standard high temperature forecasts for one city across multiple days.
 
     Emits one DataPoint per forecast day (up to OPEN_METEO_FORECAST_DAYS days).
     Each DataPoint carries ``forecast_date`` and ``forecast_offset`` in metadata
     so the date guard in main.py aligns it to the correct Kalshi market.  The
-    ``as_of`` timestamp follows NOAA's convention: noon ET on the target forecast
-    date, so the date guard comparison is consistent across sources.
+    ``as_of`` timestamp is noon in the city's local timezone, matching the NOAA
+    extended-forecast convention.
 
     Returns list of DataPoints (may be empty on error).
     """
@@ -125,7 +139,7 @@ async def _fetch_city_forecast(
         "longitude":        f"{lon:.4f}",
         "daily":            "temperature_2m_max",
         "temperature_unit": "fahrenheit",
-        "timezone":         "UTC",
+        "timezone":         city_tz_str,  # local tz so daily dates match Kalshi settlement
         "forecast_days":    str(OPEN_METEO_FORECAST_DAYS),
     }
 
@@ -149,8 +163,9 @@ async def _fetch_city_forecast(
         logging.warning("Open-Meteo: empty daily response for %s", city_name)
         return []
 
-    # Find index for today's UTC date — the starting anchor.
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Find index for today's LOCAL date — anchor to city tz so the date aligns
+    # with what Kalshi settles against (local calendar day, not UTC).
+    today_str = datetime.now(city_tz).strftime("%Y-%m-%d")
     try:
         today_idx = times.index(today_str)
     except ValueError:
@@ -174,13 +189,13 @@ async def _fetch_city_forecast(
 
         value = float(temp_val)
 
-        # as_of = noon ET on the forecast date (matches NOAA extended-forecast
+        # as_of = noon in the city's local timezone (matches NOAA extended-forecast
         # convention so the date guard in main.py treats both sources the same).
         try:
-            forecast_noon_et = datetime.strptime(
+            forecast_noon_local = datetime.strptime(
                 forecast_date_str, "%Y-%m-%d"
-            ).replace(hour=12, tzinfo=_ET)
-            as_of = forecast_noon_et.astimezone(timezone.utc).isoformat()
+            ).replace(hour=12, tzinfo=city_tz)
+            as_of = forecast_noon_local.astimezone(timezone.utc).isoformat()
         except ValueError:
             as_of = datetime.now(timezone.utc).isoformat()
 
@@ -238,8 +253,12 @@ async def fetch_city_forecasts(
         return _cache_points
 
     tasks = [
-        _fetch_city_forecast(session, metric, city_name, lat, lon)
-        for metric, (city_name, lat, lon, *_) in CITIES.items()
+        _fetch_city_forecast(
+            session, metric, city_name, lat, lon,
+            city_tz=city_tz,
+            city_tz_str=_CITY_TZ_STRINGS.get(metric, "UTC"),
+        )
+        for metric, (city_name, lat, lon, city_tz) in CITIES.items()
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

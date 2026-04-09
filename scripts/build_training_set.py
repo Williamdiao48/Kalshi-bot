@@ -75,6 +75,12 @@ TRAIN_FRAC: float      = float(os.environ.get("TRAIN_FRAC", "0.70"))
 VAL_FRAC: float        = float(os.environ.get("VAL_FRAC", "0.15"))
 ARTICLE_BODY_CHARS: int = int(os.environ.get("ARTICLE_BODY_CHARS", "1500"))
 
+# Max hours before resolution to include an article in training.
+# Articles published >N hours before resolution have very low predictive signal
+# because the actual determining event usually happens close to resolution.
+# 0 = disabled (include all). Default: 168 (7 days).
+MAX_HOURS_BEFORE: float = float(os.environ.get("MAX_HOURS_BEFORE", "168.0"))
+
 # Minimum markets per category before we stop stratifying that category
 # and just pool with "other" (avoids empty val/test splits for tiny categories)
 MIN_MARKETS_TO_STRATIFY = 5
@@ -217,6 +223,22 @@ def main() -> None:
         logging.error("No kept records found. Check label_with_claude.py output.")
         sys.exit(1)
 
+    # Temporal filter: drop articles published too far before resolution
+    if MAX_HOURS_BEFORE > 0:
+        before = len(kept_records)
+        kept_records = [
+            r for r in kept_records
+            if (r.get("hours_before_resolution") or 999999) <= MAX_HOURS_BEFORE
+        ]
+        logging.info(
+            "Temporal filter (≤%.0fh before resolution): %d → %d records (dropped %d).",
+            MAX_HOURS_BEFORE, before, len(kept_records), before - len(kept_records),
+        )
+
+    if not kept_records:
+        logging.error("No records remain after temporal filter. Lower MAX_HOURS_BEFORE.")
+        sys.exit(1)
+
     # Deduplicate within (market_ticker, article_url) — keep highest-scoring
     dedup: dict[tuple[str, str], dict[str, Any]] = {}
     for rec in kept_records:
@@ -232,7 +254,11 @@ def main() -> None:
     market_to_records: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for rec in kept_records:
         ticker = rec.get("market_ticker", "UNKNOWN")
-        market_to_category[ticker] = rec.get("market_category", "other")
+        # Prefer kalshi_category (specific domain label from filter_kalshi_markets.py)
+        # over market_category (Kalshi API returns "other" for all KX* markets)
+        market_to_category[ticker] = (
+            rec.get("kalshi_category") or rec.get("market_category", "other")
+        )
         market_to_records[ticker].append(rec)
 
     all_market_tickers = list(market_to_records.keys())
@@ -261,6 +287,7 @@ def main() -> None:
                 "market_ticker":           ticker,
                 "market_title":            rec.get("market_title", ""),
                 "market_category":         rec.get("market_category", "other"),
+                "kalshi_category":         rec.get("kalshi_category", ""),
                 "article_url":             rec.get("article_url", ""),
                 "article_headline":        rec.get("article_headline", ""),
                 "article_date":            rec.get("article_date", ""),

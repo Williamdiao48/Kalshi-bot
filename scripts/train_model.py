@@ -272,7 +272,7 @@ def main(max_epochs: int) -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ---- Training loop -----------------------------------------------------
-    best_val_loss  = float("inf")
+    best_val_auc   = -1.0
     patience_count = 0
     best_epoch     = 0
 
@@ -286,6 +286,7 @@ def main(max_epochs: int) -> None:
             class_weights=None,  # unweighted — honest early-stop signal
         )
         val_metrics = _evaluate_full(model, val_loader, device)
+        val_auc = val_metrics["auc"]
 
         logging.info(
             "Epoch %2d/%d  train_loss=%.4f acc=%.3f | val_loss=%.4f acc=%.3f "
@@ -293,18 +294,18 @@ def main(max_epochs: int) -> None:
             epoch, max_epochs,
             train_loss, train_acc,
             val_loss, val_acc,
-            val_metrics["f1"], val_metrics["auc"],
+            val_metrics["f1"], val_auc,
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
+        if val_auc > best_val_auc:
+            best_val_auc   = val_auc
             best_epoch     = epoch
             patience_count = 0
             # Save best checkpoint
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(OUTPUT_DIR)
             tokenizer.save_pretrained(OUTPUT_DIR)
-            logging.info("  ✓ New best — checkpoint saved.")
+            logging.info("  ✓ New best (auc=%.3f) — checkpoint saved.", val_auc)
         else:
             patience_count += 1
             logging.info(

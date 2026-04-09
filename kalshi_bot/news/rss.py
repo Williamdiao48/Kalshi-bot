@@ -20,6 +20,10 @@ Feeds included and their relevance to live Kalshi market categories:
   politico_energy     Politico Energy     → energy / EPA markets
   politico_politics   Politico Politics   → production election / admin markets
   thehill             The Hill            → production Congress / political markets
+  coindesk            CoinDesk            → KXBTC*, KXDOGE*, KXETH* crypto markets
+  cointelegraph       Cointelegraph       → KXBTC*, KXDOGE*, KXETH* crypto markets
+  cnbc_top            CNBC Top News       → economics / equity index markets
+  marketwatch         MarketWatch         → economics / equity index markets
 
 Normalized article format (compatible with matcher.py and state.py):
   {
@@ -69,11 +73,22 @@ FEEDS: list[Feed] = [
     Feed("politico_energy",    "Politico Energy",    "https://rss.politico.com/energy.xml"),
     Feed("politico_politics",  "Politico Politics",  "https://rss.politico.com/politics-news.xml"),
     Feed("thehill",     "The Hill",             "https://thehill.com/feed/"),
-    # Sports (KXNBA* markets)
-    Feed("espn_nba",    "ESPN NBA",             "https://www.espn.com/espn/rss/nba/news"),
-    Feed("espn_top",    "ESPN Top Stories",     "https://www.espn.com/espn/rss/news"),
-    # Entertainment (KXTOPSONG markets)
-    Feed("billboard",   "Billboard",            "https://www.billboard.com/feed/"),
+    # Sports (KXNBA*, KXNHL*, KXMLB*, KXF1* markets)
+    Feed("espn_nba",      "ESPN NBA",          "https://www.espn.com/espn/rss/nba/news"),
+    Feed("espn_nhl",      "ESPN NHL",          "https://www.espn.com/espn/rss/nhl/news"),
+    Feed("espn_mlb",      "ESPN MLB",          "https://www.espn.com/espn/rss/mlb/news"),
+    Feed("espn_top",      "ESPN Top Stories",  "https://www.espn.com/espn/rss/news"),
+    Feed("motorsport_f1", "Motorsport F1",     "https://www.motorsport.com/rss/f1/news/"),
+    # Entertainment (KXTOPSONG, KXRT markets)
+    Feed("billboard",          "Billboard",           "https://www.billboard.com/feed/"),
+    Feed("variety",            "Variety",             "https://variety.com/feed/"),
+    Feed("hollywood_reporter", "Hollywood Reporter",  "https://www.hollywoodreporter.com/feed/"),
+    # Crypto news (KXBTC*, KXDOGE*, KXETH* markets)
+    Feed("coindesk",      "CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    Feed("cointelegraph", "Cointelegraph", "https://cointelegraph.com/rss"),
+    # Financial news (economics, earnings, macro)
+    Feed("cnbc_top",    "CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    Feed("marketwatch", "MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
 ]
 
 

@@ -80,9 +80,13 @@ VADER_THRESHOLD:  float = float(os.environ.get("HEURISTIC_VADER_THRESHOLD",  "0.
 ARTICLE_CHARS:    int   = int(os.environ.get("HEURISTIC_ARTICLE_CHARS",      "3000"))
 ENCODE_BATCH:     int   = int(os.environ.get("HEURISTIC_ENCODE_BATCH",       "512"))
 
-# Market categories where the temporal embargo applies
+# Market categories where the temporal embargo applies (original Kalshi/Manifold labels)
 _EMBARGO_CATEGORIES: frozenset[str] = frozenset({
     "political_action", "regulatory", "corporate",
+})
+# kalshi_category values (from filter_kalshi_markets.py) that also get the embargo
+_KALSHI_EMBARGO_CATEGORIES: frozenset[str] = frozenset({
+    "politics",
 })
 
 # Minimal English stopwords (no NLTK dependency)
@@ -236,12 +240,18 @@ def main(dry_run: bool = False) -> None:
     records: list[dict] = []
 
     for i, pair in enumerate(remaining):
-        hours    = float(pair.get("hours_before_resolution") or 0.0)
-        body     = (pair.get("article_body") or "")
-        category = pair.get("market_category", "other")
-        ticker   = pair.get("market_ticker", "")
-        outcome  = (pair.get("market_result") or "").lower()
-        kws      = keywords_list[i]
+        hours          = float(pair.get("hours_before_resolution") or 0.0)
+        body           = (pair.get("article_body") or "")
+        category       = pair.get("market_category", "other")
+        kalshi_cat     = pair.get("kalshi_category", "")
+        ticker         = pair.get("market_ticker", "")
+        outcome        = (pair.get("market_result") or "").lower()
+        kws            = keywords_list[i]
+
+        _embargo_applies = (
+            category in _EMBARGO_CATEGORIES
+            or kalshi_cat in _KALSHI_EMBARGO_CATEGORIES
+        )
 
         # Hard gates
         if len(body) < 200:
@@ -252,7 +262,7 @@ def main(dry_run: bool = False) -> None:
             counters["gate_too_early"] += 1
             kept = False
             reason = "too_early"
-        elif hours < EMBARGO_H and category in _EMBARGO_CATEGORIES:
+        elif hours < EMBARGO_H and _embargo_applies:
             counters["gate_embargo"] += 1
             kept = False
             reason = "embargo"

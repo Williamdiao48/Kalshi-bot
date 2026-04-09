@@ -43,6 +43,7 @@ SYMBOLS: dict[str, str] = {
     "ADAUSDT":  "price_ada_usd",
     "AVAXUSDT": "price_avax_usd",
     "LINKUSDT": "price_link_usd",
+    "BNBUSDT":  "price_bnb_usd",
 }
 
 # Display labels for logging
@@ -55,6 +56,7 @@ _LABELS: dict[str, str] = {
     "ADAUSDT":  "ADA",
     "AVAXUSDT": "AVAX",
     "LINKUSDT": "LINK",
+    "BNBUSDT":  "BNB",
 }
 
 

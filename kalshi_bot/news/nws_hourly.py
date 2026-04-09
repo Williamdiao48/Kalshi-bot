@@ -45,6 +45,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -58,6 +59,11 @@ NWS_HOURLY_CACHE_MINUTES: int = int(os.environ.get("NWS_HOURLY_CACHE_MINUTES", "
 NWS_HOURLY_FORECAST_DAYS: int = min(7, max(1, int(
     os.environ.get("NWS_HOURLY_FORECAST_DAYS", "3")
 )))
+
+# Wall-clock UTC ISO timestamp of the most recent successful fetch per city.
+# Stored in DataPoint metadata as "fetched_at" so main.py can detect staleness
+# regardless of cache hits — cached DataPoints carry the original fetch time.
+_city_fetch_time: dict[str, str] = {}
 
 # Per-city cache: metric → (monotonic_time, list[DataPoint])
 _city_cache: dict[str, tuple[float, list[DataPoint]]] = {}
@@ -104,6 +110,7 @@ async def _fetch_city_hourly(
     city_name: str,
     lat: float,
     lon: float,
+    city_tz: ZoneInfo,
 ) -> list[DataPoint]:
     """Fetch NWS hourly forecast daily highs for one city.
 
@@ -118,6 +125,8 @@ async def _fetch_city_hourly(
         cache_ts, cache_pts = cached
         if (now - cache_ts) < cache_ttl:
             return cache_pts
+
+    fetch_wall_time = datetime.now(timezone.utc).isoformat()
 
     hourly_url = await _get_hourly_url(session, lat, lon)
     if not hourly_url:
@@ -141,10 +150,6 @@ async def _fetch_city_hourly(
         return []
 
     # Build day → max_temp mapping using LOCAL dates from each period's timestamp.
-    # US cities are UTC-4 to UTC-8; at any hour of day, "today" local is either
-    # the same as UTC date or one day behind it.  We compute offsets against the
-    # UTC date but the day_highs keys are LOCAL dates from the API timestamps.
-    today_utc = datetime.now(timezone.utc).date()
     day_highs: dict[str, float] = {}
 
     for period in features:
@@ -158,7 +163,7 @@ async def _fetch_city_hourly(
             dt = datetime.fromisoformat(start_raw)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            date_str = dt.strftime("%Y-%m-%d")  # local date, not UTC
+            date_str = dt.strftime("%Y-%m-%d")  # local date from timestamp
         except ValueError:
             continue
         if date_str in day_highs:
@@ -169,19 +174,10 @@ async def _fetch_city_hourly(
     points: list[DataPoint] = []
     summary_parts: list[str] = []
 
-    # Local "today" for US cities may be one calendar day behind UTC today
-    # (e.g. UTC 02:00 = previous local evening for UTC-8 cities).
-    # Try both UTC date and UTC-1 day to find the matching local date key.
-    local_today_candidates = [
-        today_utc + timedelta(days=d) for d in (-1, 0)
-    ]
-    # Find actual local today: the candidate whose date_str exists in day_highs
-    # and is nearest to today_utc. Default to today_utc if nothing found.
-    local_today = today_utc
-    for candidate in local_today_candidates:
-        if candidate.strftime("%Y-%m-%d") in day_highs:
-            local_today = candidate
-            break
+    # Compute local today directly from the city's timezone — avoids the fragile
+    # heuristic that checked which of [UTC-1day, UTC-today] appeared in day_highs
+    # (which could pick the wrong day if old forecast periods were in the data).
+    local_today = datetime.now(city_tz).date()
 
     for day_offset in range(NWS_HOURLY_FORECAST_DAYS):
         target_date = local_today + timedelta(days=day_offset)
@@ -190,11 +186,11 @@ async def _fetch_city_hourly(
             continue
         value = day_highs[date_str]
 
-        # as_of = noon UTC on target date (matches Open-Meteo / NOAA convention)
+        # as_of = noon in city's local timezone (matches NOAA/Open-Meteo convention)
         as_of = datetime(
             target_date.year, target_date.month, target_date.day,
-            12, 0, 0, tzinfo=timezone.utc,
-        ).isoformat()
+            12, 0, 0, tzinfo=city_tz,
+        ).astimezone(timezone.utc).isoformat()
 
         label = "today" if day_offset == 0 else f"day+{day_offset}"
         summary_parts.append(f"{label}={value:.0f}°F")
@@ -209,6 +205,7 @@ async def _fetch_city_hourly(
                 "city":            city_name,
                 "forecast_date":   date_str,
                 "forecast_offset": day_offset,
+                "fetched_at":      fetch_wall_time,
             },
         ))
 
@@ -231,8 +228,8 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         List of DataPoints (one per city per forecast day).
     """
     tasks = [
-        _fetch_city_hourly(session, metric, city_name, lat, lon)
-        for metric, (city_name, lat, lon, *_) in CITIES.items()
+        _fetch_city_hourly(session, metric, city_name, lat, lon, city_tz)
+        for metric, (city_name, lat, lon, city_tz) in CITIES.items()
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -36,16 +36,19 @@ Normalized document format (compatible with matcher.py and SeenDocuments):
 
 import html
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
 import aiohttp
 
+EDGAR_FETCH_COUNT: int = int(os.environ.get("EDGAR_FETCH_COUNT", "40"))
+
 _EDGAR_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar"
     "?action=getcurrent&type=8-K&dateb=&owner=include"
-    "&count=40&search_text=&output=atom"
+    f"&count={EDGAR_FETCH_COUNT}&search_text=&output=atom"
 )
 
 _HEADERS = {

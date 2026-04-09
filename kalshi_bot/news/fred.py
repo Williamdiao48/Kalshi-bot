@@ -59,7 +59,11 @@ SERIES: dict[str, tuple[str, str, str]] = {
     "ICSA":     ("fred_icsa",     "k claims", "Initial Claims"),
     # ISM PMI (NAPM / NMFCI) were removed from FRED after ISM revoked the
     # redistribution license.  Fetched directly via the ISM module instead.
-    "PCEPI":    ("fred_pce",          "index", "PCE Price Index"),
+    "PCEPI":           ("fred_pce",        "index", "PCE Price Index"),
+    # Real GDP growth rate (SAAR, %) — matches KXGDP "Will real GDP increase by
+    # more than X% in QN YYYY?" markets.  FRED updates within hours of the BEA
+    # advance estimate (last business day of the first month after quarter-end).
+    "A191RL1Q225SBEA": ("fred_gdp_growth", "%",     "Real GDP Growth (SAAR)"),
 }
 
 

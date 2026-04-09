@@ -30,9 +30,12 @@ Resume behaviour:
     is opened in append mode so completed work is never lost.
 
 Environment variables:
-    GDELT_DELAY_SECONDS   Delay between GDELT requests (default: 1.1).
-    MAX_RECORDS_PER_MARKET  Max articles per market from GDELT (default: 250,
-                            which is GDELT's hard maximum).
+    GDELT_DELAY_SECONDS      Delay between GDELT requests (default: 3.0).
+    MAX_RECORDS_PER_MARKET   Max articles per market from GDELT (default: 50).
+    MAX_MARKETS_PER_CATEGORY Cap on markets queried per kalshi_category (default: 500).
+                             Set to 0 to disable. At 3 s/market, 500 cats × 6 = ~25 min.
+    GDELT_MAX_RETRIES        Retry attempts on 429 before giving up (default: 3).
+    GDELT_RETRY_BASE_S       Base wait seconds on 429 retry, multiplied by attempt (default: 60).
 """
 
 import asyncio
@@ -61,12 +64,20 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-INPUT_FILE  = Path(__file__).parent.parent / "data" / "kalshi_markets.jsonl"
+INPUT_FILE  = Path(__file__).parent.parent / "data" / "kalshi_resolved_markets.jsonl"
 OUTPUT_FILE = Path(__file__).parent.parent / "data" / "gdelt_article_list.jsonl"
 
 GDELT_BASE_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 GDELT_DELAY: float = float(os.environ.get("GDELT_DELAY_SECONDS", "3.0"))
-MAX_RECORDS: int   = min(250, int(os.environ.get("MAX_RECORDS_PER_MARKET", "250")))
+MAX_RECORDS: int   = min(250, int(os.environ.get("MAX_RECORDS_PER_MARKET", "50")))
+
+# Max markets to query per kalshi_category.  Keeps total runtime manageable
+# (~3 s/market × 500 markets = ~25 min).  Set to 0 to disable.
+MAX_MARKETS_PER_CATEGORY: int = int(os.environ.get("MAX_MARKETS_PER_CATEGORY", "500"))
+
+# 429 retry config
+GDELT_MAX_RETRIES: int   = int(os.environ.get("GDELT_MAX_RETRIES", "3"))
+GDELT_RETRY_BASE_S: float = float(os.environ.get("GDELT_RETRY_BASE_S", "60.0"))
 
 # Earliest date GDELT has reliable coverage
 _GDELT_EPOCH = datetime(2013, 1, 1, tzinfo=timezone.utc)
@@ -313,14 +324,15 @@ def _plan_query(market: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     return {
-        "market_ticker":   ticker,
-        "market_title":    title,
-        "market_result":   market.get("result"),
-        "market_category": market.get("category", "other"),
-        "resolution_time": resolution,
-        "gdelt_query":     query,
-        "gdelt_start":     window[0],
-        "gdelt_end":       window[1],
+        "market_ticker":    ticker,
+        "market_title":     title,
+        "market_result":    market.get("result"),
+        "market_category":  market.get("category", "other"),
+        "kalshi_category":  market.get("kalshi_category", "other"),
+        "resolution_time":  resolution,
+        "gdelt_query":      query,
+        "gdelt_start":      window[0],
+        "gdelt_end":        window[1],
     }
 
 
@@ -347,23 +359,34 @@ async def _fetch_gdelt(
         "sort":          "DateDesc",
     }
 
-    try:
-        async with session.get(
-            GDELT_BASE_URL,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status == 429:
-                logging.warning("GDELT rate-limited (429) — waiting 60s.")
-                await asyncio.sleep(60)
-                return []
-            resp.raise_for_status()
-            data = await resp.json(content_type=None)
-    except asyncio.TimeoutError:
-        logging.warning("GDELT timeout for %s", plan["market_ticker"])
-        return []
-    except Exception as exc:
-        logging.warning("GDELT fetch error for %s: %s", plan["market_ticker"], exc)
+    for attempt in range(1, GDELT_MAX_RETRIES + 1):
+        try:
+            async with session.get(
+                GDELT_BASE_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 429:
+                    wait = GDELT_RETRY_BASE_S * attempt
+                    logging.warning(
+                        "GDELT rate-limited (429) — attempt %d/%d, waiting %.0fs.",
+                        attempt, GDELT_MAX_RETRIES, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+                break  # success
+        except asyncio.TimeoutError:
+            logging.warning("GDELT timeout for %s (attempt %d)", plan["market_ticker"], attempt)
+            if attempt < GDELT_MAX_RETRIES:
+                await asyncio.sleep(GDELT_RETRY_BASE_S)
+            continue
+        except Exception as exc:
+            logging.warning("GDELT fetch error for %s: %s", plan["market_ticker"], exc)
+            return []
+    else:
+        logging.error("GDELT gave up on %s after %d attempts.", plan["market_ticker"], GDELT_MAX_RETRIES)
         return []
 
     raw_articles = data.get("articles") or []
@@ -404,6 +427,7 @@ async def _fetch_gdelt(
             "market_title":            plan["market_title"],
             "market_result":           plan["market_result"],
             "market_category":         plan["market_category"],
+            "kalshi_category":         plan["kalshi_category"],
             "resolution_time":         plan["resolution_time"],
             "gdelt_query":             plan["gdelt_query"],
             "article_url":             url,
@@ -483,6 +507,22 @@ async def main() -> None:
     if not remaining:
         logging.info("Nothing to do — all markets already processed.")
         return
+
+    # Cap markets per kalshi_category to keep runtime manageable
+    if MAX_MARKETS_PER_CATEGORY > 0:
+        cat_counts: dict[str, int] = defaultdict(int)
+        capped: list[dict[str, Any]] = []
+        for plan in remaining:
+            cat = plan.get("kalshi_category", "other")
+            if cat_counts[cat] < MAX_MARKETS_PER_CATEGORY:
+                capped.append(plan)
+                cat_counts[cat] += 1
+        if len(capped) < len(remaining):
+            logging.info(
+                "Per-category cap (%d): %d → %d markets remaining.",
+                MAX_MARKETS_PER_CATEGORY, len(remaining), len(capped),
+            )
+        remaining = capped
 
     # Stage 2B — fetch articles
     total_articles = 0
