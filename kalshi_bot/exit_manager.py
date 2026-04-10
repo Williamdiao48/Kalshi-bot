@@ -119,6 +119,16 @@ if TYPE_CHECKING:
 EXIT_PROFIT_TAKE: float = float(os.environ.get("EXIT_PROFIT_TAKE", "0.20"))
 EXIT_STOP_LOSS: float   = float(os.environ.get("EXIT_STOP_LOSS",   "0.70"))
 
+# Capital recycling: force-exit near-settled positions to free capital for new trades.
+# Sources eligible for recycling — observed-data sources only (high confidence).
+CAPITAL_RECYCLE_SOURCES: frozenset[str] = frozenset(
+    s.strip() for s in
+    os.environ.get("CAPITAL_RECYCLE_SOURCES", "band_arb,metar,noaa_observed").split(",")
+)
+# Minimum current NO value (¢) to be eligible.  At 97¢ the YES bid is ≤ 3¢ —
+# the market has essentially priced in settlement.  Set to 0 to disable recycling.
+CAPITAL_RECYCLE_MIN_NO_VALUE: int = int(os.environ.get("CAPITAL_RECYCLE_MIN_NO_VALUE", "97"))
+
 # Trailing stop: exit if the position has *ever* been up by at least this
 # fraction of cost, and has since drawn back by EXIT_TRAILING_DRAWDOWN below
 # that peak.
@@ -229,12 +239,13 @@ _pt_raw = os.environ.get(
 )
 _sl_raw = os.environ.get(
     "EXIT_SOURCE_STOP_LOSS",
-    '{"noaa_observed:yes": 0.15, "metar:yes": 0.05, "nws_climo:yes": 0.05, "nws_alert:yes": 0.05,'
+    '{"noaa_observed:yes": 0.50, "metar:yes": 0.05, "nws_climo:yes": 0.05, "nws_alert:yes": 0.05,'
     ' "noaa_observed": 0.70, "metar": 0.60, "noaa": 0.30, "owm": 0.50, "open_meteo": 0.50,'
     ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.95, "eia_inventory": 0.95,'
     ' "noaa_day2:yes": 0.45, "noaa_day2_early:yes": 0.45,'
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
+    ' "band_arb": 0.95,'
     ' "binance": 0.25, "coinbase": 0.25}',
 )
 try:
@@ -307,7 +318,12 @@ _WEATHER_STOP_LOSS_ONLY_SOURCES: frozenset[str] = frozenset({
     "noaa", "noaa_day1", "noaa_day2",
     "noaa_observed", "nws_hourly", "nws_climo", "nws_alert",
     "metar", "hrrr", "open_meteo", "weatherapi", "owm",
-    "band_arb",   # METAR+NOAA confirmed band crossing — hold to 100¢, stop-loss only
+    # band_arb: hold to settlement, stop_loss only.
+    # The temperature has physically been recorded above the ceiling — this is
+    # among the most locked signals the bot produces.  Exiting early on profit-take
+    # destroys large expected-value (trade 237: 180¢ captured vs 645¢ at settlement).
+    # Stop-loss still fires if the market decisively reverses (sensor error).
+    "band_arb",
 })
 
 _ORDERS_PATH = "/trade-api/v2/orders"
@@ -495,6 +511,7 @@ class ExitManager:
             lp = getattr(trade, "limit_price", 100)
             entry_cost = lp if side == "yes" else (100 - lp)
             profit_take_thresh = self._resolve_profit_take(src, side, entry_cost)
+
             _sl_composite = f"{src}:{side}"
             stop_loss_thresh = EXIT_SOURCE_STOP_LOSS.get(
                 _sl_composite,
@@ -768,6 +785,25 @@ class ExitManager:
             (trade_id,),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+    async def force_exit(
+        self,
+        session: aiohttp.ClientSession,
+        trade:   "_Trade",
+        reason:  str = "capital_recycle",
+    ) -> "ExitEvent | None":
+        """Force-exit a specific trade immediately, bypassing threshold checks.
+
+        Used by capital recycling: when a new trade is blocked by the exposure cap,
+        near-settled positions are liquidated to free capital.
+        Returns None if the trade is already exited or has no current price.
+        """
+        if getattr(trade, "exited_at", None) is not None:
+            return None
+        if getattr(trade, "current_mid", None) is None:
+            return None
+        pnl = trade._unrealized_cents()
+        return await self._execute_exit(session, trade, pnl, reason)
 
     async def _execute_exit(
         self,

@@ -718,7 +718,7 @@ def _implied_p_yes(opp: NumericOpportunity) -> float | None:
     if opp.direction == "between":
         if opp.strike_lo is None or opp.strike_hi is None:
             return None
-        if opp.metric.startswith("temp_high"):
+        if opp.metric.startswith(("temp_high", "temp_low")):
             sigma = NOAA_OBSERVED_SIGMA if opp.source in ("noaa_observed", "metar") else _temp_forecast_sigma(opp.metric, opp.source)
         else:
             scale = next(
@@ -760,7 +760,7 @@ def _implied_p_yes(opp: NumericOpportunity) -> float | None:
     if opp.strike is None:
         return None
 
-    if opp.metric.startswith("temp_high"):
+    if opp.metric.startswith(("temp_high", "temp_low")):
         # Calibrated model: observed data uses tight sigma; forecasts use NWS MAE.
         sigma = NOAA_OBSERVED_SIGMA if opp.source == "noaa_observed" else _temp_forecast_sigma(opp.metric, opp.source)
         z = opp.edge / sigma
@@ -935,6 +935,7 @@ class TradeExecutor:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
         self.stats = FilterStats()
+        self._ledger: "Any | None" = None  # DryRunLedger, set via set_ledger()
         mode_label = "DRY-RUN" if self._dry_run else "LIVE"
         logging.info(
             "TradeExecutor — mode=%s  kelly=%.2f  default_p=%.2f"
@@ -1219,7 +1220,7 @@ class TradeExecutor:
                 return
 
         # --- Minimum temperature edge filter ---
-        if opp.metric.startswith("temp_high") and NUMERIC_MIN_TEMP_EDGE > 0:
+        if opp.metric.startswith(("temp_high", "temp_low")) and NUMERIC_MIN_TEMP_EDGE > 0:
             if opp.source != "noaa_observed" and opp.edge < NUMERIC_MIN_TEMP_EDGE:
                 logging.debug(
                     "Trade skip (temp edge %.1f°F < min %.1f°F): %s",
@@ -1319,7 +1320,7 @@ class TradeExecutor:
         # observed temperature can't drop back below the strike overnight.
         # noaa_observed is always exempt (it IS the observation).
         _temp_no_exempt = (
-            opp.metric.startswith("temp_high")
+            opp.metric.startswith(("temp_high", "temp_low"))
             and opp.implied_outcome == "NO"
         )
         if SAME_DAY_CUTOFF_HOURS > 0 and opp.source != "noaa_observed" and not _temp_no_exempt:
@@ -1555,7 +1556,10 @@ class TradeExecutor:
             # By 3 PM ET (19:00 UTC) the daily maximum is essentially determined;
             # forecast sources (nws_hourly, HRRR) may still project a low reading
             # that no longer reflects reality, as seen in trade #200.
-            if datetime.now(timezone.utc).hour >= TEMP_HIGH_NO_CUTOFF_UTC:
+            # Exception: peak_past=True signals are explicitly post-4:30 PM locked-NO
+            # observations — the cutoff is exactly what they're designed to fire after,
+            # so exempting them is correct.
+            if not opp.peak_past and datetime.now(timezone.utc).hour >= TEMP_HIGH_NO_CUTOFF_UTC:
                 logging.info(
                     "Trade skip (late-day cutoff: KXHIGH NO after %02d:00 UTC): %s",
                     TEMP_HIGH_NO_CUTOFF_UTC, opp.market_ticker,
@@ -1614,14 +1618,23 @@ class TradeExecutor:
             current_exposure = self._total_open_exposure_cents()
             this_trade_cost  = count * cost_cents
             if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
-                logging.info(
-                    "Trade skip (aggregate exposure cap: open=%d¢ + this=%d¢ = %d¢ > %d¢ limit): %s",
-                    current_exposure, this_trade_cost,
-                    current_exposure + this_trade_cost,
-                    MAX_TOTAL_EXPOSURE_CENTS, opp.market_ticker,
-                )
-                self.stats.filtered_exposure += 1
-                return
+                deficit = (current_exposure + this_trade_cost) - MAX_TOTAL_EXPOSURE_CENTS
+                freed = await self._recycle_capital(session, deficit)
+                current_exposure = self._total_open_exposure_cents()
+                if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                    logging.info(
+                        "Trade skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
+                        " recycled %d¢ but still insufficient): %s",
+                        current_exposure, this_trade_cost,
+                        MAX_TOTAL_EXPOSURE_CENTS, freed, opp.market_ticker,
+                    )
+                    self.stats.filtered_exposure += 1
+                    return
+                if freed > 0:
+                    logging.info(
+                        "CapitalRecycle: freed %d¢ — proceeding with %s",
+                        freed, opp.market_ticker,
+                    )
 
         logging.debug(
             "All filters passed — executing: %s %s %d×%d¢  p=%.3f  score=%.2f  src=%s",
@@ -2275,17 +2288,8 @@ class TradeExecutor:
             signal.no_ask, signal.direction,
         )
 
-        # Ticker cooldown
-        if TRADE_TICKER_COOLDOWN_MINUTES > 0:
-            last = self._last_trade_time(signal.ticker)
-            if last is not None:
-                age_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
-                if age_min < TRADE_TICKER_COOLDOWN_MINUTES:
-                    logging.info(
-                        "BandArb skip (ticker cooldown %.0f min remaining): %s",
-                        TRADE_TICKER_COOLDOWN_MINUTES - age_min, signal.ticker,
-                    )
-                    return
+        # No ticker cooldown for band_arb: each signal is a distinct market that
+        # the temperature has physically passed through — not a speculative re-entry.
 
         # Circuit breaker
         if self._is_category_tripped(signal.ticker):
@@ -2321,6 +2325,29 @@ class TradeExecutor:
             )
             return
 
+        if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            cost_cents = signal.no_ask
+            current_exposure = self._total_open_exposure_cents()
+            this_trade_cost  = count * cost_cents
+            if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                deficit = (current_exposure + this_trade_cost) - MAX_TOTAL_EXPOSURE_CENTS
+                freed = await self._recycle_capital(session, deficit)
+                current_exposure = self._total_open_exposure_cents()
+                if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                    logging.info(
+                        "BandArb skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
+                        " recycled %d¢ but still insufficient): %s",
+                        current_exposure, this_trade_cost,
+                        MAX_TOTAL_EXPOSURE_CENTS, freed, signal.ticker,
+                    )
+                    self.stats.filtered_exposure += 1
+                    return
+                if freed > 0:
+                    logging.info(
+                        "CapitalRecycle: freed %d¢ — proceeding with BandArb %s",
+                        freed, signal.ticker,
+                    )
+
         self.stats.trades_attempted += 1
         await self._execute(
             session=session,
@@ -2328,7 +2355,7 @@ class TradeExecutor:
             side="no",
             count=count,
             limit_price=signal.yes_bid,   # NO buy: limit_price = yes_bid
-            opportunity_kind="arb",
+            opportunity_kind="band_arb",
             score=1.0,       # near-certain observed signal
             p_estimate=p_win,
             source="band_arb",
@@ -2641,6 +2668,49 @@ class TradeExecutor:
         """
         dt, _, _ = self._last_trade_context(ticker)
         return dt
+
+    def set_ledger(self, ledger: "Any") -> None:
+        """Wire the DryRunLedger so capital recycling can access enriched trades."""
+        self._ledger = ledger
+
+    async def _recycle_capital(
+        self,
+        session: "Any",
+        needed_cents: int,
+    ) -> int:
+        """Force-exit near-settled positions to free at least needed_cents of capital.
+
+        Reads DryRunLedger.recyclable_trades() (positions from the last refresh
+        cycle whose current NO value ≥ CAPITAL_RECYCLE_MIN_NO_VALUE), sorted by
+        NO value descending.  Exits greedily until the freed cost basis covers the
+        deficit or candidates are exhausted.
+
+        Returns the total cost basis freed (cents).  Returns 0 when no ledger is
+        wired (live mode without recycling support) or no candidates exist.
+        """
+        if self._ledger is None:
+            return 0
+        candidates = self._ledger.recyclable_trades()
+        if not candidates:
+            return 0
+
+        freed = 0
+        for trade in candidates:
+            if freed >= needed_cents:
+                break
+            cost_per = 100 - trade.limit_price  # NO entry cost per contract
+            trade_cost = cost_per * trade.count
+            event = await self._ledger._exit_manager.force_exit(
+                session, trade, reason="capital_recycle"
+            )
+            if event is not None:
+                freed += trade_cost
+                logging.info(
+                    "CapitalRecycle: exited %s (%s×%d @ %d¢ NO) — freed %d¢  [%d¢ needed]",
+                    trade.ticker, trade.side, trade.count, int(trade.current_mid),
+                    trade_cost, needed_cents,
+                )
+        return freed
 
     def _total_open_exposure_cents(self) -> int:
         """Sum of cost basis (count × cost_per_contract) across all open positions.

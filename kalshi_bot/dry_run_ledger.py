@@ -76,7 +76,7 @@ from typing import Any
 
 import aiohttp
 
-from .exit_manager import ExitManager
+from .exit_manager import ExitManager, CAPITAL_RECYCLE_SOURCES, CAPITAL_RECYCLE_MIN_NO_VALUE
 from .markets import fetch_market_detail
 
 _DEFAULT_DB_PATH       = Path(__file__).parent.parent / "opportunity_log.db"
@@ -302,6 +302,10 @@ class DryRunLedger:
         # ExitManager shares our connection so all writes land in the same DB.
         self._exit_manager = ExitManager(self._conn, dry_run=TRADE_DRY_RUN)
 
+        # Cache of enriched open trades from the last refresh cycle.
+        # Populated by refresh_and_write(); read by recyclable_trades().
+        self._current_open_trades: list[_Trade] = []
+
         logging.info(
             "DryRunLedger — overview=%s  starting_capital=$%.2f",
             self._overview_path, starting_capital_cents / 100,
@@ -371,8 +375,40 @@ class DryRunLedger:
             logging.info(
                 "DryRunLedger: wrote %d bytes to %s", len(overview), self._overview_path
             )
+
+            # Update cache for capital recycling (must be after check_exits so
+            # any positions exited this cycle are excluded).
+            self._current_open_trades = [
+                t for t in trades
+                if not t.exited and t.current_mid is not None
+            ]
         except Exception as exc:
             logging.error("DryRunLedger: refresh_and_write failed: %s", exc, exc_info=True)
+
+    def recyclable_trades(self) -> "list[_Trade]":
+        """Return open positions eligible for forced capital recycling.
+
+        Filters to high-confidence sources (CAPITAL_RECYCLE_SOURCES) whose
+        current NO value has reached CAPITAL_RECYCLE_MIN_NO_VALUE — meaning the
+        market has essentially priced in settlement already.  Sorted by NO value
+        descending so greedy selection exits the most settled positions first.
+
+        Returns an empty list when recycling is disabled (CAPITAL_RECYCLE_MIN_NO_VALUE=0)
+        or no enriched trades are cached yet (before the first refresh cycle).
+        """
+        if CAPITAL_RECYCLE_MIN_NO_VALUE <= 0:
+            return []
+        candidates = [
+            t for t in self._current_open_trades
+            if (
+                t.source in CAPITAL_RECYCLE_SOURCES
+                and t.side == "no"
+                and t.current_mid is not None
+                and t.current_mid >= CAPITAL_RECYCLE_MIN_NO_VALUE
+            )
+        ]
+        candidates.sort(key=lambda t: t.current_mid, reverse=True)  # type: ignore[arg-type]
+        return candidates
 
     def close(self) -> None:
         self._conn.close()
@@ -713,6 +749,13 @@ class DryRunLedger:
                 bid = mkt.get("yes_bid")
                 ask = mkt.get("yes_ask")
                 if bid is not None and ask is not None:
+                    # bid=0 + ask=100 is the Kalshi API's post-close pending-settlement
+                    # state — the market has stopped trading but hasn't resolved yet.
+                    # Treat as no price available: skip current_mid so exit checks and
+                    # snapshots are skipped this cycle rather than recording a phantom
+                    # –100% unrealized loss.
+                    if int(bid) == 0 and int(ask) == 100:
+                        continue
                     trade.yes_bid = int(bid)
                     trade.yes_ask = int(ask)
                     if trade.side == "yes":
