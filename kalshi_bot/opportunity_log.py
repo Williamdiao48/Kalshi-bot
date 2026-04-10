@@ -268,7 +268,7 @@ class OpportunityLog:
                 opp.edge,
             )
             for opp in opps
-            if opp.metric.startswith("temp_high_")
+            if opp.metric.startswith(("temp_high_", "temp_low_"))
         ]
         if rows:
             self._conn.executemany(

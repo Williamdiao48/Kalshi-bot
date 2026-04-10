@@ -117,8 +117,9 @@ TEMPORAL_HALFLIFE: float = 5.0
 # An edge equal to this value (or larger) yields edge_score = 1.0.
 # Values below it scale linearly toward 0.0.
 METRIC_EDGE_SCALES: dict[str, float] = {
-    # City daily high temperature (°F) — 10°F clearance is a strong signal
+    # City daily high/low temperature (°F) — 10°F clearance is a strong signal
     "temp_high": 10.0,
+    "temp_low":  10.0,
     # Crypto prices (USD)
     "price_btc":  5_000.0,  # $5k above/below BTC strike
     "price_eth":    300.0,  # $300 above/below ETH strike

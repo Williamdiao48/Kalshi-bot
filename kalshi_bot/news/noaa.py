@@ -44,6 +44,7 @@ _ET = ZoneInfo("America/New_York")
 _CT = ZoneInfo("America/Chicago")
 _MT = ZoneInfo("America/Denver")
 _PT = ZoneInfo("America/Los_Angeles")
+_PHX = ZoneInfo("America/Phoenix")    # no DST observed in Arizona
 
 import aiohttp
 
@@ -77,11 +78,24 @@ CITIES: dict[str, tuple[str, float, float, ZoneInfo]] = {
     "temp_high_ny":  ("New York",    40.7789,  -73.9692, _ET),  # KNYC Central Park
     "temp_high_mia": ("Miami",       25.7959,  -80.2870, _ET),  # KMIA airport
     "temp_high_aus": ("Austin",      30.1975,  -97.6664, _CT),  # KAUS airport
-    # Inactive as of 2026-03-09 (no markets found in next 30 days); kept
-    # in case Kalshi re-lists them — NOAA fetch is harmless when idle.
+    # Previously inactive; kept for old KXHIGHDAL series (Love Field settlement)
     "temp_high_dal": ("Dallas",      32.8479,  -96.8514, _CT),  # KDAL Love Field
     "temp_high_bos": ("Boston",      42.3643,  -71.0052, _ET),  # KBOS airport
     "temp_high_hou": ("Houston",     29.6454,  -95.2789, _CT),  # KHOU Hobby
+    # KXHIGHTDAL settles against DFW (confirmed by rules_primary), not Love Field
+    "temp_high_dfw": ("Dallas/Fort Worth", 32.8998,  -97.0403, _CT),  # KDFW
+    # New cities — active from 2026-04
+    "temp_high_sfo": ("San Francisco", 37.6190, -122.3750, _PT),   # KSFO
+    "temp_high_sea": ("Seattle",       47.4502, -122.3088, _PT),   # KSEA
+    "temp_high_phx": ("Phoenix",       33.4373, -112.0078, _PHX),  # KPHX (no DST)
+    "temp_high_phl": ("Philadelphia",  39.8729,  -75.2437, _ET),   # KPHL
+    "temp_high_atl": ("Atlanta",       33.6407,  -84.4277, _ET),   # KATL
+    "temp_high_msp": ("Minneapolis",   44.8848,  -93.2223, _CT),   # KMSP
+    "temp_high_dca": ("Washington DC", 38.8512,  -77.0402, _ET),   # KDCA
+    "temp_high_las": ("Las Vegas",     36.0840, -115.1537, _PT),   # KLAS
+    "temp_high_okc": ("Oklahoma City", 35.3931,  -97.6007, _CT),   # KOKC
+    "temp_high_sat": ("San Antonio",   29.5337,  -98.4698, _CT),   # KSAT
+    "temp_high_msy": ("New Orleans",   29.9934,  -90.2580, _CT),   # KMSY
 }
 
 # ---------------------------------------------------------------------------
@@ -124,6 +138,42 @@ _CITY_SIGMA_F: dict[str, tuple[float, ...]] = {
     "temp_high_dal": (5.0,  5.0,  5.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.0,  5.0,  5.0),
     "temp_high_bos": (4.5,  5.0,  5.0,  4.5,  4.0,  3.5,  3.0,  3.0,  3.5,  4.5,  5.0,  5.0),
     "temp_high_hou": (4.0,  4.0,  4.5,  4.5,  4.5,  3.5,  3.0,  3.0,  3.5,  4.0,  4.0,  4.0),
+    # New cities (initial estimates based on climate type; calibrate after 30 days)
+    #                   Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+    "temp_high_dfw": (5.0,  5.0,  5.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.0,  5.0,  5.0),
+    "temp_high_sfo": (4.0,  4.0,  4.5,  4.5,  4.0,  3.5,  3.5,  3.5,  4.0,  4.5,  4.5,  4.0),
+    "temp_high_sea": (4.0,  4.0,  4.5,  4.5,  4.0,  3.5,  3.0,  3.0,  3.5,  4.5,  4.5,  4.0),
+    "temp_high_phx": (3.5,  3.5,  4.0,  4.5,  4.5,  3.5,  3.0,  3.0,  3.5,  4.0,  3.5,  3.5),
+    "temp_high_phl": (4.5,  4.5,  5.0,  4.5,  4.0,  3.5,  3.0,  3.0,  3.5,  4.5,  4.5,  4.5),
+    "temp_high_atl": (4.0,  4.0,  4.5,  4.0,  4.0,  3.5,  3.0,  3.0,  3.5,  4.0,  4.0,  4.0),
+    "temp_high_msp": (6.0,  6.0,  6.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.5,  6.0,  6.0),
+    "temp_high_dca": (4.0,  4.5,  5.0,  4.5,  4.0,  3.5,  3.0,  3.0,  3.5,  4.5,  4.5,  4.0),
+    "temp_high_las": (3.5,  3.5,  4.0,  4.5,  4.5,  3.5,  3.0,  3.0,  3.5,  4.0,  3.5,  3.5),
+    "temp_high_okc": (5.0,  5.0,  5.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.0,  5.0,  5.0),
+    "temp_high_sat": (4.5,  4.5,  5.0,  5.0,  4.5,  3.5,  3.0,  3.0,  4.0,  4.5,  4.5,  4.5),
+    "temp_high_msy": (4.0,  4.0,  4.5,  4.0,  4.0,  3.5,  3.0,  3.0,  3.5,  4.0,  4.0,  4.0),
+    # Daily low sigma (~10% higher than daily high — overnight lows slightly harder to forecast)
+    #                   Jan   Feb   Mar   Apr   May   Jun   Jul   Aug   Sep   Oct   Nov   Dec
+    "temp_low_lax": (3.5,  3.2,  3.5,  3.8,  3.2,  2.8,  2.8,  2.8,  3.0,  3.5,  3.2,  3.5),
+    "temp_low_den": (6.0,  6.0,  7.0,  6.5,  6.0,  5.0,  4.0,  4.0,  5.5,  6.0,  6.0,  6.0),
+    "temp_low_chi": (5.5,  6.0,  6.0,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.5,  6.0,  6.0),
+    "temp_low_ny":  (5.0,  5.0,  5.5,  5.0,  4.5,  4.0,  3.5,  3.5,  4.0,  5.0,  5.0,  5.0),
+    "temp_low_mia": (3.2,  3.2,  3.5,  3.5,  3.2,  3.0,  2.8,  2.8,  3.0,  3.2,  3.2,  3.2),
+    "temp_low_aus": (5.0,  5.0,  5.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.0,  5.0,  5.0),
+    "temp_low_bos": (5.0,  5.5,  5.5,  5.0,  4.5,  4.0,  3.5,  3.5,  4.0,  5.0,  5.5,  5.5),
+    "temp_low_hou": (4.5,  4.5,  5.0,  5.0,  5.0,  4.0,  3.5,  3.5,  4.0,  4.5,  4.5,  4.5),
+    "temp_low_dfw": (5.5,  5.5,  6.0,  6.0,  5.5,  4.5,  4.0,  4.0,  5.0,  5.5,  5.5,  5.5),
+    "temp_low_sfo": (4.5,  4.5,  5.0,  5.0,  4.5,  4.0,  4.0,  4.0,  4.5,  5.0,  5.0,  4.5),
+    "temp_low_sea": (4.5,  4.5,  5.0,  5.0,  4.5,  4.0,  3.5,  3.5,  4.0,  5.0,  5.0,  4.5),
+    "temp_low_phx": (4.0,  4.0,  4.5,  5.0,  5.0,  4.0,  3.5,  3.5,  4.0,  4.5,  4.0,  4.0),
+    "temp_low_phl": (5.0,  5.0,  5.5,  5.0,  4.5,  4.0,  3.5,  3.5,  4.0,  5.0,  5.0,  5.0),
+    "temp_low_atl": (4.5,  4.5,  5.0,  4.5,  4.5,  4.0,  3.5,  3.5,  4.0,  4.5,  4.5,  4.5),
+    "temp_low_msp": (6.5,  6.5,  7.0,  6.0,  5.5,  4.5,  4.0,  4.0,  5.0,  6.0,  6.5,  6.5),
+    "temp_low_dca": (4.5,  5.0,  5.5,  5.0,  4.5,  4.0,  3.5,  3.5,  4.0,  5.0,  5.0,  4.5),
+    "temp_low_las": (4.0,  4.0,  4.5,  5.0,  5.0,  4.0,  3.5,  3.5,  4.0,  4.5,  4.0,  4.0),
+    "temp_low_okc": (5.5,  5.5,  6.0,  6.0,  5.5,  4.5,  4.0,  4.0,  5.0,  5.5,  5.5,  5.5),
+    "temp_low_sat": (5.0,  5.0,  5.5,  5.5,  5.0,  4.0,  3.5,  3.5,  4.5,  5.0,  5.0,  5.0),
+    "temp_low_msy": (4.5,  4.5,  5.0,  4.5,  4.5,  4.0,  3.5,  3.5,  4.0,  4.5,  4.5,  4.5),
 }
 
 _CITY_SIGMA_FALLBACK: float = 4.0  # °F — used when metric not in table
@@ -171,6 +221,47 @@ KALSHI_STATION_IDS: dict[str, str] = {
     "temp_high_dal": "KDAL",   # Dallas Love Field Airport
     "temp_high_bos": "KBOS",   # Boston Logan International Airport
     "temp_high_hou": "KHOU",   # Houston William P. Hobby Airport
+    "temp_high_dfw": "KDFW",   # Dallas/Fort Worth International Airport (KXHIGHTDAL)
+    # New cities — active from 2026-04
+    "temp_high_sfo": "KSFO",   # San Francisco International Airport
+    "temp_high_sea": "KSEA",   # Seattle-Tacoma International Airport
+    "temp_high_phx": "KPHX",   # Phoenix Sky Harbor International Airport
+    "temp_high_phl": "KPHL",   # Philadelphia International Airport
+    "temp_high_atl": "KATL",   # Hartsfield-Jackson Atlanta International Airport
+    "temp_high_msp": "KMSP",   # Minneapolis-Saint Paul International Airport
+    "temp_high_dca": "KDCA",   # Ronald Reagan Washington National Airport
+    "temp_high_las": "KLAS",   # Harry Reid International Airport (Las Vegas)
+    "temp_high_okc": "KOKC",   # Will Rogers World Airport (Oklahoma City)
+    "temp_high_sat": "KSAT",   # San Antonio International Airport
+    "temp_high_msy": "KMSY",   # Louis Armstrong New Orleans International Airport
+}
+
+# Cities with Kalshi KXLOWT* daily low temperature markets.
+# Same coordinates/timezones as CITIES (same settlement stations).
+# Do NOT add temp_low_* entries to KALSHI_STATION_IDS — that breaks METAR's
+# reverse map.  Low-temp fetchers derive the station ID from the corresponding
+# temp_high_* key.
+LOW_CITIES: dict[str, tuple[str, float, float, ZoneInfo]] = {
+    "temp_low_lax": ("Los Angeles",      33.9425, -118.4081, _PT),   # KLAX
+    "temp_low_den": ("Denver",           39.8561, -104.6737, _MT),   # KDEN
+    "temp_low_chi": ("Chicago",          41.7868,  -87.7522, _CT),   # KMDW
+    "temp_low_ny":  ("New York",         40.7789,  -73.9692, _ET),   # KNYC
+    "temp_low_mia": ("Miami",            25.7959,  -80.2870, _ET),   # KMIA
+    "temp_low_aus": ("Austin",           30.1975,  -97.6664, _CT),   # KAUS
+    "temp_low_bos": ("Boston",           42.3643,  -71.0052, _ET),   # KBOS
+    "temp_low_hou": ("Houston",          29.6454,  -95.2789, _CT),   # KHOU
+    "temp_low_dfw": ("Dallas/Fort Worth",32.8998,  -97.0403, _CT),   # KDFW
+    "temp_low_sfo": ("San Francisco",    37.6190, -122.3750, _PT),   # KSFO
+    "temp_low_sea": ("Seattle",          47.4502, -122.3088, _PT),   # KSEA
+    "temp_low_phx": ("Phoenix",          33.4373, -112.0078, _PHX),  # KPHX (no DST)
+    "temp_low_phl": ("Philadelphia",     39.8729,  -75.2437, _ET),   # KPHL
+    "temp_low_atl": ("Atlanta",          33.6407,  -84.4277, _ET),   # KATL
+    "temp_low_msp": ("Minneapolis",      44.8848,  -93.2223, _CT),   # KMSP
+    "temp_low_dca": ("Washington DC",    38.8512,  -77.0402, _ET),   # KDCA
+    "temp_low_las": ("Las Vegas",        36.0840, -115.1537, _PT),   # KLAS
+    "temp_low_okc": ("Oklahoma City",    35.3931,  -97.6007, _CT),   # KOKC
+    "temp_low_sat": ("San Antonio",      29.5337,  -98.4698, _CT),   # KSAT
+    "temp_low_msy": ("New Orleans",      29.9934,  -90.2580, _CT),   # KMSY
 }
 
 # In-process caches — all resolved once per process lifetime
@@ -532,6 +623,183 @@ async def _fetch_high_temp(
     return points
 
 
+async def _fetch_observed_min_today(
+    session: aiohttp.ClientSession, city_name: str, obs_url: str, city_tz: ZoneInfo
+) -> float | None:
+    """Return the min temperature (°F) recorded at the station since local midnight.
+
+    Analogous to _fetch_observed_max_today() but tracks the running minimum.
+    Used to provide a hard upper bound on today's daily low (the actual low
+    can only stay at or below the running minimum as the morning progresses).
+    """
+    local_now = datetime.now(city_tz)
+    midnight_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Cap query window to midnight→5 AM local so we only see overnight
+    # observations.  Without this, a call at 10 PM includes the afternoon high
+    # (e.g. Phoenix 84°F) which becomes the spurious "observed minimum".
+    cutoff_local = midnight_local.replace(hour=5)
+    end_local = min(local_now, cutoff_local)
+
+    try:
+        async with session.get(
+            obs_url,
+            params={
+                "start": midnight_local.astimezone(timezone.utc).isoformat(),
+                "end":   end_local.astimezone(timezone.utc).isoformat(),
+                "limit": 20,  # at most ~5 hourly obs in a 5-hour window
+            },
+            headers=_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as exc:
+        logging.warning("NOAA observed min fetch failed for %s: %s", city_name, exc)
+        return None
+
+    min_f: float | None = None
+    for feature in data.get("features", []):
+        temp_c = (feature.get("properties") or {}).get("temperature", {}).get("value")
+        if temp_c is not None:
+            temp_f = temp_c * 9.0 / 5.0 + 32.0
+            if min_f is None or temp_f < min_f:
+                min_f = temp_f
+
+    if min_f is not None:
+        logging.debug("NOAA [%s]: observed min today = %.1f°F", city_name, min_f)
+    return min_f
+
+
+async def _fetch_low_temp(
+    session: aiohttp.ClientSession,
+    metric: str,
+    city_name: str,
+    forecast_url: str,
+    obs_url: str | None,
+    city_tz: ZoneInfo,
+) -> list[DataPoint]:
+    """Fetch nighttime forecast low and observed min; return one DataPoint per stream.
+
+    The NWS daily forecast includes nighttime periods whose temperature is the
+    overnight low.  The "Tonight" period covers tonight's evening into tomorrow
+    morning — the low it forecasts settles as tomorrow's daily low on Kalshi
+    (occurring ~4–6 AM local).  Therefore:
+
+      nighttime_periods[0]  →  tomorrow's low   (day_offset = 1, source="noaa")
+      nighttime_periods[1]  →  night-after low  (day_offset = 2, source="noaa_day2")
+      … up to nighttime_periods[4] → day_offset = 5 (source="noaa_day5")
+
+    Extended lows cover 5 nights (days 1–5) rather than 6 because NWS only
+    reliably includes 6–7 nighttime periods per call.
+
+    Observed min (source="noaa_observed", as_of=today noon local): today's
+    running minimum since midnight.  Acts as a hard upper bound on the daily
+    low (the actual low can only go lower before the day ends).
+    """
+    try:
+        async with session.get(
+            forecast_url, headers=_HEADERS, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as exc:
+        logging.error("NOAA low-temp forecast fetch failed for %s: %s", city_name, exc)
+        return []
+
+    periods: list[dict[str, Any]] = data.get("properties", {}).get("periods", [])
+    nighttime_periods = [p for p in periods if not p.get("isDaytime", True)]
+    if not nighttime_periods:
+        logging.warning("NOAA: no nighttime period found for %s", city_name)
+        return []
+
+    today_local = datetime.now(city_tz).date()
+    today_noon_local = datetime.now(city_tz).replace(hour=12, minute=0, second=0, microsecond=0)
+    as_of_today = today_noon_local.astimezone(timezone.utc).isoformat()
+
+    unit = "°F"
+    points: list[DataPoint] = []
+    extended_summary: list[str] = []
+
+    for np_ in nighttime_periods[:5]:
+        try:
+            low_temp = float(np_["temperature"])
+            period_start_dt = datetime.fromisoformat(
+                np_["startTime"].replace("Z", "+00:00")
+            ).astimezone(city_tz)
+            period_start = period_start_dt.date()
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        # Nighttime periods start in the evening (hour >= 14).  Skip daytime
+        # periods that crept into the nighttime list due to NWS quirks.
+        if period_start_dt.hour < 14:
+            continue
+
+        # The low in the "Tonight" period is recorded in the *next* morning.
+        target_date = period_start + timedelta(days=1)
+        day_offset = (target_date - today_local).days
+        if day_offset < 1 or day_offset > 5:
+            continue
+
+        as_of_ext = datetime(
+            target_date.year, target_date.month, target_date.day,
+            12, 0, 0, tzinfo=city_tz,
+        ).astimezone(timezone.utc).isoformat()
+
+        source = "noaa" if day_offset == 1 else f"noaa_day{day_offset}"
+        extended_summary.append(f"night+{day_offset}={low_temp:.0f}°F")
+
+        points.append(DataPoint(
+            source=source,
+            metric=metric,
+            value=low_temp,
+            unit=unit,
+            as_of=as_of_ext,
+            metadata={
+                "city":           city_name,
+                "forecast_day":   day_offset,
+                "period":         np_.get("name", ""),
+                "short_forecast": np_.get("shortForecast", ""),
+                "forecast_low":   low_temp,
+            },
+        ))
+
+    # Observed minimum so far today.
+    observed_min: float | None = None
+    if obs_url:
+        # Derive the station obs URL from the corresponding temp_high_* key
+        # (avoids adding temp_low_* to KALSHI_STATION_IDS which would break METAR).
+        high_metric = metric.replace("temp_low_", "temp_high_")
+        station_id = KALSHI_STATION_IDS.get(high_metric)
+        if station_id:
+            low_obs_url = f"https://api.weather.gov/stations/{station_id}/observations"
+        else:
+            low_obs_url = obs_url
+        observed_min = await _fetch_observed_min_today(session, city_name, low_obs_url, city_tz)
+
+    logging.info(
+        "NOAA low [%s]: %s  observed_min=%s",
+        city_name,
+        "  ".join(extended_summary) if extended_summary else "no nighttime periods",
+        f"{observed_min:.1f}°F" if observed_min is not None else "N/A",
+    )
+
+    if observed_min is not None:
+        points.append(DataPoint(
+            source="noaa_observed",
+            metric=metric,
+            value=observed_min,
+            unit=unit,
+            as_of=as_of_today,
+            metadata={
+                "city":         city_name,
+                "observed_min": observed_min,
+            },
+        ))
+
+    return points
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -539,13 +807,13 @@ async def _fetch_high_temp(
 async def fetch_city_forecasts(
     session: aiohttp.ClientSession,
 ) -> list[DataPoint]:
-    """Fetch today's effective high-temperature estimate for all tracked cities.
+    """Fetch today's effective high and low temperature estimates for all tracked cities.
 
     For each city, resolves the NWS gridpoint URLs (cached), then concurrently
-    fetches the forecast and the day's observed maximum temperature.  Returns
-    one DataPoint per city successfully fetched.
+    fetches the forecast and the day's observed max/min temperature.  Returns
+    DataPoints for both daily high (CITIES) and daily low (LOW_CITIES).
     """
-    async def fetch_one(
+    async def fetch_one_high(
         metric: str, city_name: str, lat: float, lon: float, city_tz: ZoneInfo
     ) -> list[DataPoint]:
         gridpoint = await _resolve_gridpoint(session, metric, lat, lon)
@@ -556,14 +824,32 @@ async def fetch_city_forecasts(
             session, metric, city_name, gridpoint["forecast"], obs_url, city_tz
         )
 
-    tasks = [
-        fetch_one(metric, city_name, lat, lon, city_tz)
+    async def fetch_one_low(
+        metric: str, city_name: str, lat: float, lon: float, city_tz: ZoneInfo
+    ) -> list[DataPoint]:
+        # Re-use the gridpoint resolved for the corresponding high city.
+        high_metric = metric.replace("temp_low_", "temp_high_")
+        gridpoint = await _resolve_gridpoint(session, high_metric, lat, lon)
+        if gridpoint is None:
+            return []
+        obs_url = await _resolve_obs_url(session, high_metric, gridpoint["obs_stations"])
+        return await _fetch_low_temp(
+            session, metric, city_name, gridpoint["forecast"], obs_url, city_tz
+        )
+
+    high_tasks = [
+        fetch_one_high(metric, city_name, lat, lon, city_tz)
         for metric, (city_name, lat, lon, city_tz) in CITIES.items()
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    low_tasks = [
+        fetch_one_low(metric, city_name, lat, lon, city_tz)
+        for metric, (city_name, lat, lon, city_tz) in LOW_CITIES.items()
+    ]
+    results = await asyncio.gather(*high_tasks, *low_tasks, return_exceptions=True)
 
+    all_keys = list(CITIES.keys()) + list(LOW_CITIES.keys())
     data_points: list[DataPoint] = []
-    for metric, result in zip(CITIES.keys(), results):
+    for metric, result in zip(all_keys, results):
         if isinstance(result, Exception):
             logging.error("NOAA fetch error for %s: %s", metric, result)
         elif result:

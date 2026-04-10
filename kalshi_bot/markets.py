@@ -22,9 +22,19 @@ _MARKETS_PATH = "/trade-api/v2/markets"
 # the flood of KXMVE sports markets that dominate the default pagination order.
 # ---------------------------------------------------------------------------
 NUMERIC_SERIES: tuple[str, ...] = (
-    # Daily high temperature by city
+    # Daily high temperature by city — original series
     "KXHIGHLAX", "KXHIGHDEN", "KXHIGHCHI", "KXHIGHNY", "KXHIGHMIA",
     "KXHIGHDAL", "KXHIGHBOS", "KXHIGHAUS", "KXHIGHOU",
+    # Daily high temperature — new KXHIGHT* series (launched 2026-04)
+    "KXHIGHTSFO", "KXHIGHTSEA", "KXHIGHTBOS", "KXHIGHTPHX", "KXHIGHPHIL",
+    "KXHIGHTATL", "KXHIGHTMIN", "KXHIGHTDC",  "KXHIGHTLV",  "KXHIGHTOKC",
+    "KXHIGHTDAL", "KXHIGHTSATX", "KXHIGHTHOU", "KXHIGHTNOLA",
+    # Daily low temperature — KXLOWT* series (launched 2026-04)
+    "KXLOWTLAX", "KXLOWTDEN", "KXLOWTCHI", "KXLOWTNYC", "KXLOWTMIA",
+    "KXLOWTAUS", "KXLOWTBOS", "KXLOWTHOU", "KXLOWTDFW",
+    "KXLOWTSFO", "KXLOWTSEA", "KXLOWTPHX", "KXLOWTPHIL",
+    "KXLOWTATL", "KXLOWTMIN", "KXLOWTDC",  "KXLOWTLV",
+    "KXLOWTOKC", "KXLOWTSATX", "KXLOWTNOLA",
     # Crypto prices
     "KXBTCD", "KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M",
     "KXDOGE15M", "KXDOGE", "KXADA15M", "KXADA",

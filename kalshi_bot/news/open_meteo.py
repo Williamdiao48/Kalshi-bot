@@ -102,6 +102,40 @@ _CITY_TZ_STRINGS: dict[str, str] = {
     "temp_high_dal": "America/Chicago",
     "temp_high_bos": "America/New_York",
     "temp_high_hou": "America/Chicago",
+    "temp_high_dfw": "America/Chicago",
+    # New cities — active from 2026-04
+    "temp_high_sfo": "America/Los_Angeles",
+    "temp_high_sea": "America/Los_Angeles",
+    "temp_high_phx": "America/Phoenix",
+    "temp_high_phl": "America/New_York",
+    "temp_high_atl": "America/New_York",
+    "temp_high_msp": "America/Chicago",
+    "temp_high_dca": "America/New_York",
+    "temp_high_las": "America/Los_Angeles",
+    "temp_high_okc": "America/Chicago",
+    "temp_high_sat": "America/Chicago",
+    "temp_high_msy": "America/Chicago",
+    # Daily low temperature — same timezone strings as high counterparts
+    "temp_low_lax": "America/Los_Angeles",
+    "temp_low_den": "America/Denver",
+    "temp_low_chi": "America/Chicago",
+    "temp_low_ny":  "America/New_York",
+    "temp_low_mia": "America/New_York",
+    "temp_low_aus": "America/Chicago",
+    "temp_low_bos": "America/New_York",
+    "temp_low_hou": "America/Chicago",
+    "temp_low_dfw": "America/Chicago",
+    "temp_low_sfo": "America/Los_Angeles",
+    "temp_low_sea": "America/Los_Angeles",
+    "temp_low_phx": "America/Phoenix",
+    "temp_low_phl": "America/New_York",
+    "temp_low_atl": "America/New_York",
+    "temp_low_msp": "America/Chicago",
+    "temp_low_dca": "America/New_York",
+    "temp_low_las": "America/Los_Angeles",
+    "temp_low_okc": "America/Chicago",
+    "temp_low_sat": "America/Chicago",
+    "temp_low_msy": "America/Chicago",
 }
 
 # ---------------------------------------------------------------------------
@@ -137,7 +171,7 @@ async def _fetch_city_forecast(
     params = {
         "latitude":         f"{lat:.4f}",
         "longitude":        f"{lon:.4f}",
-        "daily":            "temperature_2m_max",
+        "daily":            "temperature_2m_max,temperature_2m_min",
         "temperature_unit": "fahrenheit",
         "timezone":         city_tz_str,  # local tz so daily dates match Kalshi settlement
         "forecast_days":    str(OPEN_METEO_FORECAST_DAYS),
@@ -158,6 +192,7 @@ async def _fetch_city_forecast(
     daily = data.get("daily", {})
     times: list[str] = daily.get("time", [])
     temps: list = daily.get("temperature_2m_max", [])
+    mins:  list = daily.get("temperature_2m_min", [])
 
     if not times or not temps:
         logging.warning("Open-Meteo: empty daily response for %s", city_name)
@@ -190,14 +225,20 @@ async def _fetch_city_forecast(
         value = float(temp_val)
 
         # as_of = noon in the city's local timezone (matches NOAA extended-forecast
-        # convention so the date guard in main.py treats both sources the same).
+        # convention so the date guard in numeric_matcher treats both sources the same).
+        # On parse failure skip the point rather than falling back to now() — a bad
+        # as_of would fool the date guard into matching this forecast to the wrong market.
         try:
             forecast_noon_local = datetime.strptime(
                 forecast_date_str, "%Y-%m-%d"
             ).replace(hour=12, tzinfo=city_tz)
             as_of = forecast_noon_local.astimezone(timezone.utc).isoformat()
         except ValueError:
-            as_of = datetime.now(timezone.utc).isoformat()
+            logging.warning(
+                "open_meteo: unparseable forecast date %r for %s day+%d — skipping point",
+                forecast_date_str, metric, day_offset,
+            )
+            continue
 
         label = "today" if day_offset == 0 else f"day+{day_offset}"
         summary_parts.append(f"{label}={value:.0f}°F")
@@ -214,6 +255,23 @@ async def _fetch_city_forecast(
                 "forecast_offset": day_offset,
             },
         ))
+
+        # Also emit the daily low for the same date.
+        if day_idx < len(mins) and mins[day_idx] is not None:
+            low_metric = metric.replace("temp_high_", "temp_low_")
+            if low_metric != metric:  # only emit when the replacement matched
+                points.append(DataPoint(
+                    source   = "open_meteo",
+                    metric   = low_metric,
+                    value    = float(mins[day_idx]),
+                    unit     = "°F",
+                    as_of    = as_of,
+                    metadata = {
+                        "city":            city_name,
+                        "forecast_date":   forecast_date_str,
+                        "forecast_offset": day_offset,
+                    },
+                ))
 
     if summary_parts:
         logging.info("Open-Meteo [%s]: %s", city_name, "  ".join(summary_parts))

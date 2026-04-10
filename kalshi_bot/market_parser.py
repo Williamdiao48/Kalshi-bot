@@ -31,6 +31,42 @@ TICKER_TO_METRIC: dict[str, str] = {
     "KXHIGHBOS": "temp_high_bos",
     "KXHIGHAUS": "temp_high_aus",
     "KXHIGHOU":  "temp_high_hou",
+    # New KXHIGHT* series (2026-04)
+    "KXHIGHTSFO":  "temp_high_sfo",
+    "KXHIGHTSEA":  "temp_high_sea",
+    "KXHIGHTBOS":  "temp_high_bos",   # reuses existing metric key
+    "KXHIGHTPHX":  "temp_high_phx",
+    "KXHIGHPHIL":  "temp_high_phl",
+    "KXHIGHTATL":  "temp_high_atl",
+    "KXHIGHTMIN":  "temp_high_msp",
+    "KXHIGHTDC":   "temp_high_dca",
+    "KXHIGHTLV":   "temp_high_las",
+    "KXHIGHTOKC":  "temp_high_okc",
+    "KXHIGHTDAL":  "temp_high_dfw",   # DFW airport (not Love Field — confirmed by rules_primary)
+    "KXHIGHTSATX": "temp_high_sat",
+    "KXHIGHTHOU":  "temp_high_hou",   # reuses existing metric key
+    "KXHIGHTNOLA": "temp_high_msy",
+    # Daily low temperature — KXLOWT* series (launched 2026-04)
+    "KXLOWTLAX":  "temp_low_lax",
+    "KXLOWTDEN":  "temp_low_den",
+    "KXLOWTCHI":  "temp_low_chi",
+    "KXLOWTNYC":  "temp_low_ny",    # "NYC" in ticker, normalized to "ny"
+    "KXLOWTMIA":  "temp_low_mia",
+    "KXLOWTAUS":  "temp_low_aus",
+    "KXLOWTBOS":  "temp_low_bos",
+    "KXLOWTHOU":  "temp_low_hou",
+    "KXLOWTDFW":  "temp_low_dfw",
+    "KXLOWTSFO":  "temp_low_sfo",
+    "KXLOWTSEA":  "temp_low_sea",
+    "KXLOWTPHX":  "temp_low_phx",
+    "KXLOWTPHIL": "temp_low_phl",   # "PHIL" in ticker, normalized to "phl"
+    "KXLOWTATL":  "temp_low_atl",
+    "KXLOWTMIN":  "temp_low_msp",
+    "KXLOWTDC":   "temp_low_dca",
+    "KXLOWTLV":   "temp_low_las",
+    "KXLOWTOKC":  "temp_low_okc",
+    "KXLOWTSATX": "temp_low_sat",
+    "KXLOWTNOLA": "temp_low_msy",
     # Crypto — price in USD
     "KXBTCD":    "price_btc_usd",   # daily close
     "KXBTC15M":  "price_btc_usd",   # 15-minute
@@ -205,7 +241,8 @@ def parse_all_markets(markets: list[dict[str, Any]]) -> list[ParsedMarket]:
 # Any ticker starting with one of these but absent from TICKER_TO_METRIC is
 # surfaced as a candidate for manual addition.
 _NUMERIC_PATTERN_PREFIXES: tuple[str, ...] = (
-    "KXHIGH",                          # temperature by city
+    "KXHIGH",                          # daily high temperature by city
+    "KXLOWT",                          # daily low temperature by city
     "KXBTC", "KXETH", "KXSOL", "KXXRP",   # crypto prices (BTC/ETH/SOL/XRP)
     "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",  # crypto prices
     "KXEUR", "KXUSD", "KXGBP", "KXJPY",  # forex

@@ -323,8 +323,8 @@ def find_numeric_opportunities(
             # carry today's city-local reading; forecast sources (weatherapi,
             # open_meteo, noaa_day2…) set as_of to noon on the forecast date.
             # Converting as_of → city local date handles both cases uniformly.
-            if dp.metric.startswith("temp_high"):
-                _city_info = _TEMP_HIGH_CITIES.get(dp.metric)
+            if dp.metric.startswith(("temp_high", "temp_low")):
+                _city_info = _TEMP_HIGH_CITIES.get(dp.metric.replace("temp_low_", "temp_high_"))
                 if _city_info is not None:
                     _city_tz = _city_info[3]
                     try:
