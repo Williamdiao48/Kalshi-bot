@@ -104,8 +104,17 @@ FAST_LOOP_INTERVAL: float = float(os.environ.get("FAST_LOOP_INTERVAL", "10.0"))
 #   was within WATCH_THRESHOLD_F of a band ceiling in the last full cycle.
 # _last_noaa_obs: NOAA observed values cached from the last full cycle for
 #   use as corroboration in _fast_loop() without re-fetching NOAA.
+# _last_noaa_obs_time: monotonic timestamp of when _last_noaa_obs was populated.
+#   Used to detect stale cache after a poll gap; if older than NOAA_OBS_MAX_AGE_S
+#   the fast loop falls back to NOAA-None mode (market-price confirmation only).
 _near_threshold_cities: set[str] = set()
 _last_noaa_obs: dict[str, float] = {}
+_last_noaa_obs_time: float = 0.0  # time.monotonic(); 0 = never populated
+
+# Maximum age (seconds) of the cached NOAA observed values before the fast loop
+# treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
+# the cached reading may no longer represent the current observed daily max.
+NOAA_OBS_MAX_AGE_S: float = float(os.environ.get("NOAA_OBS_MAX_AGE_S", "1800"))
 
 # How often to re-fetch the NUMERIC series markets (KXHIGH, KXBTCD, etc.).
 # These are the markets the bot actually trades; stale prices cause bad fills.
@@ -953,9 +962,13 @@ _ET = ZoneInfo("America/New_York")
 
 # City → local timezone, derived from nws_climo.CLIMO_LOCATIONS so there is a
 # single source of truth for the metric → timezone mapping.
+# Covers both temp_high_* and temp_low_* (same cities, same timezones).
 _CITY_TZ: dict[str, ZoneInfo] = {
     metric: tz for metric, (_, _, tz) in nws_climo.CLIMO_LOCATIONS.items()
 }
+_CITY_TZ.update({
+    metric: tz for metric, (_, _, tz) in nws_climo.LOW_CLIMO_LOCATIONS.items()
+})
 # Minimum local hour before a noaa_observed YES trade is allowed.
 # Daily temp max is typically established 1–5 PM local; before 1 PM the
 # "observed" max is still a morning partial reading — not a confirmed high.
@@ -969,6 +982,17 @@ NOAA_OBS_YES_MIN_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_YES_MIN_LOCAL_HO
 # committing to "temp will stay below strike".
 NOAA_OBS_PEAK_PAST_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LOCAL_HOUR", "16"))
 NOAA_OBS_PEAK_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LOCAL_MINUTE", "30"))
+
+# Morning gate for low-temperature observed YES signals (direction=over on
+# temp_low_* metrics).  The running daily minimum resets at local midnight and
+# at midnight equals the current temperature — not the overnight low, which
+# typically occurs at 4–6 AM.  Only allow noaa_observed YES trades on low-temp
+# markets after this local hour, by which point the overnight trough has passed
+# and the running min is a reliable confirmed floor.
+# Default: 05:00 local (typically past the overnight low trough).
+# Override via NOAA_OBS_LOW_PAST_LOCAL_HOUR / _MINUTE env vars.
+NOAA_OBS_LOW_PAST_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_HOUR", "5"))
+NOAA_OBS_LOW_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_MINUTE", "0"))
 
 # Regex for the date segment in KXHIGH tickers: e.g. "26MAR10" in KXHIGHAUS-26MAR10-T75
 _TICKER_DATE_RE = re.compile(r"^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$")
@@ -1054,7 +1078,7 @@ def _filter_weather_opportunities(
         for _o in opps:
             if (
                 _o.source in _OBS_CONFIRMED
-                and _o.metric.startswith("temp_high")
+                and _o.metric.startswith(("temp_high", "temp_low"))
                 and _o.implied_outcome == "YES"
             ):
                 # Apply the same afternoon hour gate used in the main loop.
@@ -1067,7 +1091,7 @@ def _filter_weather_opportunities(
     result: list[NumericOpportunity] = []
     for opp in opps:
         # Non-temperature metrics are unaffected.
-        if not opp.metric.startswith("temp_high"):
+        if not opp.metric.startswith(("temp_high", "temp_low")):
             result.append(opp)
             continue
 
@@ -1170,6 +1194,28 @@ def _filter_weather_opportunities(
                                 _mkt_date, local_dt.date(),
                             )
                             continue
+
+                        # Morning gate for low-temp observed YES signals.
+                        # The running daily min resets at local midnight and at
+                        # that point equals the current temp — not the overnight
+                        # low, which typically occurs at 4–6 AM.  Block until
+                        # NOAA_OBS_LOW_PAST_LOCAL_HOUR (default 05:00) by which
+                        # point the trough has passed and the running min is a
+                        # confirmed floor.
+                        if opp.metric.startswith("temp_low_"):
+                            local_mins = local_dt.hour * 60 + local_dt.minute
+                            min_mins = (NOAA_OBS_LOW_PAST_LOCAL_HOUR * 60
+                                        + NOAA_OBS_LOW_PAST_LOCAL_MINUTE)
+                            if local_mins < min_mins:
+                                logging.info(
+                                    "Morning gate: suppressed %s low-temp YES %s"
+                                    " — local time %02d:%02d < %02d:%02d"
+                                    " (overnight low not yet confirmed)",
+                                    opp.source, opp.market_ticker,
+                                    local_dt.hour, local_dt.minute,
+                                    min_mins // 60, min_mins % 60,
+                                )
+                                continue
 
                 if opp.source in _OBS_CONFIRMED and opp.direction in ("under", "between"):
                     city_tz = _CITY_TZ.get(opp.metric)
@@ -1795,7 +1841,7 @@ async def _poll(
         _pre_fraction = len(numeric_opps)
         _filtered: list = []
         for _o in numeric_opps:
-            if _o.metric.startswith("temp_high"):
+            if _o.metric.startswith(("temp_high", "temp_low")):
                 _filtered.append(_o)  # weather has its own gates
                 continue
             _scale = next(
@@ -1840,7 +1886,7 @@ async def _poll(
         # so we can detect conflicts even when the observed opp was filtered out.
         _obs_value: dict[str, float] = {}
         for _dp in data_points:
-            if _dp.source in ("noaa_observed", "metar") and _dp.metric.startswith("temp_high"):
+            if _dp.source in ("noaa_observed", "metar") and _dp.metric.startswith(("temp_high", "temp_low")):
                 # metar updates faster — prefer it over noaa_observed when both present
                 if _dp.source == "metar" or _dp.metric not in _obs_value:
                     _obs_value[_dp.metric] = _dp.value
@@ -1851,7 +1897,7 @@ async def _poll(
 
         consensus_opps: list[NumericOpportunity] = []
         for (metric, ticker), group in by_key.items():
-            if not metric.startswith("temp_high"):
+            if not metric.startswith(("temp_high", "temp_low")):
                 consensus_opps.extend(group)
                 continue
             # noaa_observed, nws_climo, nws_alert are ground-truth / high-confidence
@@ -2924,11 +2970,15 @@ async def _poll(
     # ---- band-pass arbitrage (METAR observed high vs. KXHIGH band markets) --
     # Duplicate of the identical block lower in _poll; this copy runs even when
     # all text/numeric/poly signals fail the score gate.
-    _band_arb_obs_early: dict[str, float] = {
-        dp.metric: dp.value
-        for dp in metar_result
-        if dp.metric.startswith("temp_high")
-    }
+    # Guard: metar_result may be an Exception if the fetch failed; iterating over
+    # an Exception raises TypeError and would crash the entire _poll().
+    _band_arb_obs_early: dict[str, float] = {}
+    if not isinstance(metar_result, Exception) and metar_result:
+        _band_arb_obs_early = {
+            dp.metric: dp.value
+            for dp in metar_result
+            if dp.metric.startswith("temp_high")  # band arb is high-temp only
+        }
     _band_arb_noaa_obs_early: dict[str, float] = {
         dp.metric: dp.value
         for dp in data_points
@@ -2946,6 +2996,12 @@ async def _poll(
                 len(_early_band_arb_signals), BAND_ARB_EXECUTION_ENABLED,
             )
             for _barb in _early_band_arb_signals:
+                if _barb.ticker in dry_run_held:
+                    logging.info(
+                        "BandArb skip: %s in re-entry cooldown / held position.",
+                        _barb.ticker,
+                    )
+                    continue
                 await executor.maybe_trade_band_arb(session, _barb)
 
     # ---- report + log ------------------------------------------------------
@@ -3077,11 +3133,11 @@ async def _poll(
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
     # inner loop only refreshes series prices for cities that matter.
-    global _near_threshold_cities, _last_noaa_obs
+    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time
     _near_threshold_cities = set()
     for _wl_mkt in markets:
         _wl_parsed = parse_market(_wl_mkt)
-        if _wl_parsed is None or not _wl_parsed.metric.startswith("temp_high"):
+        if _wl_parsed is None or not _wl_parsed.metric.startswith(("temp_high", "temp_low")):
             continue
         _wl_obs = _band_arb_obs_early.get(_wl_parsed.metric)
         if _wl_obs is None:
@@ -3094,6 +3150,7 @@ async def _poll(
         if _wl_ceil is not None and abs(_wl_ceil - _wl_obs) <= WATCH_THRESHOLD_F:
             _near_threshold_cities.add(_wl_parsed.metric)
     _last_noaa_obs = _band_arb_noaa_obs_early.copy()
+    _last_noaa_obs_time = time.monotonic()
     if _near_threshold_cities:
         logging.debug(
             "Fast-loop watchlist: %d near-threshold city(ies): %s",
@@ -3155,6 +3212,7 @@ def _adaptive_poll_interval(now_utc: datetime) -> int:
 async def _fast_loop(
     session: aiohttp.ClientSession,
     executor: "TradeExecutor",
+    ledger: "DryRunLedger | None" = None,
 ) -> None:
     """Lightweight band-arb check that runs between full poll cycles.
 
@@ -3206,14 +3264,39 @@ async def _fast_loop(
     if not fresh_markets:
         return
 
+    # Use cached NOAA only if it's fresh enough.  After a poll gap > NOAA_OBS_MAX_AGE_S
+    # the cached reading may no longer represent the current observed daily max; fall
+    # back to NOAA-None mode so the market-price gate (BAND_ARB_NOAA_NONE_MAX_NO_ASK)
+    # provides soft confirmation instead.
+    _noaa_age = time.monotonic() - _last_noaa_obs_time
+    _noaa_for_arb = (
+        _last_noaa_obs
+        if _last_noaa_obs and _noaa_age < NOAA_OBS_MAX_AGE_S
+        else None
+    )
+    if _noaa_for_arb is None and _last_noaa_obs:
+        logging.debug("Fast loop: NOAA cache stale (%.0fs > %.0fs), using None", _noaa_age, NOAA_OBS_MAX_AGE_S)
     signals = find_band_arbs(
         fresh_markets,
         obs_values,
-        noaa_obs_values=_last_noaa_obs or None,
+        noaa_obs_values=_noaa_for_arb,
     )
     if signals:
         logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))
+
+    fast_held: set[str] = set()
+    if TRADE_DRY_RUN and ledger is not None:
+        fast_held = ledger.open_tickers()
+        if EXIT_REENTRY_COOLDOWN_MINUTES > 0:
+            fast_held |= ledger.recently_exited_tickers(EXIT_REENTRY_COOLDOWN_MINUTES)
+
     for signal in signals:
+        if signal.ticker in fast_held:
+            logging.info(
+                "Fast loop BandArb skip: %s in re-entry cooldown / held position.",
+                signal.ticker,
+            )
+            continue
         await executor.maybe_trade_band_arb(session, signal)
 
 
@@ -3235,6 +3318,8 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
     executor = TradeExecutor()
     win_tracker = WinRateTracker()
     ledger = DryRunLedger() if TRADE_DRY_RUN else None
+    if ledger is not None:
+        executor.set_ledger(ledger)
     connector = aiohttp.TCPConnector(limit=30)
     cycle = 0
 
@@ -3266,7 +3351,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                     await asyncio.sleep(FAST_LOOP_INTERVAL)
                     _elapsed += FAST_LOOP_INTERVAL
                     try:
-                        await _fast_loop(session, executor)
+                        await _fast_loop(session, executor, ledger=ledger)
                     except Exception as exc:
                         logging.debug("Fast loop error: %s", exc)
                 _remaining = _sleep - _elapsed
