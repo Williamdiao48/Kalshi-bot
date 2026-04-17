@@ -1,9 +1,9 @@
 """Fetch historical NWS CLI (Climatological Report) actual high temperatures.
 
-For each of the 9 Kalshi temperature cities, queries the NWS Products API for
+For each of the 21 Kalshi temperature cities, queries the NWS Products API for
 all available CLI products, parses the daily MAXIMUM temperature, and writes
-a CSV of ground-truth actuals that backtest_source_accuracy.py uses to
-evaluate per-source forecast accuracy.
+a CSV of ground-truth actuals that backtest_source_accuracy.py and
+backtest_band_arb_yes.py use to evaluate accuracy.
 
 Output: data/nws_cli_actuals.csv
   city_metric, date, actual_high_f
@@ -11,6 +11,8 @@ Output: data/nws_cli_actuals.csv
 Usage:
   venv/bin/python scripts/fetch_nws_cli_history.py
   venv/bin/python scripts/fetch_nws_cli_history.py --out data/nws_cli_actuals.csv
+  venv/bin/python scripts/fetch_nws_cli_history.py --days 60
+  venv/bin/python scripts/fetch_nws_cli_history.py --append
 """
 
 import argparse
@@ -31,6 +33,30 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kalshi_bot.news.nws_climo import CLIMO_LOCATIONS, _parse_max_f  # noqa: E402
+
+# Extended station mapping — 13 cities beyond the original CLIMO_LOCATIONS 8.
+# These are the same stations used by the live METAR/NOAA fetchers.
+_EXTRA_STATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
+    "temp_high_dal":  ("DAL",  "Dallas Love Field",        ZoneInfo("America/Chicago")),
+    "temp_high_atl":  ("ATL",  "Atlanta",                  ZoneInfo("America/New_York")),
+    "temp_high_sea":  ("SEA",  "Seattle",                  ZoneInfo("America/Los_Angeles")),
+    "temp_high_sfo":  ("SFO",  "San Francisco",            ZoneInfo("America/Los_Angeles")),
+    "temp_high_phx":  ("PHX",  "Phoenix",                  ZoneInfo("America/Phoenix")),
+    "temp_high_phl":  ("PHL",  "Philadelphia",             ZoneInfo("America/New_York")),
+    "temp_high_msp":  ("MSP",  "Minneapolis",              ZoneInfo("America/Chicago")),
+    "temp_high_dca":  ("DCA",  "Washington DC",            ZoneInfo("America/New_York")),
+    "temp_high_las":  ("LAS",  "Las Vegas",                ZoneInfo("America/Los_Angeles")),
+    "temp_high_okc":  ("OKC",  "Oklahoma City",            ZoneInfo("America/Chicago")),
+    "temp_high_sat":  ("SAT",  "San Antonio",              ZoneInfo("America/Chicago")),
+    "temp_high_msy":  ("MSY",  "New Orleans",              ZoneInfo("America/Chicago")),
+    "temp_high_dfw":  ("DFW",  "Dallas/Fort Worth",        ZoneInfo("America/Chicago")),
+}
+
+# Combined: all 21 Kalshi temperature cities
+ALL_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
+    **CLIMO_LOCATIONS,
+    **_EXTRA_STATIONS,
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -209,40 +235,74 @@ async def _fetch_city_actuals(
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(out_path: Path) -> None:
+async def main(out_path: Path, append: bool = False, days: int | None = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing rows if appending
+    existing: dict[tuple[str, str], float] = {}
+    if append and out_path.exists():
+        with out_path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                key = (row["city_metric"], row["date"])
+                existing[key] = float(row["actual_high_f"])
+        log.info("Loaded %d existing rows (append mode)", len(existing))
+
+    # Date cutoff: only keep rows within --days of today
+    cutoff_date: str | None = None
+    if days is not None:
+        from datetime import date, timedelta
+        cutoff_date = (date.today() - timedelta(days=days)).isoformat()
+        log.info("Filtering to dates >= %s (%d days)", cutoff_date, days)
 
     all_rows: list[dict] = []
 
     async with aiohttp.ClientSession() as session:
         tasks = [
             _fetch_city_actuals(session, metric, loc, city, tz)
-            for metric, (loc, city, tz) in CLIMO_LOCATIONS.items()
+            for metric, (loc, city, tz) in ALL_LOCATIONS.items()
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for metric, result in zip(CLIMO_LOCATIONS, results):
+    for metric, result in zip(ALL_LOCATIONS, results):
         if isinstance(result, Exception):
             log.error("City fetch error for %s: %s", metric, result)
         else:
             all_rows.extend(result)
 
-    all_rows.sort(key=lambda r: (r["city_metric"], r["date"]))
+    # Merge with existing (new data wins on same date)
+    merged: dict[tuple[str, str], float] = dict(existing)
+    for row in all_rows:
+        key = (row["city_metric"], row["date"])
+        if cutoff_date is None or row["date"] >= cutoff_date:
+            merged[key] = row["actual_high_f"]
+
+    final_rows = [
+        {"city_metric": m, "date": d, "actual_high_f": v}
+        for (m, d), v in sorted(merged.items())
+        if cutoff_date is None or d >= cutoff_date
+    ]
 
     with out_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["city_metric", "date", "actual_high_f"])
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(final_rows)
 
-    log.info("Wrote %d rows to %s", len(all_rows), out_path)
+    log.info("Wrote %d rows to %s", len(final_rows), out_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch historical NWS CLI actuals.")
     parser.add_argument(
-        "--out",
-        default="data/nws_cli_actuals.csv",
+        "--out", default="data/nws_cli_actuals.csv",
         help="Output CSV path (default: data/nws_cli_actuals.csv)",
     )
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="Only include rows within this many days of today (default: all available)",
+    )
+    parser.add_argument(
+        "--append", action="store_true",
+        help="Merge with existing CSV rather than overwriting",
+    )
     args = parser.parse_args()
-    asyncio.run(main(Path(args.out)))
+    asyncio.run(main(Path(args.out), append=args.append, days=args.days))

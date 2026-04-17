@@ -42,6 +42,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -58,12 +59,16 @@ async def _fetch_city_high(
     lat: float,
     lon: float,
     api_key: str,
-    today_utc: str,
+    city_tz: ZoneInfo,
 ) -> DataPoint | None:
     """Fetch the forecast daily high for one city from OWM.
 
-    Filters 3-hour forecast slots to today's UTC date, returns the max
+    Filters 3-hour forecast slots to today's city-local date, returns the max
     ``main.temp_max`` as a DataPoint.  Returns None on failure or no data.
+
+    City-local date is used (not UTC) because late in the UTC day the OWM API
+    returns slots starting from midnight UTC of the next day — which are still
+    "today" in US local time (e.g. April 11 00:00 UTC = April 10 8 PM EDT).
     """
     params = {
         "lat":   lat,
@@ -87,10 +92,30 @@ async def _fetch_city_high(
         logging.error("OWM request error for %s: %s", city_name, exc)
         return None
 
+    slots = data.get("list", [])
+
+    # Diagnose auth/quota failures: OWM returns {"cod": "401"/"429", "message": ...}
+    # with HTTP 200 in some cases — no "list" key present.
+    if not slots:
+        cod = data.get("cod") or data.get("message", "")
+        logging.warning(
+            "OWM: empty response for %s (cod=%s) — possible auth/quota issue",
+            city_name, cod,
+        )
+        return None
+
+    today_local = datetime.now(city_tz).date()
     daily_high: float | None = None
-    for slot in data.get("list", []):
+    slot_dates: set[str] = set()
+    for slot in slots:
         dt_txt = slot.get("dt_txt", "")
-        if not dt_txt.startswith(today_utc):
+        try:
+            slot_utc = datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            slot_local_date = slot_utc.astimezone(city_tz).date()
+        except ValueError:
+            continue
+        slot_dates.add(str(slot_local_date))
+        if slot_local_date != today_local:
             continue
         slot_max = (slot.get("main") or {}).get("temp_max")
         if slot_max is not None:
@@ -98,7 +123,10 @@ async def _fetch_city_high(
                 daily_high = float(slot_max)
 
     if daily_high is None:
-        logging.warning("OWM: no forecast slots found for %s on %s", city_name, today_utc)
+        logging.warning(
+            "OWM: no forecast slots for %s on %s (local) — API returned local dates: %s",
+            city_name, today_local, sorted(slot_dates),
+        )
         return None
 
     as_of = datetime.now(timezone.utc).isoformat()
@@ -125,11 +153,9 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         logging.warning("OWM_API_KEY not set — skipping OWM weather fetch.")
         return []
 
-    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     tasks = [
-        _fetch_city_high(session, metric, city_name, lat, lon, api_key, today_utc)
-        for metric, (city_name, lat, lon, *_) in CITIES.items()
+        _fetch_city_high(session, metric, city_name, lat, lon, api_key, tz)
+        for metric, (city_name, lat, lon, tz) in CITIES.items()
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

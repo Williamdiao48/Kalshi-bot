@@ -44,6 +44,7 @@ Written to `opportunity_log.db` in the project root (same directory as
 """
 
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -53,6 +54,15 @@ from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 
 _DEFAULT_DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+
+# ---------------------------------------------------------------------------
+# Retention policy — rows older than these thresholds are deleted on startup.
+# Set to 0 to disable purging for a given table.
+# trades and circuit_breakers are never purged (tiny tables, irreplaceable).
+# ---------------------------------------------------------------------------
+RETENTION_OPPORTUNITIES_DAYS: int = int(os.environ.get("RETENTION_OPPORTUNITIES_DAYS", "30"))
+RETENTION_RAW_FORECASTS_DAYS: int = int(os.environ.get("RETENTION_RAW_FORECASTS_DAYS", "30"))
+RETENTION_PRICE_SNAPSHOTS_DAYS: int = int(os.environ.get("RETENTION_PRICE_SNAPSHOTS_DAYS", "30"))
 
 _CREATE_RAW_FORECASTS_SQL = """
 CREATE TABLE IF NOT EXISTS raw_forecasts (
@@ -193,7 +203,44 @@ class OpportunityLog:
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
+        self._purge_old_rows()
         logging.debug("OpportunityLog opened at %s", self._db_path)
+
+    def _purge_old_rows(self) -> None:
+        """Delete rows older than configured retention windows.
+
+        Called once on startup. Only purges high-volume tables (opportunities,
+        raw_forecasts, price_snapshots). trades and circuit_breakers are never
+        purged — they are tiny and serve as a permanent audit trail.
+        Set any retention env var to 0 to disable purging for that table.
+        """
+        thresholds = [
+            ("opportunities",   "logged_at",   RETENTION_OPPORTUNITIES_DAYS),
+            ("raw_forecasts",   "logged_at",   RETENTION_RAW_FORECASTS_DAYS),
+            ("price_snapshots", "snapshot_at", RETENTION_PRICE_SNAPSHOTS_DAYS),
+        ]
+        total = 0
+        for table, ts_col, days in thresholds:
+            if days <= 0:
+                continue
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                continue
+            cur = self._conn.execute(
+                f"DELETE FROM {table} WHERE {ts_col} < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            if cur.rowcount:
+                logging.info(
+                    "Retention purge: deleted %d rows from %s (older than %d days)",
+                    cur.rowcount, table, days,
+                )
+                total += cur.rowcount
+        if total:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _init_schema(self) -> None:
         # Connection is in autocommit mode (isolation_level=None); each execute
@@ -270,6 +317,45 @@ class OpportunityLog:
             for opp in opps
             if opp.metric.startswith(("temp_high_", "temp_low_"))
         ]
+        if rows:
+            self._conn.executemany(
+                """
+                INSERT INTO raw_forecasts
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def log_forecast_no_sources(self, signals: "list") -> None:
+        """Log per-source qualifying details for forecast_no signals to raw_forecasts.
+
+        Each ForecastNoSignal carries source_details: list of (source, value, edge_F).
+        Writing these to raw_forecasts makes open_meteo and noaa contributions visible
+        alongside the HRRR/METAR entries already logged by log_raw_forecasts().
+        """
+        from .strike_arb import ForecastNoSignal
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for sig in signals:
+            if not isinstance(sig, ForecastNoSignal):
+                continue
+            # Derive strike from direction for the raw_forecasts schema
+            strike: float | None = None
+            if hasattr(sig, "direction"):
+                # We don't have parsed.strike here; use None — logged for visibility only
+                pass
+            for source, value, edge in sig.source_details:
+                rows.append((
+                    now,
+                    source,
+                    sig.metric,
+                    sig.ticker,
+                    value,
+                    None,       # strike — not available on ForecastNoSignal
+                    sig.direction,
+                    edge,
+                ))
         if rows:
             self._conn.executemany(
                 """

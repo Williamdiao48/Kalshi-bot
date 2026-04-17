@@ -39,13 +39,11 @@ Rationale for compiled-in defaults:
   noaa_observed      0.80 — NO side still has uncertainty (temp can still
                             rise); give those more room.
   nws_alert          0.80 — high-confidence but not yet ground truth.
-  eia                0.95 — WTI oil contracts have extreme intraday volatility
-  eia_inventory      0.95   but consistently converge to their true value by
-                            settlement.  Only cut if position is nearly
-                            worthless (95% loss = essentially terminal).
-                            History: 3/3 stop-losses on eia_inventory were
-                            premature — all settled as wins.  Raised from
-                            0.50 to 0.95 to match eia behavior.
+  eia                0.50 — EIA data is public and already priced in; treat as
+  eia_inventory      0.50   a moderate-confidence forecast, not a lock.
+                            Historical "100% WR" was all far-OTM NO trades;
+                            the first genuinely contested signal was a bad trade
+                            caused by stale 2022-era spot price data.
 
 Exit columns added to the ``trades`` table
 ------------------------------------------
@@ -214,9 +212,8 @@ EXIT_PROFIT_TAKE_LONGSHOT_MULT: float = float(
 #                           still climb); give those positions more room.
 # nws_alert          0.80 — high-confidence directional signal but not yet
 #                           ground truth; let the position run.
-# eia                0.90 — WTI oil contracts trend toward their settlement
-#                           value; both historical EIA profit-takes exited too
-#                           early (left 52¢ and 58¢ on table).
+# eia                0.40 — EIA is a public, already-priced-in signal; treat
+# eia_inventory      0.40   like a weak forecast (same tier as polymarket).
 # noaa / owm / open_meteo  0.50 — raw forecast: symmetric risk each way.
 # polymarket / manifold    0.40 — text matches are noisier; cut losses fast.
 # noaa_day2:no  0.04 — day-ahead NWS forecast NO trades:
@@ -232,20 +229,22 @@ EXIT_PROFIT_TAKE_LONGSHOT_MULT: float = float(
 _pt_raw = os.environ.get(
     "EXIT_SOURCE_PROFIT_TAKE",
     '{"noaa_observed:yes": 0.50, "noaa_observed": 0.75, "metar:yes": 0.50, "metar": 0.80, "nws_alert": 0.80,'
-    ' "eia": 0.90, "eia_inventory": 0.90, "noaa_day2:no": 0.07, "noaa_day2_early:no": 0.07,'
+    ' "eia": 0.40, "eia_inventory": 0.40, "noaa_day2:no": 0.07, "noaa_day2_early:no": 0.07,'
     ' "noaa_day2:yes": 0.35, "noaa_day2_early:yes": 0.35,'
     ' "noaa": 0.40, "noaa_day2": 0.20, "polymarket": 0.25,'
+    ' "obs_trajectory:yes": 0.30,'
+    ' "band_arb:yes": 0.15,'
     ' "binance": 0.35, "coinbase": 0.35}',
 )
 _sl_raw = os.environ.get(
     "EXIT_SOURCE_STOP_LOSS",
     '{"noaa_observed:yes": 0.50, "metar:yes": 0.05, "nws_climo:yes": 0.05, "nws_alert:yes": 0.05,'
     ' "noaa_observed": 0.70, "metar": 0.60, "noaa": 0.30, "owm": 0.50, "open_meteo": 0.50,'
-    ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.95, "eia_inventory": 0.95,'
+    ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.50, "eia_inventory": 0.50,'
     ' "noaa_day2:yes": 0.45, "noaa_day2_early:yes": 0.45,'
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
-    ' "band_arb": 0.95,'
+    ' "band_arb": 0.95, "band_arb:yes": 0.70, "forecast_no": 0.90,'
     ' "binance": 0.25, "coinbase": 0.25}',
 )
 try:
@@ -298,6 +297,36 @@ COUNTER_SIGNAL_MAX_PROFIT_PCT: float = float(
     os.environ.get("COUNTER_SIGNAL_MAX_PROFIT_PCT", "0.40")
 )
 
+# Near-close stop-loss suppression for physically-locked signals.
+#
+# When a position is within EXIT_STOP_LOSS_NEARCLOSE_HOURS of market close
+# AND its source:side is considered irrevocably locked (the underlying
+# physical observation cannot reverse), the stop-loss threshold is replaced
+# with EXIT_STOP_LOSS_LOCKED_NEARCLOSE (default 0.0 = fully disabled).
+#
+# This prevents thin-liquidity midnight price spikes from firing a stop-loss
+# on signals whose outcome is already determined by physics.
+#
+# Locked signal examples:
+#   band_arb:no    — METAR observed daily max crossed the KXHIGH band ceiling.
+#                    The observation is recorded; it cannot be un-crossed.
+#   noaa_observed:no on KXLOWT* — the daily minimum temperature cannot rise
+#                    during a calendar day.  Any KXLOWT* NO signal is
+#                    structurally locked from entry.
+#                    Trade #250: Chicago 11 PM min 44.6°F vs 38.5°F ceil,
+#                    34 min before midnight close — a transient 18¢ NO spike
+#                    fired a false stop-loss.  Market resolved NO.
+#
+# Set EXIT_STOP_LOSS_NEARCLOSE_HOURS=0 to disable this feature entirely.
+EXIT_STOP_LOSS_NEARCLOSE_HOURS: float = float(
+    os.environ.get("EXIT_STOP_LOSS_NEARCLOSE_HOURS", "2.0")
+)
+# Threshold used near close for locked signals.
+# 0.0 = fully disabled (never stop out within the near-close window).
+EXIT_STOP_LOSS_LOCKED_NEARCLOSE: float = float(
+    os.environ.get("EXIT_STOP_LOSS_LOCKED_NEARCLOSE", "0.0")
+)
+
 # Sources where intraday price moves are noise — hold to settlement, skip all exits.
 # EIA/BLS/Fed/crypto: single data-release resolution; thin books before release
 # don't reflect new information.
@@ -309,21 +338,30 @@ _HOLD_TO_SETTLEMENT_SOURCES: frozenset[str] = frozenset({
     "polymarket", "metaculus", "manifold", "predictit",
 })
 
-# Weather sources: hold winners to settlement (intraday repricing on a correct
-# signal is noise), but allow stop_loss when the market moves decisively against
-# the position (observed temps rising = real information, not noise).
-# Profit-take and trailing-stop are suppressed — same-day markets resolve within
-# hours so there's no reason to exit a winning position early.
-_WEATHER_STOP_LOSS_ONLY_SOURCES: frozenset[str] = frozenset({
-    "noaa", "noaa_day1", "noaa_day2",
-    "noaa_observed", "nws_hourly", "nws_climo", "nws_alert",
-    "metar", "hrrr", "open_meteo", "weatherapi", "owm",
-    # band_arb: hold to settlement, stop_loss only.
-    # The temperature has physically been recorded above the ceiling — this is
-    # among the most locked signals the bot produces.  Exiting early on profit-take
-    # destroys large expected-value (trade 237: 180¢ captured vs 645¢ at settlement).
-    # Stop-loss still fires if the market decisively reverses (sensor error).
+# Locked weather signals — hold to settlement, stop_loss only.
+# These are based on confirmed observed data or official NWS advisories, so
+# the market will reprice to full value by settlement.  Exiting early on
+# profit-take destroys large EV (band_arb trade 237: 180¢ captured vs 645¢).
+# Stop-loss still fires if the market decisively reverses (sensor error).
+_LOCKED_STOP_LOSS_ONLY: frozenset[str] = frozenset({
+    "noaa_observed", "metar", "nws_climo", "nws_alert",
+    # band_arb: temperature physically recorded above ceiling — most locked signal.
     "band_arb",
+})
+
+# Forecast and trajectory sources — profit-take ENABLED for YES side.
+# These are probabilistic (model-based or trend-projected) rather than locked
+# outcomes, so capturing profit when the market reprices toward the target is
+# correct EV management.  NO side remains stop-loss-only (directional NO from
+# a forecast model is less certain and should not be profit-taken early).
+_FORECAST_PROFIT_TAKE_SOURCES: frozenset[str] = frozenset({
+    "noaa", "noaa_day1", "noaa_day2",
+    "nws_hourly", "hrrr",
+    "open_meteo", "weatherapi", "owm",
+    # obs_trajectory: projects likely peak from current METAR warming trend.
+    # Enter YES when slope × parabolic model says peak > strike; profit-take
+    # when the market catches up to the trajectory projection (~30% gain).
+    "obs_trajectory",
 })
 
 _ORDERS_PATH = "/trade-api/v2/orders"
@@ -384,6 +422,10 @@ class ExitManager:
         ("exit_pnl_cents",   "REAL"),
         ("exit_reason",      "TEXT"),
         ("exit_order_id",    "TEXT"),
+        # 1 if trade was entered after the daily peak was confirmed (peak_past=True
+        # on the originating NumericOpportunity).  Used by _is_locked_signal to
+        # suppress stop-loss on KXHIGH:no positions after 4:30 PM local.
+        ("peak_past",        "INTEGER"),
     ]
 
     def __init__(self, conn: "sqlite3.Connection", dry_run: bool = True) -> None:
@@ -402,12 +444,19 @@ class ExitManager:
         else:
             trailing_str = "  trailing=off"
         src_overrides = len(EXIT_SOURCE_PROFIT_TAKE) + len(EXIT_SOURCE_STOP_LOSS)
+        locked_str = (
+            f"  locked-SL={EXIT_STOP_LOSS_LOCKED_NEARCLOSE:.0%}"
+            f"@{EXIT_STOP_LOSS_NEARCLOSE_HOURS:.1f}h"
+            if EXIT_STOP_LOSS_NEARCLOSE_HOURS > 0
+            else "  locked-SL=off"
+        )
         logging.info(
-            "ExitManager — profit_take=%.0f%%  stop_loss=%.0f%%%s"
+            "ExitManager — profit_take=%.0f%%  stop_loss=%.0f%%%s%s"
             "  source_overrides=%d  dry_run=%s",
             EXIT_PROFIT_TAKE * 100,
             EXIT_STOP_LOSS  * 100,
             trailing_str,
+            locked_str,
             src_overrides,
             dry_run,
         )
@@ -519,7 +568,8 @@ class ExitManager:
             )
 
             # Compute hours to close from the trade's close_time (populated by
-            # _enrich).  Used for the time-gated trailing stop below.
+            # _enrich).  Used for the time-gated trailing stop below and for
+            # near-close locked-signal stop-loss suppression.
             hours_to_close: float | None = None
             ct_str = getattr(trade, "close_time", None)
             if ct_str:
@@ -529,14 +579,48 @@ class ExitManager:
                 except (ValueError, TypeError):
                     pass
 
-            is_weather = src in _WEATHER_STOP_LOSS_ONLY_SOURCES
+            # Near-close locked-signal stop-loss suppression.
+            # When the market is closing soon and the signal's underlying
+            # observation cannot physically reverse, replace the stop-loss
+            # threshold with EXIT_STOP_LOSS_LOCKED_NEARCLOSE (default 0 =
+            # fully disabled).  This prevents midnight liquidity spikes from
+            # stopping out positions that will settle correctly at resolution.
+            # See EXIT_STOP_LOSS_NEARCLOSE_HOURS for configuration.
+            if (
+                EXIT_STOP_LOSS_NEARCLOSE_HOURS > 0
+                and hours_to_close is not None
+                and 0 <= hours_to_close <= EXIT_STOP_LOSS_NEARCLOSE_HOURS
+                and self._is_locked_signal(
+                    src, side,
+                    getattr(trade, "ticker", ""),
+                    peak_past=bool(getattr(trade, "peak_past", False)),
+                )
+            ):
+                if stop_loss_thresh != EXIT_STOP_LOSS_LOCKED_NEARCLOSE:
+                    logging.debug(
+                        "[locked-SL] trade #%d %s %s: %.1fh to close —"
+                        " SL %.0f%% → %.0f%% (locked signal near-close suppression)",
+                        trade.trade_id, side.upper(),
+                        getattr(trade, "ticker", "?"),
+                        hours_to_close,
+                        stop_loss_thresh * 100,
+                        EXIT_STOP_LOSS_LOCKED_NEARCLOSE * 100,
+                    )
+                stop_loss_thresh = EXIT_STOP_LOSS_LOCKED_NEARCLOSE
+
+            # Locked signals (observed/advisory): hold to settlement, no profit-take.
+            # Forecast YES signals: profit-take enabled (model-projected, not locked).
+            # Forecast NO signals: stop-loss only (directional NO is less certain).
+            is_locked = (src in _LOCKED_STOP_LOSS_ONLY) and not (src == "band_arb" and side == "yes")
+            is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
+            suppress_profit_take = is_locked or is_forecast_no
 
             reason: str | None = None
-            if not is_weather and pct >= profit_take_thresh:
+            if not suppress_profit_take and pct >= profit_take_thresh:
                 reason = "profit_take"
             elif stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
                 reason = "stop_loss"
-            elif not is_weather and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)):
+            elif not suppress_profit_take and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)):
                 peak = self._get_peak_pct_gain(trade.trade_id)
                 if peak is not None and peak > 0:
                     # Resolve trailing drawdown threshold: source-specific
@@ -785,6 +869,42 @@ class ExitManager:
             (trade_id,),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+    @staticmethod
+    def _is_locked_signal(src: str, side: str, ticker: str, peak_past: bool = False) -> bool:
+        """Return True when this position's underlying observation cannot physically reverse.
+
+        Used to suppress stop-loss near market close.  A signal is "locked"
+        when the physical measurement that drove the entry is already recorded
+        and cannot change — stopping out on a transient liquidity spike then
+        destroys value when the market settles as originally predicted.
+
+        Locked cases:
+          band_arb:no    — METAR observed daily max crossed the KXHIGH band ceiling.
+                           The sensor reading is recorded; it cannot be un-crossed.
+          noaa_observed:no on KXLOWT* — the daily minimum temperature cannot rise
+                           within a calendar day (by definition of "minimum").
+                           The signal can only get stronger, never weaker.
+          noaa_observed:no on KXHIGH* with peak_past=True — the daily max has
+                           already been observed (after 4:30 PM local); the high
+                           cannot rise further.  Equivalent lock to KXLOWT:no.
+                           peak_past is persisted in the trades table at entry.
+
+        Not locked (deliberately excluded):
+          noaa_observed:no on KXHIGH* without peak_past — morning entries where the
+                           daily max has not yet been recorded (temp can still rise).
+          Forecast sources — model projections can be revised by new observations.
+        """
+        if side != "no":
+            return False
+        if src == "band_arb":
+            return True
+        if src == "noaa_observed":
+            if "KXLOWT" in ticker or "KXLOW" in ticker:
+                return True   # daily min cannot rise — always locked
+            if "KXHIGH" in ticker and peak_past:
+                return True   # daily max already peaked — locked NO
+        return False
 
     async def force_exit(
         self,

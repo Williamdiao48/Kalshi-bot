@@ -37,6 +37,12 @@ NAPM       ISM Manufacturing PMI composite index               ism_manufacturing
 NMFCI      ISM Services (Non-Manufacturing) PMI index          ism_services
            Released 3rd business day of month at 10:00 ET.
            Kalshi markets: "Will ISM Services PMI be above/below 50?"
+GDPNOW     Atlanta Fed GDPNow current-quarter estimate (%)     fred_gdp_nowcast
+           Updated ~15-20x per quarter whenever major macro data arrives
+           (retail sales, trade balance, PMI, etc.).  RMSE vs BEA advance
+           estimate ≈ 1.2pp — genuinely forward-looking.
+           Replaces lagged A191RL1Q225SBEA (quarterly SAAR, already priced in).
+           Kalshi markets: KXGDP "Will real GDP increase by more than X%?"
 """
 
 import logging
@@ -60,10 +66,12 @@ SERIES: dict[str, tuple[str, str, str]] = {
     # ISM PMI (NAPM / NMFCI) were removed from FRED after ISM revoked the
     # redistribution license.  Fetched directly via the ISM module instead.
     "PCEPI":           ("fred_pce",        "index", "PCE Price Index"),
-    # Real GDP growth rate (SAAR, %) — matches KXGDP "Will real GDP increase by
-    # more than X% in QN YYYY?" markets.  FRED updates within hours of the BEA
-    # advance estimate (last business day of the first month after quarter-end).
-    "A191RL1Q225SBEA": ("fred_gdp_growth", "%",     "Real GDP Growth (SAAR)"),
+    # Atlanta Fed GDPNow real-time estimate for the current quarter (%).
+    # Updates ~15-20x per quarter whenever major macro data releases arrive
+    # (retail sales, trade balance, ISM, etc.).  RMSE vs BEA advance estimate
+    # ≈ 1.2pp — genuinely forward-looking, unlike the lagged quarterly
+    # A191RL1Q225SBEA (SAAR) series it replaces.  No API-key change needed.
+    "GDPNOW":          ("fred_gdp_nowcast", "%",    "GDPNow Estimate"),
 }
 
 

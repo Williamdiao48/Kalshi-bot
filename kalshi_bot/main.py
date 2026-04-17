@@ -30,6 +30,7 @@ import aiohttp
 from .markets import fetch_all_markets, fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES, TEXT_SERIES
 from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC
 from .matcher import find_opportunities, Opportunity
+from .data import DataPoint
 from .numeric_matcher import find_numeric_opportunities, NumericOpportunity
 from .spread_matcher import find_spread_opportunities, SpreadOpportunity
 from .arb_detector import (
@@ -37,10 +38,10 @@ from .arb_detector import (
     find_crossed_book_opportunities, CrossedBookArb, CROSSED_BOOK_MIN_PROFIT,
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
-from .strike_arb import find_band_arbs, BAND_ARB_EXECUTION_ENABLED
+from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import federal_register
-from .news import noaa, owm, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar
+from .news import noaa, owm, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
 from .news import polymarket, metaculus, manifold, edgar, predictit
 from .news import box_office
 from .box_office_matcher import match_box_office_to_kalshi
@@ -392,9 +393,13 @@ TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "
 
 # Minimum edge (°F) for day-2+ NWS extended forecasts (source="noaa_day2" etc.).
 # Day-2 NWS MAE ≈ 5–6°F (1.4× day-1); the same 7°F edge represents only ~1.1σ
-# vs ~1.6σ for day-1. Requiring 9°F restores comparable entry quality.
+# vs ~1.6σ for day-1. Requiring 9°F was calibrated for winter cold extremes but
+# kills all day-ahead signals in spring/summer when NWS forecasts are 4–7°F from
+# strikes. Lowered to 5.0°F — equivalent to same-day TEMP_FORECAST_MIN_EDGE.
+# Quality is guarded downstream by FORECAST_CORROBORATION_MIN=2 (requires an
+# independent model to agree) and NOAA_DAY2_MIN_SCORE=0.90 (score gate).
 # Set to 0 to use TEMP_FORECAST_MIN_EDGE for all forecast sources uniformly.
-TEMP_DAY2_MIN_EDGE: float = float(os.environ.get("TEMP_DAY2_MIN_EDGE", "9.0"))
+TEMP_DAY2_MIN_EDGE: float = float(os.environ.get("TEMP_DAY2_MIN_EDGE", "5.0"))
 
 # Per-source minimum edge overrides (°F), split by market direction.
 #
@@ -425,7 +430,9 @@ TEMP_FORECAST_MIN_EDGE_UNDER: dict[str, float] = {
     "noaa":        5.0,
     "noaa_day1":   5.0,
     "nws_hourly":  5.0,  # NWS product, near-zero bias expected
-    "open_meteo":  12.0, # need 12°F raw to net ~7°F true edge after -5°F cold bias
+    "open_meteo":  7.0,  # -5°F cold bias → 7°F raw nets ~2°F true edge; FORECAST_CORROBORATION_MIN=2
+                          # prevents open_meteo from trading solo; its role is corroboration only.
+                          # Lowered from 12°F (was too aggressive; suppressed all spring signals).
     "weatherapi":  float("inf"),  # -8°F cold bias → under signals have ~-1°F true edge
 }
 
@@ -446,6 +453,41 @@ for _src, _over_env, _under_env in [
             except ValueError:
                 pass
 del _src, _over_env, _under_env, _d, _env, _v  # type: ignore[name-defined]
+
+# ---------------------------------------------------------------------------
+# Intraday temperature trajectory (obs_trajectory) configuration
+# ---------------------------------------------------------------------------
+# The obs_trajectory source uses individual METAR observations (already fetched
+# by metar.py) to compute the warming slope and project the day's likely peak
+# using a parabolic diurnal model. It fires only when the city is actively
+# warming (slope > TRAJ_MIN_SLOPE_FPH) and the projected peak meaningfully
+# exceeds the current temperature (by at least TRAJ_MIN_EDGE_F).
+#
+# Backtest (7-day, 20 cities):
+#   Parabolic MAE = 1.50°F (vs naive linear = 3.34°F)
+#   Mean error = -1.29°F (consistent underestimation → favorable for YES side)
+#   Reliable hours: 11–15 local. Unreliable: none in the 10–16 window.
+#   Recommended TRAJ_MIN_EDGE_F = 3.0°F (2× MAE).
+TRAJ_START_LOCAL_HOUR:  int   = int(os.environ.get("TRAJ_START_LOCAL_HOUR", "10"))
+TRAJ_END_LOCAL_HOUR:    int   = int(os.environ.get("TRAJ_END_LOCAL_HOUR", "16"))
+TRAJ_LOOKBACK_HOURS:    float = float(os.environ.get("TRAJ_LOOKBACK_HOURS", "2.0"))
+TRAJ_MIN_OBS:           int   = int(os.environ.get("TRAJ_MIN_OBS", "3"))
+TRAJ_MIN_SLOPE_FPH:     float = float(os.environ.get("TRAJ_MIN_SLOPE_FPH", "0.3"))
+TRAJ_MIN_HOURS_TO_PEAK: float = float(os.environ.get("TRAJ_MIN_HOURS_TO_PEAK", "0.5"))
+TRAJ_MIN_EDGE_F:        float = float(os.environ.get("TRAJ_MIN_EDGE_F", "3.0"))
+
+# City-specific typical dawn/peak hours (local). Dawn = daily minimum;
+# peak = daily maximum. Define the phase u in the parabolic diurnal model.
+# Default: dawn=6, peak=16 for all cities not listed here.
+TRAJ_DAWN_LOCAL_HOUR: dict[str, int] = {
+    "temp_high_mia": 7,   # Miami: ocean thermal lag
+    "temp_high_lax": 7,   # LA: marine layer delays warming start
+}
+TRAJ_PEAK_LOCAL_HOUR: dict[str, int] = {
+    "temp_high_phx": 15,  # Phoenix: desert heating peaks earlier
+    "temp_high_mia": 14,  # Miami: sea breeze onset ~2 PM
+    "temp_high_lax": 15,  # LA: peaks before marine layer returns
+}
 
 
 def _resolve_min_edge(source: str, direction: str) -> float:
@@ -575,6 +617,16 @@ EIA_MAX_STALE_DAYS: int = int(os.environ.get("EIA_MAX_STALE_DAYS", "1"))
 # disable the gate entirely.
 FOREX_MAX_STALE_DAYS: int = int(os.environ.get("FOREX_MAX_STALE_DAYS", "0"))
 
+# GDPNOW_MAX_STALE_DAYS — Maximum age (calendar days) of the Atlanta Fed GDPNow
+# estimate before it is considered stale and dropped.  GDPNow updates ~2-3x per
+# week during the quarter (whenever major macro data arrives).  Between updates
+# the reading can be 1-3 days old, which is still forward-looking.  The main
+# risk is the inter-quarter gap after the BEA advance estimate releases but
+# before GDPNow starts updating for the next quarter.
+# Default: 5 (covers weekends + minor gaps; drops stale inter-quarter readings).
+# Set to 30 to disable and always use the most recent available estimate.
+GDPNOW_MAX_STALE_DAYS: int = int(os.environ.get("GDPNOW_MAX_STALE_DAYS", "5"))
+
 # FOREX_CLOSE_HOURS — Gate for forex daily-fix markets (KXEURUSD, KXUSDJPY).
 # Only surface opportunities when within this many hours of the market's
 # close_time.  The ECB fixing and Kalshi resolution both land at ~10 AM ET;
@@ -662,7 +714,7 @@ OPPORTUNITY_COOLDOWN_MINUTES: int = int(os.environ.get("OPPORTUNITY_COOLDOWN_MIN
 # Profit-take exits are NOT blocked — a market that hit its profit target
 # may still have actionable upside worth re-entering.
 # Set to 0 to disable.
-EXIT_REENTRY_COOLDOWN_MINUTES: int = int(os.environ.get("EXIT_REENTRY_COOLDOWN_MINUTES", "240"))
+EXIT_REENTRY_COOLDOWN_MINUTES: int = int(os.environ.get("EXIT_REENTRY_COOLDOWN_MINUTES", "120"))
 
 # Minimum absolute net position (in contracts) at which an opportunity in that
 # market is suppressed from display. Prevents re-alerting on a market where we
@@ -994,6 +1046,34 @@ NOAA_OBS_PEAK_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LO
 NOAA_OBS_LOW_PAST_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_HOUR", "5"))
 NOAA_OBS_LOW_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_MINUTE", "0"))
 
+# Forecast floor gate for noaa_observed temp_low YES signals.
+# After the morning trough, temps rise during the day then drop again at sunset.
+# The NWS daily minimum spans the full calendar day — evening cooling can push
+# the final daily min below the strike even if the morning min was above it.
+# Guard: if tonight's NWS forecast low (source="noaa", day1) is below
+# (strike + TEMP_LOW_YES_FORECAST_BUFFER_F), suppress the YES signal.
+# Buffer of 0.5°F mirrors NWS integer rounding used in band arb: a forecast
+# of 47°F means the official low rounds to 47 (≥46.5) → safe above a 46°F
+# strike; a forecast of 46°F could round to 46 = strike → YES won't resolve.
+# Set TEMP_LOW_YES_FORECAST_BUFFER_F=0 for strict < strike comparison.
+TEMP_LOW_YES_FORECAST_BUFFER_F: float = float(
+    os.environ.get("TEMP_LOW_YES_FORECAST_BUFFER_F", "0.5")
+)
+# If True (default), suppress YES when no tonight forecast is available.
+# Set to 'false' to fall back to pre-fix behavior (allow without forecast).
+TEMP_LOW_YES_REQUIRE_FORECAST: bool = (
+    os.environ.get("TEMP_LOW_YES_REQUIRE_FORECAST", "true").lower() == "true"
+)
+# Only enforce the TEMP_LOW_YES_REQUIRE_FORECAST gate at or after this local
+# hour.  Before this hour the signal is about the confirmed overnight/morning
+# trough, which is less sensitive to evening cooldown risk.  After this hour
+# the temperature is likely still rising (or near peak) and an evening dip
+# could invalidate the YES — so the forecast is required.
+# Default 12 (noon local): require forecast in the afternoon when cooldown matters.
+TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR: int = int(
+    os.environ.get("TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR", "12")
+)
+
 # Regex for the date segment in KXHIGH tickers: e.g. "26MAR10" in KXHIGHAUS-26MAR10-T75
 _TICKER_DATE_RE = re.compile(r"^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$")
 _MONTH_NUM = {
@@ -1016,11 +1096,112 @@ def _ticker_date(ticker: str) -> date | None:
         return None
 
 
+def _compute_trajectory_projections(
+    metar_points: list[DataPoint],
+    now_utc: datetime,
+) -> list[DataPoint]:
+    """Compute temperature trajectory DataPoints from METAR time-series.
+
+    Uses a parabolic diurnal model to project the expected daily peak, accounting
+    for the natural deceleration of warming as temperatures approach their afternoon
+    maximum.  Only fires during TRAJ_START_LOCAL_HOUR..TRAJ_END_LOCAL_HOUR local
+    time when the city is actively warming (slope > TRAJ_MIN_SLOPE_FPH) and the
+    projected rise exceeds TRAJ_MIN_EDGE_F.
+
+    Model: T(t) = T_min + A*(2u - u²) where u = phase through warming phase.
+    Remaining rise: slope_now × hours_to_peak × (1 - u_now) / 2.
+    """
+    points: list[DataPoint] = []
+    for dp in metar_points:
+        if dp.source != "metar":
+            continue
+        obs_series = dp.metadata.get("obs_series")
+        if not obs_series or len(obs_series) < TRAJ_MIN_OBS:
+            continue
+
+        city_entry = noaa.CITIES.get(dp.metric)
+        if city_entry is None:
+            continue
+        city_tz = city_entry[3]
+
+        local_now = now_utc.astimezone(city_tz)
+        if not (TRAJ_START_LOCAL_HOUR <= local_now.hour < TRAJ_END_LOCAL_HOUR):
+            continue
+
+        local_hour_frac = local_now.hour + local_now.minute / 60.0
+
+        # Use only observations from the last TRAJ_LOOKBACK_HOURS
+        cutoff = now_utc.timestamp() - TRAJ_LOOKBACK_HOURS * 3600
+        recent = [(t, temp) for t, temp in obs_series if t >= cutoff]
+        if len(recent) < TRAJ_MIN_OBS:
+            continue
+
+        # Linear regression to compute warming slope (°F/hour)
+        n = len(recent)
+        ts = [t for t, _ in recent]
+        temps = [temp for _, temp in recent]
+        t_mean = sum(ts) / n
+        temp_mean = sum(temps) / n
+        num = sum((ts[i] - t_mean) * (temps[i] - temp_mean) for i in range(n))
+        den = sum((ts[i] - t_mean) ** 2 for i in range(n))
+        if den < 1.0:
+            continue
+        slope_fph = (num / den) * 3600  # per-second → per-hour
+        if slope_fph <= TRAJ_MIN_SLOPE_FPH:
+            continue
+
+        current_temp = temps[-1]
+
+        dawn_hour = TRAJ_DAWN_LOCAL_HOUR.get(dp.metric, 6)
+        peak_hour = TRAJ_PEAK_LOCAL_HOUR.get(dp.metric, 16)
+        warming_duration_h = peak_hour - dawn_hour
+        if warming_duration_h <= 0:
+            continue
+
+        u_now = max(0.0, min(1.0, (local_hour_frac - dawn_hour) / warming_duration_h))
+        hours_to_peak = max(0.0, peak_hour - local_hour_frac)
+        if hours_to_peak < TRAJ_MIN_HOURS_TO_PEAK:
+            continue
+
+        # Parabolic projected remaining rise
+        tod_factor = (1.0 - u_now) / 2.0
+        projected_rise = slope_fph * hours_to_peak * tod_factor
+        if projected_rise < TRAJ_MIN_EDGE_F:
+            continue
+
+        projected_peak = current_temp + projected_rise
+        logging.info(
+            "Trajectory [%s]: current=%.1f°F  slope=+%.2f°F/h  "
+            "phase=%.0f%%  projected_peak=%.1f°F  (+%.1f°F in %.1fh)",
+            dp.metric, current_temp, slope_fph,
+            u_now * 100, projected_peak, projected_rise, hours_to_peak,
+        )
+
+        points.append(DataPoint(
+            source="obs_trajectory",
+            metric=dp.metric,
+            value=projected_peak,
+            unit="°F",
+            as_of=now_utc.isoformat(),
+            metadata={
+                "current_temp":   current_temp,
+                "slope_fph":      round(slope_fph, 2),
+                "u_now":          round(u_now, 3),
+                "tod_factor":     round(tod_factor, 3),
+                "hours_to_peak":  round(hours_to_peak, 2),
+                "projected_rise": round(projected_rise, 2),
+                "obs_count":      len(recent),
+            },
+        ))
+    return points
+
+
 def _filter_weather_opportunities(
     opps: list[NumericOpportunity],
     markets: list[dict],
     hrrr_hourly_highs: dict[str, float] | None = None,
     observed_values: dict[str, float] | None = None,
+    fc_low_by_metric: dict[str, float] | None = None,
 ) -> list[NumericOpportunity]:
     """Apply source-specific quality gates to temperature (KXHIGH) opportunities.
 
@@ -1217,6 +1398,52 @@ def _filter_weather_opportunities(
                                 )
                                 continue
 
+                            # Forecast floor gate: suppress YES if tonight's NWS
+                            # forecast low is within striking distance of the
+                            # strike.  Evening cooling after sunset can push the
+                            # final daily min below the morning trough — the
+                            # morning gate passes but the signal is still unsafe.
+                            # 0.5°F buffer: NWS rounds to integer; need forecast
+                            # ≥ strike+1 to guarantee official low > strike.
+                            if fc_low_by_metric is not None and opp.strike is not None:
+                                _fc_low = fc_low_by_metric.get(opp.metric)
+                                if _fc_low is None and TEMP_LOW_YES_REQUIRE_FORECAST:
+                                    _past_gate_hour = (
+                                        local_dt.hour
+                                        >= TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR
+                                    )
+                                    if _past_gate_hour:
+                                        logging.info(
+                                            "Forecast floor gate: suppressed noaa_observed YES %s"
+                                            " — no tonight forecast after %02d:00 local"
+                                            " (TEMP_LOW_YES_REQUIRE_FORECAST=true)",
+                                            opp.market_ticker,
+                                            TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR,
+                                        )
+                                        continue
+                                    # Before the gate hour: morning trough is the primary
+                                    # signal; allow through without forecast.
+                                    logging.debug(
+                                        "Forecast floor gate: allowing noaa_observed YES %s"
+                                        " without forecast — before %02d:00 local (%02d:%02d)",
+                                        opp.market_ticker,
+                                        TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR,
+                                        local_dt.hour, local_dt.minute,
+                                    )
+                                if (
+                                    _fc_low is not None
+                                    and _fc_low < opp.strike + TEMP_LOW_YES_FORECAST_BUFFER_F
+                                ):
+                                    logging.info(
+                                        "Forecast floor gate: suppressed noaa_observed YES %s"
+                                        " — tonight forecast %.1f°F < strike+buf %.1f°F"
+                                        " (strike=%.1f°F, buf=%.1f°F)",
+                                        opp.market_ticker, _fc_low,
+                                        opp.strike + TEMP_LOW_YES_FORECAST_BUFFER_F,
+                                        opp.strike, TEMP_LOW_YES_FORECAST_BUFFER_F,
+                                    )
+                                    continue
+
                 if opp.source in _OBS_CONFIRMED and opp.direction in ("under", "between"):
                     city_tz = _CITY_TZ.get(opp.metric)
                     if city_tz is not None:
@@ -1252,6 +1479,14 @@ def _filter_weather_opportunities(
                             )
                             continue
 
+                        # After 4:30 PM the daily max is established — the upper
+                        # bound of a "between" band is now locked.  Flag peak_past
+                        # so score_p_yes uses a one-sided CDF (lower-boundary risk
+                        # only) and the edge scorer measures clearance from
+                        # strike_lo only, not the min of both distances.
+                        if opp.direction == "between":
+                            opp.peak_past = True
+
                     # Obs-consensus gate: require OBS_CONSENSUS_MIN distinct
                     # confirmed-observation sources to both show YES before
                     # trading.  Station mismatches appear in a single feed —
@@ -1269,12 +1504,22 @@ def _filter_weather_opportunities(
                             )
                             continue
 
-                    logging.info(
-                        "%s LOCKED-YES: %s  observed %.1f°F already exceeds strike"
-                        "  (edge %.1f°F)",
-                        opp.source.upper(), opp.market_ticker,
-                        opp.data_value, opp.edge,
-                    )
+                    if opp.direction == "between" and getattr(opp, "peak_past", False):
+                        logging.info(
+                            "%s LOCKED-BETWEEN-YES: %s  observed %.1f°F inside"
+                            " [%.1f, %.1f], peak confirmed past %02d:%02d"
+                            "  (edge %.1f°F above lo)",
+                            opp.source.upper(), opp.market_ticker, opp.data_value,
+                            opp.strike_lo or 0.0, opp.strike_hi or 0.0,
+                            min_mins // 60, min_mins % 60, opp.edge,
+                        )
+                    else:
+                        logging.info(
+                            "%s LOCKED-YES: %s  observed %.1f°F already exceeds strike"
+                            "  (edge %.1f°F)",
+                            opp.source.upper(), opp.market_ticker,
+                            opp.data_value, opp.edge,
+                        )
                 else:
                     logging.info(
                         "NWS ALERT-YES: %s  alert temp %.1f°F above strike"
@@ -1441,6 +1686,7 @@ async def _poll(
         ("bls",          bls.fetch_latest(session, seen)),
         ("fred",         fred.fetch_rates(session)),
         ("eia",          eia.fetch_prices(session)),
+        ("wti_futures",  wti_futures.fetch_futures(session)),
         ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),
         ("adp",          adp.fetch_datapoints(session)),
         ("chicago_pmi",  chicago_pmi.fetch_datapoints(session)),
@@ -1478,6 +1724,7 @@ async def _poll(
     bls_result         = R["bls"]
     fred_result        = R["fred"]
     eia_result         = R["eia"]
+    wti_futures_result = R["wti_futures"]
     fedwatch_result    = R["fedwatch"]
     adp_result         = R["adp"]
     chicago_pmi_result  = R["chicago_pmi"]
@@ -1676,6 +1923,7 @@ async def _poll(
         ("BLS",         bls_result),
         ("FRED",        fred_result),
         ("EIA",         eia_result),
+        ("WTI Futures", wti_futures_result),
     ]:
         if isinstance(result, Exception):
             logging.error("%s fetch error: %s", label, result)
@@ -1688,22 +1936,10 @@ async def _poll(
     if fedwatch_dps:
         data_points.extend(fedwatch_dps)
 
-    # EIA Inventory — weekly crude/natgas stock change → implied price direction.
-    # Called sequentially (needs spot prices from eia_result).  Inventory data
-    # cached 1 hour internally; recomputes implied prices from fresh spots each cycle.
-    # Opens a Tuesday 16:30 ET (API report) and Wednesday 10:30 ET (AGA report)
-    # pre-release window in addition to the standard Wednesday/Thursday EIA windows.
-    _eia_wti_spot    = next((dp.value for dp in (eia_result or []) if dp.metric == "eia_wti"),    None)
-    _eia_natgas_spot = next((dp.value for dp in (eia_result or []) if dp.metric == "eia_natgas"), None)
-    if _eia_wti_spot is not None or _eia_natgas_spot is not None:
-        try:
-            _eia_inv_dps = await eia_inventory.fetch_signals(
-                session, wti_spot=_eia_wti_spot, natgas_spot=_eia_natgas_spot
-            )
-            if _eia_inv_dps:
-                data_points.extend(_eia_inv_dps)
-        except Exception as _e:
-            logging.error("EIA inventory fetch error: %s", _e)
+    # EIA Inventory — deferred to AFTER the staleness filter below so that
+    # implied prices are computed from the same fresh spot the filter approves.
+    # (Previously extracted from raw eia_result before filtering, which allowed
+    # stale 2022-era WTI prints to slip through and produce wildly wrong signals.)
 
     # ADP Employment Report — pre-signal for KXNFP (Wed before BLS Friday).
     if isinstance(adp_result, Exception):
@@ -1784,6 +2020,23 @@ async def _poll(
             )
         data_points = fresh
 
+    # ---- EIA Inventory (post-staleness-filter) ------------------------------
+    # Extract spot prices from the already-filtered data_points so that stale
+    # EIA periods (e.g. 2022-era WTI at $114) cannot reach eia_inventory.
+    # Opens a Tuesday 16:30 ET (API report) and Wednesday 10:30 ET (AGA report)
+    # pre-release window in addition to the standard Wednesday/Thursday EIA windows.
+    _eia_wti_spot    = next((dp.value for dp in data_points if dp.source == "eia" and dp.metric == "eia_wti"),    None)
+    _eia_natgas_spot = next((dp.value for dp in data_points if dp.source == "eia" and dp.metric == "eia_natgas"), None)
+    if _eia_wti_spot is not None or _eia_natgas_spot is not None:
+        try:
+            _eia_inv_dps = await eia_inventory.fetch_signals(
+                session, wti_spot=_eia_wti_spot, natgas_spot=_eia_natgas_spot
+            )
+            if _eia_inv_dps:
+                data_points.extend(_eia_inv_dps)
+        except Exception as _e:
+            logging.error("EIA inventory fetch error: %s", _e)
+
     # ---- Frankfurter/ECB forex staleness filter -----------------------------
     # ECB reference rates publish once per day at ~16:00 CET (~10:00 AM ET).
     # Until that publication the only available rate is yesterday's — which is
@@ -1821,6 +2074,61 @@ async def _poll(
                 fx_stale, FOREX_MAX_STALE_DAYS,
             )
         data_points = fx_fresh
+
+    # ---- GDPNow staleness filter --------------------------------------------
+    # Atlanta Fed GDPNow updates ~2-3x per week during the quarter.  Between
+    # updates the series date can be 1-3 days old, which is still useful.
+    # The risky period is the inter-quarter gap: after the BEA advance estimate
+    # is published the old quarter's GDPNOW stops updating, leaving a stale
+    # reading until the new quarter's estimate begins.  Drop any fred_gdp_nowcast
+    # DataPoint whose FRED series date exceeds GDPNOW_MAX_STALE_DAYS.
+    # Note: filter is scoped to metric=="fred_gdp_nowcast" only — other FRED
+    # series (DGS10, ICSA, etc.) reflect the most recent trading/report day
+    # and must never be age-filtered here.
+    if GDPNOW_MAX_STALE_DAYS < 30 and any(
+        dp.source == "fred" and dp.metric == "fred_gdp_nowcast" for dp in data_points
+    ):
+        today_date = datetime.now(timezone.utc).date()
+        gdp_fresh: list = []
+        gdp_stale = 0
+        for dp in data_points:
+            if dp.source != "fred" or dp.metric != "fred_gdp_nowcast":
+                gdp_fresh.append(dp)
+                continue
+            try:
+                series_date = datetime.fromisoformat(
+                    dp.as_of.split("T")[0].replace("Z", "")
+                ).date()
+                age_days = (today_date - series_date).days
+                if age_days <= GDPNOW_MAX_STALE_DAYS:
+                    gdp_fresh.append(dp)
+                else:
+                    gdp_stale += 1
+                    logging.info(
+                        "GDPNow staleness gate: dropped fred_gdp_nowcast"
+                        " series_date=%s (age %d day(s) > max %d)",
+                        dp.as_of, age_days, GDPNOW_MAX_STALE_DAYS,
+                    )
+            except (ValueError, AttributeError):
+                gdp_fresh.append(dp)  # unparseable date: allow through
+        if gdp_stale:
+            logging.info(
+                "GDPNow staleness gate: dropped %d stale GDPNow DataPoint(s)"
+                " (series date older than %d day(s)).",
+                gdp_stale, GDPNOW_MAX_STALE_DAYS,
+            )
+        data_points = gdp_fresh
+
+    # ---- Intraday trajectory projections (obs_trajectory) -------------------
+    # Extract METAR time-series already present in data_points and append
+    # obs_trajectory DataPoints.  These flow through numeric_matcher exactly
+    # like any other forecast source.  Zero extra API calls — the obs_series
+    # is already fetched by metar.fetch_city_forecasts().
+    _metar_dps = [dp for dp in data_points if dp.source == "metar"]
+    if _metar_dps:
+        _traj_dps = _compute_trajectory_projections(_metar_dps, datetime.now(timezone.utc))
+        if _traj_dps:
+            data_points.extend(_traj_dps)
 
     numeric_opps: list[NumericOpportunity] = []
     if data_points and markets:
@@ -1890,6 +2198,15 @@ async def _poll(
                 # metar updates faster — prefer it over noaa_observed when both present
                 if _dp.source == "metar" or _dp.metric not in _obs_value:
                     _obs_value[_dp.metric] = _dp.value
+
+        # NWS "Tonight" (day1) forecast low per temp_low metric.
+        # source="noaa" carries the day-1 overnight low from fetch_city_forecasts().
+        # Used by _filter_weather_opportunities to suppress noaa_observed YES signals
+        # when tonight's forecast will push the daily minimum below the strike.
+        _fc_low_by_metric: dict[str, float] = {}
+        for _dp in data_points:
+            if _dp.source == "noaa" and _dp.metric.startswith("temp_low_"):
+                _fc_low_by_metric[_dp.metric] = _dp.value
 
         by_key: dict[tuple[str, str], list[NumericOpportunity]] = collections.defaultdict(list)
         for opp in numeric_opps:
@@ -2116,13 +2433,18 @@ async def _poll(
             # multi-model blend with human forecaster adjustments.
             if forecast_outcome == "YES":
                 yes_sources = {o.source for o in forecasts if o.implied_outcome == "YES"}
-                noaa_yes = {s for s in yes_sources if s.startswith("noaa") or s == "hrrr"}
+                # obs_trajectory is an observed-trend signal (derived from real METAR
+                # readings) — treated alongside noaa/hrrr as a trusted source.
+                noaa_yes = {
+                    s for s in yes_sources
+                    if s.startswith("noaa") or s in ("hrrr", "obs_trajectory")
+                }
                 # Sources that may never trade solo (unreliable standalone forecasts):
                 # - open_meteo: raw GFS, systematically underestimates cold-front timing
                 # - weatherapi: commercial aggregator with demonstrated day+0/+1 errors
                 #   (7°F+ same-day, >16°F next-day). Can still vote in consensus.
                 _SOLO_BLOCKED = {"open_meteo", "weatherapi"}
-                gfs_only = not noaa_yes  # True when no NOAA/HRRR source is in YES set
+                gfs_only = not noaa_yes  # True when no NOAA/HRRR/obs_trajectory source is in YES set
                 solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
                 if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
                     logging.info(
@@ -2131,7 +2453,12 @@ async def _poll(
                         ", ".join(yes_sources), metric, ticker,
                     )
                     continue
-                if not gfs_only and FORECAST_CORROBORATION_MIN > 1:
+                # obs_trajectory is self-corroborating: it derives from real observed
+                # METAR readings so a lone signal is accepted without requiring an
+                # additional model source.  All other trusted sources (noaa, hrrr)
+                # still require FORECAST_CORROBORATION_MIN when trading solo.
+                obs_traj_solo = yes_sources == {"obs_trajectory"}
+                if not gfs_only and not obs_traj_solo and FORECAST_CORROBORATION_MIN > 1:
                     if len(yes_sources) < FORECAST_CORROBORATION_MIN:
                         logging.info(
                             "Corroboration gate: lone %s YES on %s %s"
@@ -2174,9 +2501,8 @@ async def _poll(
             # forecast pool for future-day markets, noaa_day2 + open_meteo
             # provides a genuinely independent NWS+ECMWF two-source signal.
             if forecast_outcome == "NO" and not is_same_day_mkt:
-                no_sources_fday = {
-                    o.source for o in forecasts if o.implied_outcome == "NO"
-                }
+                no_forecasts_fday = [o for o in forecasts if o.implied_outcome == "NO"]
+                no_sources_fday = {o.source for o in no_forecasts_fday}
                 # weatherapi is demoted to corroboration-only (same as open_meteo).
                 # A weatherapi-only NO on a future-day market is suppressed regardless
                 # of FORECAST_CORROBORATION_MIN.
@@ -2195,6 +2521,30 @@ async def _poll(
                         FORECAST_CORROBORATION_MIN, len(no_sources_fday),
                     )
                     continue
+                # For "between" band NO signals, sources can agree on NO for
+                # opposite reasons: one says too hot (above band), another says
+                # too cold (below band).  This is contradictory, not corroboration.
+                # Require all NO sources to agree on which side of the band the
+                # forecast falls (all above strike_hi, or all below strike_lo).
+                ref_opp = next((o for o in no_forecasts_fday), None)
+                if (
+                    ref_opp is not None
+                    and ref_opp.direction == "between"
+                    and ref_opp.strike_lo is not None
+                    and ref_opp.strike_hi is not None
+                ):
+                    above = [o for o in no_forecasts_fday if o.data_value > ref_opp.strike_hi]
+                    below = [o for o in no_forecasts_fday if o.data_value < ref_opp.strike_lo]
+                    if above and below:
+                        logging.info(
+                            "Corroboration gate: contradictory NO on between %s %s"
+                            " — sources disagree on which side of band"
+                            " (above=%s, below=%s); suppressed",
+                            metric, ticker,
+                            [o.source for o in above],
+                            [o.source for o in below],
+                        )
+                        continue
 
             # NO-side corroboration gate (same-day markets).
             # A lone real-time source (nws_hourly only, no HRRR) calling NO
@@ -2265,6 +2615,7 @@ async def _poll(
         numeric_opps = _filter_weather_opportunities(
             numeric_opps, markets, hrrr_hourly_highs,
             observed_values=_obs_value if numeric_opps else None,
+            fc_low_by_metric=_fc_low_by_metric if numeric_opps else None,
         )
         dropped = before - len(numeric_opps)
         if dropped:
@@ -2290,7 +2641,7 @@ async def _poll(
             #   cme_fedwatch — continuous FOMC probability signal
             #   adp           — Wednesday pre-signal for Friday BLS NFP
             #   chicago_pmi   — last-biz-day pre-signal for ISM Manufacturing
-            if opp.source in ("cme_fedwatch", "adp", "chicago_pmi"):
+            if opp.source in ("cme_fedwatch", "adp", "chicago_pmi", "yahoo_wti_futures"):
                 passed_rw.append(opp)
                 continue
             if is_within_release_window(opp.metric, now_utc, RELEASE_WINDOW_MINUTES):
@@ -2908,6 +3259,19 @@ async def _poll(
                 )
             dry_run_held |= recently_exited
 
+        # forecast_no: block same-day re-entry for any exit reason (profit-take
+        # included).  The `recently_exited_tickers` cooldown only covers stop-loss
+        # exits, so profit-taken forecast_no positions could be re-entered at a
+        # higher price with less remaining upside on the very next poll.
+        _fno_exited_today: set[str] = ledger.forecast_no_exited_today()
+        if _fno_exited_today:
+            logging.info(
+                "ForecastNO today-exited: %d ticker(s) blocked from same-day re-entry: %s",
+                len(_fno_exited_today), ", ".join(sorted(_fno_exited_today)),
+            )
+    else:
+        _fno_exited_today = set()
+
     if POSITION_SKIP_CONTRACTS > 0 or dry_run_held:
         before_pos = len(scored_text) + len(scored_numeric) + len(scored_poly)
         scored_text = [
@@ -2973,22 +3337,25 @@ async def _poll(
     # Guard: metar_result may be an Exception if the fetch failed; iterating over
     # an Exception raises TypeError and would crash the entire _poll().
     _band_arb_obs_early: dict[str, float] = {}
+    _band_arb_obs_dates: dict[str, date] = {}
     if not isinstance(metar_result, Exception) and metar_result:
-        _band_arb_obs_early = {
-            dp.metric: dp.value
-            for dp in metar_result
-            if dp.metric.startswith("temp_high")  # band arb is high-temp only
-        }
+        for _dp in metar_result:
+            if _dp.metric.startswith(("temp_high", "temp_low")):
+                _band_arb_obs_early[_dp.metric] = _dp.value
+                _ld = (_dp.metadata or {}).get("local_date")
+                if _ld:
+                    _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
     _band_arb_noaa_obs_early: dict[str, float] = {
         dp.metric: dp.value
         for dp in data_points
-        if dp.source == "noaa_observed" and dp.metric.startswith("temp_high")
+        if dp.source == "noaa_observed" and dp.metric.startswith(("temp_high", "temp_low"))
     }
     if _band_arb_obs_early:
         _early_band_arb_signals = find_band_arbs(
             markets,
             _band_arb_obs_early,
             noaa_obs_values=_band_arb_noaa_obs_early or None,
+            obs_dates=_band_arb_obs_dates or None,
         )
         if _early_band_arb_signals:
             logging.info(
@@ -3003,6 +3370,48 @@ async def _poll(
                     )
                     continue
                 await executor.maybe_trade_band_arb(session, _barb)
+
+    # ---- forecast-driven NO signals (early, before METAR confirmation) ------
+    if FORECAST_NO_ENABLED and data_points:
+        _forecast_no_signals = find_forecast_nos(markets, data_points)
+        if _forecast_no_signals:
+            opp_log.log_forecast_no_sources(_forecast_no_signals)
+            logging.info(
+                "ForecastNO: %d signal(s) found.", len(_forecast_no_signals),
+            )
+            # Build set of city-date prefixes (e.g. "KXHIGHTSFO-26APR14") that
+            # already have a held or today-exited forecast_no position.  Adjacent
+            # strike bands in the same city are correlated — holding multiple
+            # bands doubles exposure with no diversification benefit.
+            _held_prefixes: set[str] = {
+                "-".join(t.split("-")[:2])
+                for t in (dry_run_held | _fno_exited_today)
+                if "KXHIGH" in t or "KXLOWT" in t
+            }
+            # Process highest-edge signal first so the best-conviction band wins
+            # when multiple bands from the same city qualify simultaneously.
+            for _fno in sorted(_forecast_no_signals, key=lambda s: -s.min_edge_f):
+                _fno_prefix = "-".join(_fno.ticker.split("-")[:2])
+                if _fno.ticker in dry_run_held:
+                    logging.info(
+                        "ForecastNO skip: %s — open position held.", _fno.ticker,
+                    )
+                    continue
+                if _fno.ticker in _fno_exited_today:
+                    logging.info(
+                        "ForecastNO skip: %s — already traded today (same-day re-entry blocked).",
+                        _fno.ticker,
+                    )
+                    continue
+                if _fno_prefix in _held_prefixes:
+                    logging.info(
+                        "ForecastNO skip: %s — city-date %s already has a position.",
+                        _fno.ticker, _fno_prefix,
+                    )
+                    continue
+                await executor.maybe_trade_forecast_no(session, _fno)
+                # Block further signals for this city-date within the same poll
+                _held_prefixes.add(_fno_prefix)
 
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)
@@ -3232,11 +3641,14 @@ async def _fast_loop(
         logging.debug("Fast loop: METAR fetch failed: %s", exc)
         return
 
-    obs_values = {
-        dp.metric: dp.value
-        for dp in metar_result
-        if dp.metric.startswith("temp_high")
-    }
+    obs_values: dict[str, float] = {}
+    _fast_obs_dates: dict[str, date] = {}
+    for _dp in metar_result:
+        if _dp.metric.startswith("temp_high"):
+            obs_values[_dp.metric] = _dp.value
+            _ld = (_dp.metadata or {}).get("local_date")
+            if _ld:
+                _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
     if not obs_values:
         return
 
@@ -3280,6 +3692,7 @@ async def _fast_loop(
         fresh_markets,
         obs_values,
         noaa_obs_values=_noaa_for_arb,
+        obs_dates=_fast_obs_dates or None,
     )
     if signals:
         logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))

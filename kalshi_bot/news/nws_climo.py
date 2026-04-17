@@ -33,7 +33,9 @@ high-confidence observation tier, subject to afternoon gate and obs-consensus ga
 """
 
 import logging
+import os
 import re
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -96,6 +98,12 @@ LOW_CLIMO_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
     "temp_low_msy": ("MSY", "New Orleans",              ZoneInfo("America/Chicago")),
 }
 
+# How long (minutes) to wait between retry attempts when the CLI product
+# is not yet published.  The preliminary CLI is typically published 5–8 PM
+# local time, so the bot retries every 30 minutes until it succeeds.
+# Set to 0 to attempt only once per UTC day (old behavior).
+CLIMO_RETRY_INTERVAL_MINUTES: int = int(os.environ.get("CLIMO_RETRY_INTERVAL_MINUTES", "30"))
+
 # Cache: (metric, utc_date_str) → parsed max temperature (°F).
 # Re-populated once per calendar day per city — avoids re-fetching the same
 # CLI product on every 60-second poll cycle.
@@ -103,21 +111,25 @@ _cache: dict[tuple[str, str], float] = {}
 # Cache: (location, utc_date_str) → parsed min temperature (°F).
 _min_cache: dict[tuple[str, str], float] = {}
 
-# Which product IDs have already been fetched and attempted this session.
-# Prevents hammering the API when a city's CLI doesn't have today's preliminary yet.
-_attempted: dict[tuple[str, str], bool] = {}  # (metric, utc_date_str) → tried
+# Monotonic timestamp of the most recent fetch attempt per (metric, utc_date_str).
+# Used to throttle retries — we re-attempt every CLIMO_RETRY_INTERVAL_MINUTES
+# until data is found (rather than giving up after the first miss at 8 AM).
+_last_attempted: dict[tuple[str, str], float] = {}  # (metric, utc_date_str) → time.monotonic()
 
 
 def _parse_min_f(text: str) -> float | None:
     """Extract the daily MINIMUM temperature (°F) from a NWS CLI product text.
 
     Mirrors _parse_max_f() but searches for MIN/MINIMUM instead of MAX/MAXIMUM.
-    Returns None if no numeric value follows MINIMUM or if the value is missing.
+    Returns None if no numeric value follows MINIMUM or if the value is missing
+    or outside the valid US daily low-temperature range (-60°F to 110°F).
     """
     m = re.search(r'\bMIN(?:IMUM)?\b[\s/A-Z]*(\d+)', text, re.IGNORECASE)
     if m:
         try:
-            return float(m.group(1))
+            val = float(m.group(1))
+            if -60.0 <= val <= 110.0:   # sanity: valid US daily low range
+                return val
         except ValueError:
             pass
     return None
@@ -135,14 +147,17 @@ def _parse_max_f(text: str) -> float | None:
       Format B (inline values):
         MAXIMUM   MAX 66   MIN 38   AVG 52
 
-    Returns ``None`` if no numeric value follows MAXIMUM or if the value
-    is flagged as missing ("MM", "MISSING", etc.).
+    Returns ``None`` if no numeric value follows MAXIMUM, if the value is
+    flagged as missing, or if the extracted value is outside the valid US
+    daily high-temperature range (-60°F to 130°F).  The upper bound filters
+    out non-temperature values like "MAX WIND SPEED 145" or "MAX PRESSURE 1013".
     """
-    # Find "MAXIMUM" (or "MAX TEMP") followed by optional whitespace then digits.
     m = re.search(r'\bMAX(?:IMUM)?\b[\s/A-Z]*(\d+)', text, re.IGNORECASE)
     if m:
         try:
-            return float(m.group(1))
+            val = float(m.group(1))
+            if -60.0 <= val <= 130.0:   # sanity: valid US daily high range
+                return val
         except ValueError:
             pass
     return None
@@ -237,10 +252,13 @@ async def _fetch_city_climo(
             ))
         return points
 
-    if _attempted.get(cache_key):
-        return []   # already tried and failed this calendar day
+    _last_attempt = _last_attempted.get(cache_key, 0.0)
+    if CLIMO_RETRY_INTERVAL_MINUTES > 0 and (time.monotonic() - _last_attempt) < CLIMO_RETRY_INTERVAL_MINUTES * 60:
+        return []   # too soon to retry; wait for next interval
+    elif CLIMO_RETRY_INTERVAL_MINUTES == 0 and _last_attempt > 0:
+        return []   # retry disabled — only attempt once per UTC day
 
-    _attempted[cache_key] = True
+    _last_attempted[cache_key] = time.monotonic()
     today_local = now_utc.astimezone(city_tz).date()
 
     try:

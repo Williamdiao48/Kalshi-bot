@@ -138,6 +138,22 @@ _CITY_TZ_STRINGS: dict[str, str] = {
     "temp_low_msy": "America/Chicago",
 }
 
+
+def _warn_tz_fallback(metric: str) -> str:
+    """Log a warning and return 'UTC' when a metric has no configured timezone.
+
+    Using UTC as a fallback misaligns forecast dates for most US cities (e.g.,
+    treating 11 PM ET as the next UTC day).  This function makes the silent
+    fallback visible so the mapping can be added to _CITY_TZ_STRINGS.
+    """
+    logging.warning(
+        "open_meteo: no timezone configured for metric %r — "
+        "falling back to UTC; forecast dates may be misaligned",
+        metric,
+    )
+    return "UTC"
+
+
 # ---------------------------------------------------------------------------
 # Module-level cache
 # ---------------------------------------------------------------------------
@@ -169,12 +185,13 @@ async def _fetch_city_forecast(
     Returns list of DataPoints (may be empty on error).
     """
     params = {
-        "latitude":         f"{lat:.4f}",
-        "longitude":        f"{lon:.4f}",
-        "daily":            "temperature_2m_max,temperature_2m_min",
-        "temperature_unit": "fahrenheit",
-        "timezone":         city_tz_str,  # local tz so daily dates match Kalshi settlement
-        "forecast_days":    str(OPEN_METEO_FORECAST_DAYS),
+        "latitude":           f"{lat:.4f}",
+        "longitude":          f"{lon:.4f}",
+        "daily":              "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max",
+        "temperature_unit":   "fahrenheit",
+        "precipitation_unit": "inch",    # request inches directly; no mm→in conversion needed
+        "timezone":           city_tz_str,  # local tz so daily dates match Kalshi settlement
+        "forecast_days":      str(OPEN_METEO_FORECAST_DAYS),
     }
 
     try:
@@ -193,6 +210,8 @@ async def _fetch_city_forecast(
     times: list[str] = daily.get("time", [])
     temps: list = daily.get("temperature_2m_max", [])
     mins:  list = daily.get("temperature_2m_min", [])
+    precip_totals: list = daily.get("precipitation_sum", [])
+    precip_probs:  list = daily.get("precipitation_probability_max", [])
 
     if not times or not temps:
         logging.warning("Open-Meteo: empty daily response for %s", city_name)
@@ -273,6 +292,40 @@ async def _fetch_city_forecast(
                     },
                 ))
 
+        # Emit daily precipitation total (inches).
+        if day_idx < len(precip_totals) and precip_totals[day_idx] is not None:
+            precip_metric = metric.replace("temp_high_", "precip_total_")
+            if precip_metric != metric:
+                points.append(DataPoint(
+                    source   = "open_meteo",
+                    metric   = precip_metric,
+                    value    = float(precip_totals[day_idx]),
+                    unit     = "in",
+                    as_of    = as_of,
+                    metadata = {
+                        "city":            city_name,
+                        "forecast_date":   forecast_date_str,
+                        "forecast_offset": day_offset,
+                    },
+                ))
+
+        # Emit precipitation probability (0.0–100.0 percent).
+        if day_idx < len(precip_probs) and precip_probs[day_idx] is not None:
+            prob_metric = metric.replace("temp_high_", "precip_prob_")
+            if prob_metric != metric:
+                points.append(DataPoint(
+                    source   = "open_meteo",
+                    metric   = prob_metric,
+                    value    = float(precip_probs[day_idx]),
+                    unit     = "%",
+                    as_of    = as_of,
+                    metadata = {
+                        "city":            city_name,
+                        "forecast_date":   forecast_date_str,
+                        "forecast_offset": day_offset,
+                    },
+                ))
+
     if summary_parts:
         logging.info("Open-Meteo [%s]: %s", city_name, "  ".join(summary_parts))
     else:
@@ -314,7 +367,7 @@ async def fetch_city_forecasts(
         _fetch_city_forecast(
             session, metric, city_name, lat, lon,
             city_tz=city_tz,
-            city_tz_str=_CITY_TZ_STRINGS.get(metric, "UTC"),
+            city_tz_str=_CITY_TZ_STRINGS.get(metric) or _warn_tz_fallback(metric),
         )
         for metric, (city_name, lat, lon, city_tz) in CITIES.items()
     ]

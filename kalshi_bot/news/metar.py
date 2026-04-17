@@ -77,6 +77,27 @@ _cache_time: float = 0.0
 _cache_points: list[DataPoint] = []
 
 
+def _filter_cache_to_today(now_utc: datetime) -> list[DataPoint]:
+    """Return only cached DataPoints still valid for today's local date.
+
+    Called before serving stale cache to prevent yesterday's daily high/low
+    from flowing into obs_values after a local midnight rollover.
+    Handles both temp_high_* and temp_low_* metrics (CITIES only has temp_high_*).
+    """
+    valid = []
+    for dp in _cache_points:
+        lookup_metric = dp.metric.replace("temp_low_", "temp_high_")
+        city_entry = CITIES.get(lookup_metric)
+        if city_entry is None:
+            continue
+        _, _, _, city_tz = city_entry
+        local_today_str = now_utc.astimezone(city_tz).date().strftime("%Y-%m-%d")
+        cached_date = (dp.metadata or {}).get("local_date", "")
+        if cached_date == local_today_str:
+            valid.append(dp)
+    return valid
+
+
 def _c_to_f(temp_c: float) -> float:
     return temp_c * 9.0 / 5.0 + 32.0
 
@@ -94,6 +115,8 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
     global _cache_time, _cache_points
 
     now = time.monotonic()
+    now_utc = datetime.now(timezone.utc)
+
     if _cache_points and (now - _cache_time) < METAR_CACHE_SECONDS:
         return _cache_points
 
@@ -115,7 +138,13 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
     except Exception as exc:
         logging.warning("METAR fetch failed: %s", exc)
         if _cache_points:
-            logging.info("METAR: serving stale cache after fetch failure")
+            stale = _filter_cache_to_today(now_utc)
+            logging.info(
+                "METAR: serving stale cache after fetch failure "
+                "(%d/%d cities still valid for local today)",
+                len(stale), len(_cache_points),
+            )
+            return stale
         return _cache_points
 
     # Group observations by station ID
@@ -126,7 +155,6 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             by_station[station].append(rec)
 
     points: list[DataPoint] = []
-    now_utc = datetime.now(timezone.utc)
     summary_parts: list[str] = []
 
     for station_id, obs_list in by_station.items():
@@ -143,8 +171,11 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         # Local "today" for this city
         local_today = now_utc.astimezone(city_tz).date()
 
-        # Find the maximum temperature across all observations for today
+        # Find the max and min temperatures across all observations for today,
+        # and collect the time-series for trajectory projection.
         daily_max_f: float | None = None
+        daily_min_f: float | None = None
+        obs_today: list[tuple[float, float]] = []  # (epoch_timestamp, temp_f)
         for obs in obs_list:
             temp_c = obs.get("temp")
             if temp_c is None:
@@ -157,18 +188,23 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             if obs_local_date != local_today:
                 continue
             temp_f = _c_to_f(float(temp_c))
+            obs_today.append((float(obs_epoch), temp_f))
             if daily_max_f is None or temp_f > daily_max_f:
                 daily_max_f = temp_f
+            if daily_min_f is None or temp_f < daily_min_f:
+                daily_min_f = temp_f
 
         if daily_max_f is None:
             logging.debug("METAR: no today observations for %s (%s)", station_id, city_name)
             continue
 
+        obs_today.sort(key=lambda x: x[0])  # ascending by time
+
         # as_of = current UTC time (real-time observation, not a noon anchor)
         as_of = now_utc.isoformat()
         date_str = local_today.strftime("%Y-%m-%d")
 
-        summary_parts.append(f"{city_name}={daily_max_f:.1f}°F")
+        summary_parts.append(f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo)")
 
         points.append(DataPoint(
             source="metar",
@@ -181,8 +217,28 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
                 "station":       station_id,
                 "observed_max":  daily_max_f,
                 "local_date":    date_str,
+                "obs_series":    obs_today,  # list of (epoch, temp_f) for trajectory
             },
         ))
+
+        # Emit daily minimum as temp_low_* DataPoint (same station, same fetch)
+        if daily_min_f is not None:
+            low_metric = metric.replace("temp_high_", "temp_low_")
+            if low_metric != metric:
+                points.append(DataPoint(
+                    source="metar",
+                    metric=low_metric,
+                    value=daily_min_f,
+                    unit="°F",
+                    as_of=as_of,
+                    metadata={
+                        "city":         city_name,
+                        "station":      station_id,
+                        "observed_min": daily_min_f,
+                        "local_date":   date_str,
+                        "obs_series":   obs_today,
+                    },
+                ))
 
     if summary_parts:
         logging.info("METAR observed highs: %s", "  ".join(summary_parts))
@@ -194,9 +250,12 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         _cache_points = points
     elif _cache_points:
         stale_age = int(now - _cache_time)
+        stale = _filter_cache_to_today(now_utc)
         logging.warning(
-            "METAR: all stations returned no data; serving stale cache (%ds old)",
-            stale_age,
+            "METAR: all stations returned no data; serving stale cache "
+            "(%ds old, %d/%d cities valid for local today)",
+            stale_age, len(stale), len(_cache_points),
         )
+        _cache_points[:] = stale  # drop expired entries in-place
 
     return _cache_points

@@ -119,7 +119,7 @@ from .arb_detector import (
     CrossedBookArb, CROSSED_BOOK_ARB_ENABLED,
 )
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
-from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED
+from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +259,13 @@ DRAWDOWN_ENABLED: bool          = os.environ.get("DRAWDOWN_SCALING_ENABLED", "tr
 # Default 50: covers ~5–7 weeks of recent history at current trade frequency.
 # Set to 0 to use all-time history (original behaviour).
 DRAWDOWN_LOOKBACK_TRADES: int = int(os.environ.get("DRAWDOWN_LOOKBACK_TRADES", "50"))
+# Exclude trades with id < this value from the drawdown equity curve.
+# Use to remove known-buggy trades from the PnL series without discarding the
+# drawdown mechanism or reducing the lookback window.
+# Example: set DRAWDOWN_IGNORE_BEFORE_ID=229 to start the equity clock from
+# trade 229 (first midnight ghost band-arb) onward.
+# 0 = disabled (use all trades within DRAWDOWN_LOOKBACK_TRADES).
+DRAWDOWN_IGNORE_BEFORE_ID: int = int(os.environ.get("DRAWDOWN_IGNORE_BEFORE_ID", "0"))
 
 # Module-level drawdown factor, updated each cycle by main.py via
 # set_drawdown_factor().  Applied to pos_max_cents in all trade paths.
@@ -284,20 +291,20 @@ KELLY_FRACTION_HIGH: float = float(os.environ.get("KELLY_FRACTION_HIGH", "0.40")
 KELLY_HIGH_SCORE_THRESHOLD: float = float(os.environ.get("KELLY_HIGH_SCORE_THRESHOLD", "0.80"))
 
 # Position sizing overrides for locked-observation trades (noaa_observed, metar,
-# nws_climo, nws_alert, eia, eia_inventory).  These positions are near-certain by
-# definition: either the observation already confirms the outcome (weather station
-# readings, EIA inventory report) or an NWS alert is in effect.  Use a larger
-# position ceiling and aggressive Kelly fraction since the edge is structurally
-# locked rather than probabilistic.
-# LOCKED_OBS_MAX_POSITION_CENTS: $50 (raised from $25 — EIA 100% hold-to-settlement WR).
-# LOCKED_OBS_KELLY_FRACTION: 0.75 — aggressive but not full-Kelly.
-# LOCKED_OBS_MAX_CONTRACTS: 50 — hard cap (raised from 30).
+# nws_climo, nws_alert).  These positions are near-certain by definition: the
+# observation already confirms the outcome (weather station readings) or an NWS
+# alert is in effect.  Use a larger position ceiling and aggressive Kelly fraction
+# since the edge is structurally locked rather than probabilistic.
+# EIA/eia_inventory are intentionally excluded: EIA data is public and already
+# priced into Kalshi markets within seconds of release.  The inventory adjustment
+# model has only ~65% directional accuracy — a corroboration signal, not a lock.
+# Historical "100% WR" was all trivially easy NO trades on far-OTM strikes;
+# the first genuinely contested signal (#32 YES on T91.99) produced a bad trade.
 LOCKED_OBS_MAX_POSITION_CENTS: int = int(os.environ.get("LOCKED_OBS_MAX_POSITION_CENTS", "5000"))
 LOCKED_OBS_KELLY_FRACTION: float    = float(os.environ.get("LOCKED_OBS_KELLY_FRACTION",  "0.75"))
 LOCKED_OBS_MAX_CONTRACTS: int       = int(os.environ.get("LOCKED_OBS_MAX_CONTRACTS",      "50"))
 _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
     "noaa_observed", "metar", "nws_climo", "nws_alert",
-    "eia", "eia_inventory",   # EIA reports are observed commodity data, not forecasts
 })
 
 # Maximum concurrent open positions allowed on the same underlying prefix
@@ -305,6 +312,29 @@ _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
 # while allowing the bot to capture edge on 2-3 strikes of a temp ladder.
 # Set to 1 to restore the old behavior (single position per underlying).
 MAX_SAME_UNDERLYING_OPEN: int = int(os.environ.get("MAX_SAME_UNDERLYING_OPEN", "3"))
+
+# Add-on (position averaging) controls.
+# When the bot already has an open position on the EXACT same ticker+side,
+# it evaluates adding more contracts rather than skipping the signal.
+# Kelly handles price conditioning automatically: if the market has moved
+# against us, cost rises and Kelly recommends fewer (or zero) new contracts.
+#
+# ADDON_MIN_GAP_MINUTES — minimum minutes between consecutive add-ons on the
+#   same exact ticker.  Without this gate the bot could add one trade per poll
+#   cycle (every 60 s) until the underlying cap is hit.  Default 60 min.
+#   Set to 0 to disable (no time gate between add-ons).
+# ADDON_MAX_TOTAL_CONTRACTS — maximum total open contracts on the same exact
+#   ticker + side across all trades including the original entry.  Limits
+#   total dollar exposure per market.  Default 20 contracts (≈ $10 at 50¢).
+#   Set to 0 to disable.
+ADDON_MIN_GAP_MINUTES: int = int(os.environ.get("ADDON_MIN_GAP_MINUTES", "60"))
+ADDON_MAX_TOTAL_CONTRACTS: int = int(os.environ.get("ADDON_MAX_TOTAL_CONTRACTS", "20"))
+
+# Band-arb YES p_win parameters.
+# Pre-lock: dynamic model adds clearance_factor + time_factor to BASE_P.
+# Locked (post-4:30 PM): flat LOCKED_P mirrors band_arb NO confidence level.
+BAND_ARB_YES_BASE_P: float = float(os.environ.get("BAND_ARB_YES_BASE_P", "0.62"))
+BAND_ARB_YES_LOCKED_P: float = float(os.environ.get("BAND_ARB_YES_LOCKED_P", "0.88"))
 
 # Maximum total cost basis across all currently open positions (cents).
 # Guards against correlated blowup when many weather markets are open
@@ -325,12 +355,16 @@ MAX_TOTAL_EXPOSURE_CENTS: int = int(os.environ.get("MAX_TOTAL_EXPOSURE_CENTS", "
 ARB_MAX_CONTRACTS: int = int(os.environ.get("ARB_MAX_CONTRACTS", "20"))
 
 # Score-weighted position sizing.  When enabled, the Kelly count is multiplied
-# by (score − TRADE_MIN_SCORE) / (1.0 − TRADE_MIN_SCORE), linearly scaling
-# positions from 0% at the score floor to 100% at a perfect score.
+# by a score-derived factor that scales linearly from SCORE_WEIGHT_MIN_FACTOR
+# (at TRADE_MIN_SCORE) to 1.0 (at a perfect score of 1.0).
 # This reduces exposure on low-conviction signals without blocking them
 # entirely, while high-conviction signals get full Kelly allocation.
-# Set SCORE_WEIGHTED_SIZING=false to disable.
+# SCORE_WEIGHT_MIN_FACTOR (default 0.25): the minimum fraction of Kelly applied
+#   to trades that just clear the score gate.  Hardcoded to 0.25 historically;
+#   now configurable so the dead zone just above the gate can be tuned.
+# Set SCORE_WEIGHTED_SIZING=false to disable entirely.
 SCORE_WEIGHTED_SIZING: bool = os.environ.get("SCORE_WEIGHTED_SIZING", "true").lower() != "false"
+SCORE_WEIGHT_MIN_FACTOR: float = float(os.environ.get("SCORE_WEIGHT_MIN_FACTOR", "0.25"))
 
 # Default P(win) estimate used when no per-metric prior is available.
 # 0.60 is a conservative starting point — only slightly above break-even for
@@ -477,9 +511,13 @@ def _temp_forecast_sigma(metric: str, source: str = "noaa") -> float:
 NOAA_OBSERVED_SIGMA: float = float(os.environ.get("NOAA_OBSERVED_SIGMA", "2.0"))
 
 # P(win) estimate for trades driven by observed station data (source="noaa_observed").
-# Observed temps are near-certain, so a higher prior is appropriate.
-# Overrides KELLY_DEFAULT_P / KELLY_METRIC_PRIORS for observed-source trades.
+# Observed temps are near-certain for NO signals (sensor confirms band crossed).
+# For YES signals the certainty is lower — the running min/max can still move.
+# NOAA_OBSERVED_P: floor for P(win) on NO-side observed trades.
+# NOAA_OBSERVED_YES_P: floor for P(win) on YES-side observed trades.
+# Empirical YES win rate across 34 trades = 32%; 0.40 is calibrated + margin of safety.
 NOAA_OBSERVED_P: float = float(os.environ.get("NOAA_OBSERVED_P", "0.80"))
+NOAA_OBSERVED_YES_P: float = float(os.environ.get("NOAA_OBSERVED_YES_P", "0.40"))
 
 # Maximum P(YES) returned by _implied_p_yes() for forecast-only sources
 # (any source other than noaa_observed and nws_alert).  The Normal-CDF model
@@ -544,12 +582,17 @@ CIRCUIT_BREAKER_MAX_OPEN: int = int(
     os.environ.get("CIRCUIT_BREAKER_MAX_OPEN", "5")
 )
 
-_priors_raw = os.environ.get("KELLY_METRIC_PRIORS", "{}")
+_KELLY_METRIC_PRIORS_DEFAULT: dict[str, float] = {
+    # temp_low YES win rate = 32% across 34 resolved trades; 0.40 adds margin of safety.
+    "temp_low": 0.40,
+}
+_priors_raw = os.environ.get("KELLY_METRIC_PRIORS", "")
 try:
-    KELLY_METRIC_PRIORS: dict[str, float] = json.loads(_priors_raw)
+    _priors_override: dict[str, float] = json.loads(_priors_raw) if _priors_raw else {}
 except json.JSONDecodeError:
     logging.warning("KELLY_METRIC_PRIORS is not valid JSON — using defaults.")
-    KELLY_METRIC_PRIORS = {}
+    _priors_override = {}
+KELLY_METRIC_PRIORS: dict[str, float] = {**_KELLY_METRIC_PRIORS_DEFAULT, **_priors_override}
 
 # Auto-calibrated source-level priors (source → blended P(win)).
 # Populated at runtime by calling refresh_calibrated_priors() on TradeExecutor.
@@ -726,10 +769,17 @@ def _implied_p_yes(opp: NumericOpportunity) -> float | None:
                 1.0,
             )
             sigma = scale / 2.0
-        p_in_range = (
-            _normal_cdf((opp.strike_hi - opp.data_value) / sigma)
-            - _normal_cdf((opp.strike_lo - opp.data_value) / sigma)
-        )
+        if getattr(opp, "peak_past", False):
+            # After 4:30 PM local the daily max is locked — temperature cannot
+            # rise above strike_hi.  Drop the upper tail and use a one-sided
+            # CDF: only lower-boundary risk (observed drifting below strike_lo
+            # before official CLI reading) remains.
+            p_in_range = 1.0 - _normal_cdf((opp.strike_lo - opp.data_value) / sigma)
+        else:
+            p_in_range = (
+                _normal_cdf((opp.strike_hi - opp.data_value) / sigma)
+                - _normal_cdf((opp.strike_lo - opp.data_value) / sigma)
+            )
         return max(0.0, min(1.0, p_in_range))
 
     # ------------------------------------------------------------------
@@ -1088,7 +1138,7 @@ class TradeExecutor:
             hard_cap=TRADE_MAX_CONTRACTS,
         )
         if SCORE_WEIGHTED_SIZING and TRADE_MIN_SCORE < 1.0 and count > 0:
-            score_factor = 0.25 + 0.75 * (score - TRADE_MIN_SCORE) / (1.0 - TRADE_MIN_SCORE)
+            score_factor = SCORE_WEIGHT_MIN_FACTOR + (1.0 - SCORE_WEIGHT_MIN_FACTOR) * (score - TRADE_MIN_SCORE) / (1.0 - TRADE_MIN_SCORE)
             count = max(1, math.floor(count * score_factor))
         if count < 1:
             self.stats.filtered_kelly += 1
@@ -1392,7 +1442,9 @@ class TradeExecutor:
         # NO signals where the observed temperature is well below the strike.
         if opp.source == "noaa_observed":
             if opp.implied_outcome == "YES":
-                p = max(p, NOAA_OBSERVED_P)
+                # Use the lower YES-specific floor — empirical win rate is 32%,
+                # far below the 80% NO-signal certainty level.
+                p = max(p, NOAA_OBSERVED_YES_P)
             else:
                 p = min(p, 1.0 - NOAA_OBSERVED_P)
         # FedWatch: use CME-implied meeting probability as p_estimate for Fed funds markets.
@@ -1469,7 +1521,7 @@ class TradeExecutor:
             # NOTE: only apply when Kelly already approved (count > 0).  If Kelly
             # returned 0 (no edge — e.g. cost_cents >= 100), max(1, ...) must not
             # override that veto — it would allow 100¢-cost contracts with zero EV.
-            score_factor = 0.25 + 0.75 * (score - TRADE_MIN_SCORE) / (1.0 - TRADE_MIN_SCORE)
+            score_factor = SCORE_WEIGHT_MIN_FACTOR + (1.0 - SCORE_WEIGHT_MIN_FACTOR) * (score - TRADE_MIN_SCORE) / (1.0 - TRADE_MIN_SCORE)
             count = max(1, math.floor(count * score_factor))
             logging.debug(
                 "Score-weighted sizing: score=%.2f factor=%.2f → %d contract(s): %s",
@@ -1529,7 +1581,38 @@ class TradeExecutor:
                         )
                         self.stats.filtered_ticker_cool += 1
                         return
-                    # else: fall through — allow the complementary same-direction trade
+
+                    # Add-on path: exact same ticker already has an open position.
+                    # Apply a time gap and contract cap so the bot can't spam one
+                    # add-on per poll cycle (which would hit the underlying cap in
+                    # 3 minutes).  Kelly's own math handles price conditioning:
+                    # if the market moved strongly against us, cost_cents rises and
+                    # Kelly recommends fewer (or zero) new contracts automatically.
+                    _exact_contracts = self._open_contracts_on_ticker(opp.market_ticker, side)
+                    if _exact_contracts > 0:
+                        if ADDON_MAX_TOTAL_CONTRACTS > 0 and _exact_contracts >= ADDON_MAX_TOTAL_CONTRACTS:
+                            logging.info(
+                                "Trade skip (addon contract cap %d/%d on %s %s)",
+                                _exact_contracts, ADDON_MAX_TOTAL_CONTRACTS,
+                                opp.market_ticker, side.upper(),
+                            )
+                            self.stats.filtered_ticker_cool += 1
+                            return
+                        if ADDON_MIN_GAP_MINUTES > 0:
+                            age_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
+                            if age_minutes < ADDON_MIN_GAP_MINUTES:
+                                logging.info(
+                                    "Trade skip (addon gap: %.0f min remaining, %d contracts open on %s %s)",
+                                    ADDON_MIN_GAP_MINUTES - age_minutes,
+                                    _exact_contracts, opp.market_ticker, side.upper(),
+                                )
+                                self.stats.filtered_ticker_cool += 1
+                                return
+                        logging.info(
+                            "Add-on: %s %s — %d contracts already open, signal still strong (score=%.2f)",
+                            opp.market_ticker, side.upper(), _exact_contracts, score,
+                        )
+                    # else: first trade on this exact ticker — fall through normally
                 else:
                     age_minutes = (datetime.now(timezone.utc) - last_time).total_seconds() / 60
                     # Three-tier cooldown: open position → full; exited same side → short;
@@ -1615,18 +1698,19 @@ class TradeExecutor:
             return
 
         if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            _exp_cap = self._effective_exposure_cap()
             current_exposure = self._total_open_exposure_cents()
             this_trade_cost  = count * cost_cents
-            if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
-                deficit = (current_exposure + this_trade_cost) - MAX_TOTAL_EXPOSURE_CENTS
+            if current_exposure + this_trade_cost > _exp_cap:
+                deficit = (current_exposure + this_trade_cost) - _exp_cap
                 freed = await self._recycle_capital(session, deficit)
                 current_exposure = self._total_open_exposure_cents()
-                if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                if current_exposure + this_trade_cost > _exp_cap:
                     logging.info(
                         "Trade skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
                         " recycled %d¢ but still insufficient): %s",
                         current_exposure, this_trade_cost,
-                        MAX_TOTAL_EXPOSURE_CENTS, freed, opp.market_ticker,
+                        _exp_cap, freed, opp.market_ticker,
                     )
                     self.stats.filtered_exposure += 1
                     return
@@ -1656,6 +1740,7 @@ class TradeExecutor:
             kelly_fraction=pos_kelly,
             signal_p_yes=implied_p,  # raw CDF model output, before noaa floor / fedwatch override
             corroborating_sources=opp.corroborating_sources or None,
+            peak_past=getattr(opp, "peak_past", False),
         )
 
     async def maybe_trade_poly_opportunity(
@@ -2282,6 +2367,10 @@ class TradeExecutor:
             session:  aiohttp session.
             signal:   BandArbSignal from find_band_arbs().
         """
+        if signal.side == "yes":
+            await self._maybe_trade_band_arb_yes(session, signal)
+            return
+
         logging.info(
             "BandArb: %s  obs=%.1f°F > ceil=%.1f°F  NO_ask=%d¢  (%s)",
             signal.ticker, signal.observed_max, signal.band_ceil,
@@ -2290,6 +2379,39 @@ class TradeExecutor:
 
         # No ticker cooldown for band_arb: each signal is a distinct market that
         # the temperature has physically passed through — not a speculative re-entry.
+        # However, band_arb signals fire every poll cycle while the condition holds,
+        # so we apply add-on guards to prevent opening a new position every 60s.
+        _band_existing_contracts = self._open_contracts_on_ticker(signal.ticker, "no")
+        if _band_existing_contracts > 0:
+            if ADDON_MAX_TOTAL_CONTRACTS > 0 and _band_existing_contracts >= ADDON_MAX_TOTAL_CONTRACTS:
+                logging.info(
+                    "BandArb skip (addon contract cap %d/%d on %s NO)",
+                    _band_existing_contracts, ADDON_MAX_TOTAL_CONTRACTS, signal.ticker,
+                )
+                return
+            if ADDON_MIN_GAP_MINUTES > 0:
+                _last_band_row = self._conn.execute(
+                    "SELECT MAX(logged_at) FROM trades"
+                    " WHERE ticker = ? AND side = 'no' AND exited_at IS NULL AND outcome IS NULL",
+                    (signal.ticker,),
+                ).fetchone()
+                if _last_band_row and _last_band_row[0]:
+                    try:
+                        _last_band_ts = datetime.fromisoformat(_last_band_row[0].replace("Z", "+00:00"))
+                        _band_age_min = (datetime.now(timezone.utc) - _last_band_ts).total_seconds() / 60
+                        if _band_age_min < ADDON_MIN_GAP_MINUTES:
+                            logging.info(
+                                "BandArb skip (addon gap: %.0f min remaining, %d contracts open on %s NO)",
+                                ADDON_MIN_GAP_MINUTES - _band_age_min,
+                                _band_existing_contracts, signal.ticker,
+                            )
+                            return
+                    except ValueError:
+                        pass
+            logging.info(
+                "BandArb add-on: %s NO — %d contracts already open, condition still holds",
+                signal.ticker, _band_existing_contracts,
+            )
 
         # Circuit breaker
         if self._is_category_tripped(signal.ticker):
@@ -2326,19 +2448,20 @@ class TradeExecutor:
             return
 
         if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            _exp_cap = self._effective_exposure_cap()
             cost_cents = signal.no_ask
             current_exposure = self._total_open_exposure_cents()
             this_trade_cost  = count * cost_cents
-            if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
-                deficit = (current_exposure + this_trade_cost) - MAX_TOTAL_EXPOSURE_CENTS
+            if current_exposure + this_trade_cost > _exp_cap:
+                deficit = (current_exposure + this_trade_cost) - _exp_cap
                 freed = await self._recycle_capital(session, deficit)
                 current_exposure = self._total_open_exposure_cents()
-                if current_exposure + this_trade_cost > MAX_TOTAL_EXPOSURE_CENTS:
+                if current_exposure + this_trade_cost > _exp_cap:
                     logging.info(
                         "BandArb skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
                         " recycled %d¢ but still insufficient): %s",
                         current_exposure, this_trade_cost,
-                        MAX_TOTAL_EXPOSURE_CENTS, freed, signal.ticker,
+                        _exp_cap, freed, signal.ticker,
                     )
                     self.stats.filtered_exposure += 1
                     return
@@ -2360,6 +2483,263 @@ class TradeExecutor:
             p_estimate=p_win,
             source="band_arb",
             kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
+        )
+
+    async def _maybe_trade_band_arb_yes(
+        self,
+        session: aiohttp.ClientSession,
+        signal: "BandArbSignal",
+    ) -> None:
+        """Execute or log a band-arb YES trade.
+
+        Two tiers:
+          Pre-lock  (is_locked=False): dynamic p_win based on clearance from
+                    band boundaries and time remaining until close.  Normal
+                    Kelly sizing with profit-take enabled.
+          Locked    (is_locked=True):  post-4:30 PM local — daily high is
+                    confirmed inside the band.  Flat p_win=BAND_ARB_YES_LOCKED_P,
+                    LOCKED_OBS sizing (aggressive), hold to settlement.
+        """
+        # Add-on guard — same pattern as band_arb NO
+        _yes_existing = self._open_contracts_on_ticker(signal.ticker, "yes")
+        if _yes_existing > 0:
+            if ADDON_MAX_TOTAL_CONTRACTS > 0 and _yes_existing >= ADDON_MAX_TOTAL_CONTRACTS:
+                logging.info(
+                    "BandArb YES skip (addon contract cap %d/%d on %s YES)",
+                    _yes_existing, ADDON_MAX_TOTAL_CONTRACTS, signal.ticker,
+                )
+                return
+            if ADDON_MIN_GAP_MINUTES > 0:
+                _last_yes_row = self._conn.execute(
+                    "SELECT MAX(logged_at) FROM trades"
+                    " WHERE ticker = ? AND side = 'yes'"
+                    " AND exited_at IS NULL AND outcome IS NULL",
+                    (signal.ticker,),
+                ).fetchone()
+                if _last_yes_row and _last_yes_row[0]:
+                    try:
+                        _last_yes_ts = datetime.fromisoformat(
+                            _last_yes_row[0].replace("Z", "+00:00")
+                        )
+                        _yes_age_min = (
+                            datetime.now(timezone.utc) - _last_yes_ts
+                        ).total_seconds() / 60
+                        if _yes_age_min < ADDON_MIN_GAP_MINUTES:
+                            logging.info(
+                                "BandArb YES skip (addon gap: %.0f min remaining,"
+                                " %d contracts open on %s YES)",
+                                ADDON_MIN_GAP_MINUTES - _yes_age_min,
+                                _yes_existing, signal.ticker,
+                            )
+                            return
+                    except ValueError:
+                        pass
+            logging.info(
+                "BandArb YES add-on: %s YES — %d contracts open, condition still holds",
+                signal.ticker, _yes_existing,
+            )
+
+        # Circuit breaker
+        if self._is_category_tripped(signal.ticker):
+            logging.info(
+                "BandArb YES skip (circuit breaker active for category %s): %s",
+                _ticker_category(signal.ticker), signal.ticker,
+            )
+            return
+
+        # Compute p_win and sizing parameters
+        from .strike_arb import BAND_ARB_YES_MAX_HOURS_PRELOCK as _YES_MAX_HTC
+        if signal.is_locked:
+            p_win      = BAND_ARB_YES_LOCKED_P
+            kelly_frac = LOCKED_OBS_KELLY_FRACTION
+            max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
+            hard_cap   = LOCKED_OBS_MAX_CONTRACTS
+        else:
+            min_clearance = min(
+                signal.observed_max - signal.strike_lo,
+                signal.band_ceil - signal.observed_max,
+            )
+            clearance_factor = min(0.20, min_clearance / 5.0)
+            _htc = signal.hours_to_close
+            _max_htc = max(_YES_MAX_HTC, 0.001)
+            time_factor = 0.10 * (1.0 - _htc / _max_htc)
+            p_win = min(0.92, BAND_ARB_YES_BASE_P + clearance_factor + time_factor)
+            kelly_frac = KELLY_FRACTION
+            max_cents  = max(1, int(MAX_POSITION_CENTS * _dd_factor))
+            hard_cap   = TRADE_MAX_CONTRACTS
+
+        count = kelly_contracts(
+            win_prob=p_win,
+            cost_cents=signal.yes_ask,
+            max_cents=max_cents,
+            kelly_fraction=kelly_frac,
+            hard_cap=hard_cap,
+        )
+        if count == 0:
+            logging.info(
+                "BandArb YES skip (Kelly=0 at p=%.2f yes_ask=%d¢): %s",
+                p_win, signal.yes_ask, signal.ticker,
+            )
+            return
+
+        if not BAND_ARB_EXECUTION_ENABLED:
+            logging.info(
+                "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f",
+                "locked" if signal.is_locked else "pre-lock",
+                signal.ticker, count, signal.yes_ask, p_win,
+            )
+            return
+
+        if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            _exp_cap = self._effective_exposure_cap()
+            _current_exposure = self._total_open_exposure_cents()
+            _this_trade_cost  = count * signal.yes_ask
+            if _current_exposure + _this_trade_cost > _exp_cap:
+                self.stats.filtered_exposure += 1
+                logging.info(
+                    "BandArb YES skip (exposure cap: open=%d¢ + this=%d¢ > %d¢): %s",
+                    _current_exposure, _this_trade_cost, _exp_cap, signal.ticker,
+                )
+                return
+
+        self.stats.trades_attempted += 1
+        score = 1.0 if signal.is_locked else round(0.70 + p_win * 0.15, 2)
+        logging.info(
+            "BandArb YES: %s  obs=%.1f°F in [%.1f–%.1f]  YES×%d @ %d¢  p=%.2f  (%s)",
+            signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
+            count, signal.yes_ask, p_win,
+            "locked" if signal.is_locked else "pre-lock",
+        )
+        await self._execute(
+            session=session,
+            ticker=signal.ticker,
+            side="yes",
+            count=count,
+            limit_price=signal.yes_ask,
+            opportunity_kind="band_arb",
+            score=score,
+            p_estimate=p_win,
+            source="band_arb",
+            kelly_fraction=kelly_frac,
+            yes_bid=signal.yes_bid,
+            yes_ask=signal.yes_ask,
+            peak_past=signal.is_locked,
+        )
+
+    async def maybe_trade_forecast_no(
+        self,
+        session: aiohttp.ClientSession,
+        signal: "ForecastNoSignal",
+    ) -> None:
+        """Evaluate and optionally execute a forecast-driven early NO trade.
+
+        Fires before METAR confirmation when multiple forecast sources agree the
+        temperature will be well outside a band.  Backtest shows these bands
+        start the trading day at ~55-65¢ NO ask, reaching 95-100¢ within ~5h —
+        vs. band_arb which enters at 85-96¢ after METAR confirms.
+
+        Uses standard (non-LOCKED_OBS) Kelly sizing with FORECAST_MAX_P cap,
+        since this is a probabilistic signal, not a near-certain observation.
+
+        Guards:
+          1. No existing open position on this ticker
+          2. Circuit breaker clear
+          3. Kelly recommends >= 1 contract
+          4. FORECAST_NO_ENABLED is True (else detect-only)
+        """
+        logging.info(
+            "ForecastNO: %s  NO_ask=%d¢  edge=%.1f°F  sources=%s  p=%.2f",
+            signal.ticker, signal.no_ask, signal.min_edge_f,
+            signal.sources, signal.p_estimate,
+        )
+
+        # Hard cap on concurrent open forecast_no positions.
+        # The generic _is_category_tripped() circuit breaker only trips on
+        # consecutive Kalshi-settled losses, which means early-exited trades
+        # (stop-loss / profit-take) — whose `outcome` column remains NULL —
+        # don't register as losses.  The open-count fallback inside
+        # _is_category_tripped() is therefore never reached once there's any
+        # resolved history.  This direct DB query fixes the gap: it counts
+        # forecast_no trades that are still live (not yet exited AND not
+        # officially settled) and blocks further entries once the cap is hit.
+        if CIRCUIT_BREAKER_MAX_OPEN > 0:
+            _fno_open_count = self._conn.execute(
+                """SELECT COUNT(*) FROM trades
+                   WHERE opportunity_kind = 'forecast_no'
+                     AND exited_at IS NULL
+                     AND outcome IS NULL""",
+            ).fetchone()[0]
+            if _fno_open_count >= CIRCUIT_BREAKER_MAX_OPEN:
+                logging.info(
+                    "ForecastNO skip (open-cap %d/%d reached): %s",
+                    _fno_open_count, CIRCUIT_BREAKER_MAX_OPEN, signal.ticker,
+                )
+                return
+
+        # Skip if already in position (no add-ons for forecast signals)
+        _existing = self._open_contracts_on_ticker(signal.ticker, "no")
+        if _existing > 0:
+            logging.info(
+                "ForecastNO skip: %s — %d NO contract(s) already open",
+                signal.ticker, _existing,
+            )
+            return
+
+        if self._is_category_tripped(signal.ticker):
+            logging.info(
+                "ForecastNO skip (circuit breaker active): %s", signal.ticker,
+            )
+            return
+
+        count = kelly_contracts(
+            win_prob=signal.p_estimate,
+            cost_cents=signal.no_ask,
+            max_cents=max(1, int(MAX_POSITION_CENTS * _dd_factor)),
+            kelly_fraction=KELLY_FRACTION,
+            hard_cap=TRADE_MAX_CONTRACTS,
+        )
+        if count == 0:
+            logging.info(
+                "ForecastNO skip (Kelly=0 at p=%.2f no_ask=%d¢): %s",
+                signal.p_estimate, signal.no_ask, signal.ticker,
+            )
+            return
+
+        if not FORECAST_NO_ENABLED:
+            logging.info(
+                "ForecastNO DETECT-ONLY (FORECAST_NO_ENABLED=false): "
+                "%s  NO×%d @ %d¢  edge=%.1f°F",
+                signal.ticker, count, signal.no_ask, signal.min_edge_f,
+            )
+            return
+
+        if MAX_TOTAL_EXPOSURE_CENTS > 0:
+            _exp_cap = self._effective_exposure_cap()
+            current_exposure = self._total_open_exposure_cents()
+            this_trade_cost  = count * signal.no_ask
+            if current_exposure + this_trade_cost > _exp_cap:
+                deficit = (current_exposure + this_trade_cost) - _exp_cap
+                freed = await self._recycle_capital(session, deficit)
+                current_exposure = self._total_open_exposure_cents()
+                if current_exposure + this_trade_cost > _exp_cap:
+                    logging.info(
+                        "ForecastNO skip (exposure cap): %s", signal.ticker,
+                    )
+                    self.stats.filtered_exposure += 1
+                    return
+
+        self.stats.trades_attempted += 1
+        await self._execute(
+            session=session,
+            ticker=signal.ticker,
+            side="no",
+            count=count,
+            limit_price=signal.yes_bid,
+            opportunity_kind="forecast_no",
+            score=signal.score,
+            p_estimate=signal.p_estimate,
+            source="forecast_no",
+            kelly_fraction=KELLY_FRACTION,
         )
 
     # -----------------------------------------------------------------------
@@ -2546,6 +2926,7 @@ class TradeExecutor:
             FROM trades
             WHERE ticker LIKE ?
               AND (exit_pnl_cents IS NOT NULL OR outcome IS NOT NULL)
+              AND outcome IS NOT 'void'
               {after_clause}
             ORDER BY logged_at DESC
             LIMIT ?
@@ -2599,6 +2980,19 @@ class TradeExecutor:
             (underlying_prefix + "%",),
         ).fetchone()
         return row[0] if row else 0
+
+    def _open_contracts_on_ticker(self, ticker: str, side: str) -> int:
+        """Sum of open contracts on the exact ticker and side (not exited, not settled).
+
+        Used for add-on sizing control: limits total exposure on a single market
+        across the original entry and all subsequent add-on trades.
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM trades"
+            " WHERE ticker = ? AND side = ? AND exited_at IS NULL AND outcome IS NULL",
+            (ticker, side),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def _last_trade_context(
         self, ticker: str, cross_strike: bool = True
@@ -2711,6 +3105,22 @@ class TradeExecutor:
                     trade_cost, needed_cents,
                 )
         return freed
+
+    def _effective_exposure_cap(self) -> int:
+        """Return the effective total exposure cap in cents.
+
+        When a DryRunLedger is wired, caps at the lesser of MAX_TOTAL_EXPOSURE_CENTS
+        and the ledger's available cash (starting capital + realized P&L − open
+        exposure).  This prevents the bot from committing more than it actually has.
+        In live mode (no ledger), returns MAX_TOTAL_EXPOSURE_CENTS unchanged —
+        Kalshi's API will reject orders if the account balance is insufficient.
+        """
+        if MAX_TOTAL_EXPOSURE_CENTS <= 0:
+            return MAX_TOTAL_EXPOSURE_CENTS
+        if self._ledger is not None and hasattr(self._ledger, "available_cash_cents"):
+            available = self._ledger.available_cash_cents()
+            return min(MAX_TOTAL_EXPOSURE_CENTS, max(0, available))
+        return MAX_TOTAL_EXPOSURE_CENTS
 
     def _total_open_exposure_cents(self) -> int:
         """Sum of cost basis (count × cost_per_contract) across all open positions.
@@ -2910,6 +3320,7 @@ class TradeExecutor:
         kelly_fraction: float | None = None,
         signal_p_yes: float | None = None,
         corroborating_sources: list[str] | None = None,
+        peak_past: bool = False,
     ) -> None:
         """Place the order (or log it in dry-run mode) and persist to SQLite."""
         mode = "dry_run" if self._dry_run else "live"
@@ -2950,15 +3361,15 @@ class TradeExecutor:
                 opportunity_kind, score, kelly_fraction, p_estimate,
                 status, order_id, error_msg, source, spread_id,
                 market_p_entry, yes_bid_entry, yes_ask_entry, signal_p_yes,
-                corroborating_sources
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                corroborating_sources, peak_past
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 logged_at, mode, ticker, side, count, limit_price,
                 opportunity_kind, score, _logged_kelly, p_estimate,
                 status, order_id, error_msg, source or None, spread_id,
                 market_p_entry, yes_bid, yes_ask, signal_p_yes,
-                corroboration_str,
+                corroboration_str, 1 if peak_past else 0,
             ),
         )
 
