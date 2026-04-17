@@ -43,8 +43,10 @@ Output file
 
 Price snapshot table
 --------------------
-Every poll cycle, a row is written to ``price_snapshots`` for each open
-(unsettled, unexited) trade.  Schema:
+Every poll cycle, a row is written to ``price_snapshots`` for each unsettled
+trade — including positions already exited via stop-loss or profit-take.
+Post-exit rows have ``post_exit=1`` and represent counterfactual price history
+(what the market did after we closed).  Schema:
 
   trade_id         → foreign key into ``trades``
   snapshot_at      → UTC ISO-8601 timestamp
@@ -96,6 +98,7 @@ from .trade_executor import (
     DRAWDOWN_MIN_FACTOR,
     DRAWDOWN_ENABLED,
     DRAWDOWN_LOOKBACK_TRADES,
+    DRAWDOWN_IGNORE_BEFORE_ID,
 )
 
 
@@ -118,6 +121,10 @@ class _Trade:
         "current_mid", "yes_bid", "yes_ask", "close_time",
         # market state at entry (for calibration)
         "market_p_entry", "yes_bid_entry", "yes_ask_entry",
+        # signal lock flag: True if trade entered after daily peak confirmed
+        # (peak_past=True on NumericOpportunity).  Used by exit_manager to
+        # suppress stop-loss on post-peak KXHIGH:no positions near close.
+        "peak_past",
     )
 
     def __init__(
@@ -141,6 +148,7 @@ class _Trade:
         market_p_entry:   float | None = None,
         yes_bid_entry:    int   | None = None,
         yes_ask_entry:    int   | None = None,
+        peak_past:        bool  | None = None,
     ) -> None:
         self.trade_id       = trade_id
         self.logged_at      = logged_at
@@ -157,6 +165,7 @@ class _Trade:
         self.market_p_entry   = market_p_entry
         self.yes_bid_entry    = yes_bid_entry
         self.yes_ask_entry    = yes_ask_entry
+        self.peak_past        = bool(peak_past)
 
         # Exit state — locked-in P&L from early exit.
         self.exited      = exited_at is not None
@@ -249,7 +258,8 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
     exit_price       INTEGER,
     unrealized_cents REAL,
     pct_gain         REAL,
-    days_to_close    REAL
+    days_to_close    REAL,
+    post_exit        INTEGER NOT NULL DEFAULT 0   -- 1 = trade was already exited; counterfactual row
 )
 """
 
@@ -262,6 +272,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_trade_time
 _SNAPSHOT_MIGRATIONS: list[tuple[str, str]] = [
     ("pct_gain",      "REAL"),
     ("days_to_close", "REAL"),
+    ("post_exit",     "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -353,7 +364,12 @@ class DryRunLedger:
         """
         trades = self._load_trades()
         if not trades:
-            logging.warning("DryRunLedger: _load_trades returned 0 trades — skipping overview write.")
+            # No trades yet — still write a minimal overview so the file exists.
+            overview = self._build_overview([])
+            self._overview_path.write_text(overview + "\n", encoding="utf-8")
+            logging.info(
+                "DryRunLedger: no trades yet — wrote empty overview to %s", self._overview_path
+            )
             return
 
         try:
@@ -409,6 +425,39 @@ class DryRunLedger:
         ]
         candidates.sort(key=lambda t: t.current_mid, reverse=True)  # type: ignore[arg-type]
         return candidates
+
+    def available_cash_cents(self) -> int:
+        """Return available paper cash = starting capital + realized P&L − open exposure.
+
+        Computed purely from the DB (no market prices needed) so it can be
+        called cheaply before every trade.  Unrealized P&L is excluded — only
+        settled/exited results count as real cash.
+        """
+        row = self._conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(exit_pnl_cents), 0) AS realized_pnl
+            FROM trades
+            WHERE status NOT IN ('rejected', 'error')
+              AND exited_at IS NOT NULL
+            """
+        ).fetchone()
+        realized_cents = int(row[0]) if row else 0
+
+        row2 = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(
+                count * CASE WHEN side = 'yes' THEN limit_price
+                             ELSE 100 - limit_price END
+            ), 0)
+            FROM trades
+            WHERE exited_at IS NULL
+              AND status NOT IN ('rejected', 'error')
+            """
+        ).fetchone()
+        open_exposure = int(row2[0]) if row2 else 0
+
+        return self._starting_capital + realized_cents - open_exposure
 
     def close(self) -> None:
         self._conn.close()
@@ -522,6 +571,9 @@ class DryRunLedger:
             limit_clause = (
                 f"LIMIT {DRAWDOWN_LOOKBACK_TRADES}" if DRAWDOWN_LOOKBACK_TRADES > 0 else ""
             )
+            id_clause = (
+                f"AND id >= {DRAWDOWN_IGNORE_BEFORE_ID}" if DRAWDOWN_IGNORE_BEFORE_ID > 0 else ""
+            )
             rows = self._conn.execute(
                 f"""
                 SELECT exit_pnl_cents, outcome, side, count, limit_price
@@ -529,6 +581,7 @@ class DryRunLedger:
                 WHERE mode = 'dry_run'
                   AND (outcome IN ('won', 'lost') OR exited_at IS NOT NULL)
                   AND outcome IS NOT 'void'
+                  {id_clause}
                 ORDER BY logged_at DESC
                 {limit_clause}
                 """
@@ -648,6 +701,29 @@ class DryRunLedger:
         except Exception:
             return set()
 
+    def forecast_no_exited_today(self) -> set[str]:
+        """Return tickers where a forecast_no position exited today (any exit reason).
+
+        Used to block same-day re-entry after a forecast_no profit-take. Unlike
+        recently_exited_tickers() (which only blocks stop-loss exits), this blocks
+        ALL exits for forecast_no trades on the current calendar day — profit-takes
+        included — because the opportunity has already been captured and re-entering
+        at a higher price with less remaining upside degrades expected value.
+        """
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ticker FROM trades
+                WHERE mode = 'dry_run'
+                  AND opportunity_kind = 'forecast_no'
+                  AND exited_at IS NOT NULL
+                  AND exited_at >= datetime('now', '-30 hours')
+                """
+            ).fetchall()
+            return {row[0] for row in rows}
+        except Exception:
+            return set()
+
     def _load_trades(self) -> list[_Trade]:
         try:
             rows = self._conn.execute(
@@ -655,7 +731,8 @@ class DryRunLedger:
                 SELECT id, logged_at, ticker, side, count, limit_price,
                        score, kelly_fraction, p_estimate, outcome,
                        exited_at, exit_pnl_cents, exit_reason, source, note,
-                       opportunity_kind, market_p_entry, yes_bid_entry, yes_ask_entry
+                       opportunity_kind, market_p_entry, yes_bid_entry, yes_ask_entry,
+                       peak_past
                 FROM trades
                 WHERE mode = 'dry_run'
                 ORDER BY logged_at ASC
@@ -686,6 +763,7 @@ class DryRunLedger:
                 market_p_entry   = row[16],
                 yes_bid_entry    = row[17],
                 yes_ask_entry    = row[18],
+                peak_past        = bool(row[19]) if row[19] is not None else False,
             )
             for row in rows
         ]
@@ -709,10 +787,11 @@ class DryRunLedger:
         """Fetch live market state for every open, unexited ticker."""
         import asyncio
 
-        # Only fetch tickers still needing live data: not settled, not exited.
+        # Fetch live data for: (a) unsettled open positions, and (b) exited-but-unsettled
+        # positions so we can continue logging counterfactual price snapshots after exit.
         active_tickers = list({
             t.ticker for t in trades
-            if not t.settled and not t.exited
+            if not t.settled
         })
 
         # Serial with 0.5s gap — avoids Kalshi 429s on large portfolios.
@@ -735,7 +814,7 @@ class DryRunLedger:
                 market_by_ticker[ticker] = result
 
         for trade in trades:
-            if trade.settled or trade.exited:
+            if trade.settled:
                 continue
             mkt = market_by_ticker.get(trade.ticker)
             if mkt is None:
@@ -768,23 +847,27 @@ class DryRunLedger:
                     trade.close_time = ct
 
     def _write_snapshots(self, trades: list[_Trade]) -> None:
-        """Persist a price snapshot row for every open, unexited position.
+        """Persist a price snapshot row for every unsettled position.
 
         Columns written per row:
           - trade_id, snapshot_at, yes_bid, yes_ask, exit_price
           - unrealized_cents  — signed P&L at conservative exit price
           - pct_gain          — unrealized / total_cost  (ratio, e.g. 0.5 = +50%)
           - days_to_close     — fractional days until market close (None if unavailable)
+          - post_exit         — 1 if the trade was already exited (counterfactual rows
+                                that show what the price did AFTER our stop-loss or
+                                profit-take, enabling exit-parameter backtesting)
 
-        Exited and settled positions are excluded — their price history is
-        no longer actionable.
+        Exited-but-unsettled positions are included with post_exit=1 so the
+        full price trajectory is available for backtesting.  Only fully
+        settled positions are excluded.
         """
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         rows = []
 
         for t in trades:
-            if t.settled or t.exited or t.current_mid is None:
+            if t.settled or t.current_mid is None:
                 continue
 
             exit_price = int(t.current_mid)
@@ -807,6 +890,7 @@ class DryRunLedger:
                 t.yes_bid, t.yes_ask,
                 exit_price, unrealized,
                 pct_gain, days_to_close,
+                1 if t.exited else 0,
             ))
 
         if not rows:
@@ -816,12 +900,16 @@ class DryRunLedger:
             """
             INSERT INTO price_snapshots
                 (trade_id, snapshot_at, yes_bid, yes_ask, exit_price,
-                 unrealized_cents, pct_gain, days_to_close)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 unrealized_cents, pct_gain, days_to_close, post_exit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
-        logging.debug("Price snapshots: wrote %d row(s) for open positions.", len(rows))
+        n_post = sum(1 for r in rows if r[-1])
+        logging.debug(
+            "Price snapshots: wrote %d row(s) (%d post-exit counterfactual).",
+            len(rows), n_post,
+        )
 
     def _build_overview(self, trades: list[_Trade]) -> str:
         W = "=" * 68
