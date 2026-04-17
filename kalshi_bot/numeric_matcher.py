@@ -272,7 +272,15 @@ def find_numeric_opportunities(
     Returns:
         List of NumericOpportunity objects, one per matching (data, market) pair.
     """
-    parsed_markets = parse_all_markets(markets)
+    # Drop markets with no real order book (yes_bid=0 AND yes_ask≤1).
+    # These are expired or halted markets that the Kalshi API still returns as
+    # "open" but where no fills are possible.  Filtering here prevents hundreds
+    # of spurious opportunities per cycle from near-expiry markets.
+    live_markets = [
+        m for m in markets
+        if not (m.get("yes_bid", 0) == 0 and m.get("yes_ask", 100) <= 1)
+    ]
+    parsed_markets = parse_all_markets(live_markets)
 
     # Index parsed markets by metric for fast lookup
     by_metric: dict[str, list[ParsedMarket]] = {}
@@ -281,11 +289,11 @@ def find_numeric_opportunities(
 
     # Raw market dict lookup by ticker for price and close-time retrieval
     price_by_ticker: dict[str, Any] = {
-        m.get("ticker", ""): m.get("last_price", "N/A") for m in markets
+        m.get("ticker", ""): m.get("last_price", "N/A") for m in live_markets
     }
     now_utc = datetime.now(timezone.utc)
     close_time_by_ticker: dict[str, float | None] = {}
-    for m in markets:
+    for m in live_markets:
         ticker = m.get("ticker", "")
         ct_str = m.get("close_time") or m.get("expiration_time")
         if ct_str:
@@ -323,8 +331,13 @@ def find_numeric_opportunities(
             # carry today's city-local reading; forecast sources (weatherapi,
             # open_meteo, noaa_day2…) set as_of to noon on the forecast date.
             # Converting as_of → city local date handles both cases uniformly.
-            if dp.metric.startswith(("temp_high", "temp_low")):
-                _city_info = _TEMP_HIGH_CITIES.get(dp.metric.replace("temp_low_", "temp_high_"))
+            if dp.metric.startswith(("temp_high", "temp_low", "precip_total", "precip_prob")):
+                _city_info = _TEMP_HIGH_CITIES.get(
+                    dp.metric
+                    .replace("temp_low_", "temp_high_")
+                    .replace("precip_total_", "temp_high_")
+                    .replace("precip_prob_", "temp_high_")
+                )
                 if _city_info is not None:
                     _city_tz = _city_info[3]
                     try:

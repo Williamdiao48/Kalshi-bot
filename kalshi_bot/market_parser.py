@@ -46,6 +46,8 @@ TICKER_TO_METRIC: dict[str, str] = {
     "KXHIGHTSATX": "temp_high_sat",
     "KXHIGHTHOU":  "temp_high_hou",   # reuses existing metric key
     "KXHIGHTNOLA": "temp_high_msy",
+    # Weather — daily rain (binary: will it rain?)
+    "KXRAINNYC":  "precip_total_ny",   # NYC daily rain — resolves YES if any measurable precip
     # Daily low temperature — KXLOWT* series (launched 2026-04)
     "KXLOWTLAX":  "temp_low_lax",
     "KXLOWTDEN":  "temp_low_den",
@@ -99,7 +101,7 @@ TICKER_TO_METRIC: dict[str, str] = {
     "KXISM":     "ism_manufacturing", # ISM Manufacturing PMI (generic prefix)
     "KXISMMFG":  "ism_manufacturing", # ISM Manufacturing PMI (explicit)
     "KXISMSVC":  "ism_services",     # ISM Services PMI
-    "KXGDP":     "fred_gdp_growth",  # Real GDP growth rate % (BEA advance/revised via FRED)
+    "KXGDP":     "fred_gdp_nowcast",  # Atlanta Fed GDPNow current-quarter estimate (FRED GDPNOW)
     # Interest rates (FRED)
     "KXFED":    "fred_fedfunds",
     "KXFFR":    "fred_fedfunds",
@@ -220,6 +222,13 @@ def parse_market(market: dict[str, Any]) -> ParsedMarket | None:
     if m := _TICKER_B_RE.search(ticker):
         return ParsedMarket(ticker, title, metric, "under", strike=_to_float(m.group(1)))
 
+    # Precipitation binary fallback: "Will it rain/snow in [city]?" with no numeric
+    # strike in the title → treat as "over 0" (any measurable precipitation).
+    # Uses precip_prob_* (forecast probability %) as the signal value.
+    if metric.startswith(("precip_total", "precip_prob")):
+        if re.search(r'\brain\b|\bsnow\b|\bprecipitation\b', title, re.IGNORECASE):
+            return ParsedMarket(ticker, title, metric, "over", strike=0.0)
+
     return ParsedMarket(ticker, title, metric, "unknown")
 
 
@@ -243,6 +252,9 @@ def parse_all_markets(markets: list[dict[str, Any]]) -> list[ParsedMarket]:
 _NUMERIC_PATTERN_PREFIXES: tuple[str, ...] = (
     "KXHIGH",                          # daily high temperature by city
     "KXLOWT",                          # daily low temperature by city
+    "KXRAIN",                          # daily rain markets (ticker prefix TBD — discovered via scan_unknown_series)
+    "KXSNOW",                          # daily snow markets (ticker prefix TBD)
+    "KXPRECIP",                        # alternate precipitation prefix (candidate)
     "KXBTC", "KXETH", "KXSOL", "KXXRP",   # crypto prices (BTC/ETH/SOL/XRP)
     "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",  # crypto prices
     "KXEUR", "KXUSD", "KXGBP", "KXJPY",  # forex

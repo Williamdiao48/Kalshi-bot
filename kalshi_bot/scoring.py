@@ -149,6 +149,13 @@ METRIC_EDGE_SCALES: dict[str, float] = {
     "fred_fedfunds": 0.25,  # 25bp edge in fed funds rate
     "fred_dgs10":    0.25,  # 25bp edge in 10yr Treasury yield
     "fred_dgs2":     0.25,  # 25bp edge in 2yr Treasury yield
+    # Atlanta Fed GDPNow current-quarter estimate (percentage points)
+    # GDPNow RMSE vs BEA advance estimate ≈ 1.2pp → sigma = 3.0/2 = 1.5pp.
+    # scale=3.0 keeps the model appropriately humble: at a 1.5pp edge below
+    # the strike (e.g. GDPNow=0.5% vs T2.0%) z=1.0 → p_yes=15.9%, which
+    # just clears the extreme-disagree guard threshold of 15% and allows
+    # Kelly sizing to run normally.
+    "fred_gdp_nowcast": 3.0,
     # EIA energy prices
     "eia_wti":       3.0,   # $3/bbl edge in WTI crude
     "eia_natgas":    0.20,  # $0.20/MMBtu edge in Henry Hub nat gas
@@ -187,6 +194,8 @@ _SOURCE_SCORES: dict[str, float] = {
     "noaa_day7":         0.50,   # NWS day-7 forecast (MAE ≈ 12–17°F)
     "eia":               0.75,   # official EIA energy spot prices
     "eia_inventory":     0.65,   # EIA weekly inventory change → implied price (trend proxy, ~65% directional accuracy)
+    "yahoo_wti_futures": 0.82,   # real-time CME NYMEX front-month futures (CL=F); 1–3 min delay,
+                                 # single-source (no cross-exchange confirmation vs binance 0.85)
     "metaculus":         0.75,   # calibrated crowd forecasting
     "open_meteo":        0.70,   # Open-Meteo standard forecast (deterministic)
     "yahoo_finance":     0.85,   # official index level, ~1–3 min delay
@@ -430,10 +439,15 @@ def score_numeric_opportunity(
         and opp.strike_hi is not None
     ):
         half_width = (opp.strike_hi - opp.strike_lo) / 2.0
-        clearance = min(
-            opp.data_value - opp.strike_lo,
-            opp.strike_hi - opp.data_value,
-        )
+        if getattr(opp, "peak_past", False):
+            # Upper bound locked after 4:30 PM — only distance above strike_lo
+            # matters; penalising for proximity to strike_hi is incorrect.
+            clearance = opp.data_value - opp.strike_lo
+        else:
+            clearance = min(
+                opp.data_value - opp.strike_lo,
+                opp.strike_hi - opp.data_value,
+            )
         s_edge = max(0.0, min(1.0, clearance / half_width)) if half_width > 0 else 0.0
     else:
         s_edge = _edge_score(opp.metric, opp.edge, opp.implied_outcome)
