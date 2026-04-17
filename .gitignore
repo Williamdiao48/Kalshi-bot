@@ -18,7 +18,13 @@ __pycache__/
 # Logs and runtime output
 bot.log
 dry_run_overview.txt
+dry_run_overview_archive*.txt
 pnl_attribution.txt
+
+# Data exports and backups
+*.csv
+*.db.bak*
+*.db.bak_*
 
 # Trained model weights (large binaries)
 models/
