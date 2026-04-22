@@ -111,6 +111,23 @@ FAST_LOOP_INTERVAL: float = float(os.environ.get("FAST_LOOP_INTERVAL", "10.0"))
 _near_threshold_cities: set[str] = set()
 _last_noaa_obs: dict[str, float] = {}
 _last_noaa_obs_time: float = 0.0  # time.monotonic(); 0 = never populated
+# _last_noaa_day1: NOAA day-1 forecast highs cached from the last full cycle.
+# Passed to find_band_arbs in the fast loop to enable the day-1 forecast veto
+# when NOAA observed data is absent or stale.  Day-1 forecasts change at most
+# once per NWS update cycle (~hourly), so reusing the previous poll's value
+# in the fast loop is safe and avoids an extra API call.
+_last_noaa_day1: dict[str, float] = {}
+# _last_nws_climo: NWS CLI observed daily max/min cached from the last full cycle.
+# Passed to find_band_arbs in the fast loop to enable the nws_climo hard veto.
+# The CLI preliminary report is published once ~5-8 PM local and cached for the
+# rest of the day, so reusing the previous poll's value in the fast loop is safe.
+_last_nws_climo: dict[str, float] = {}
+# _last_hrrr_highs: HRRR forecast highs cached from the last full cycle.
+# Passed to find_band_arbs in the fast loop to enable the HRRR contradiction
+# veto (catches stale METAR carry when HRRR predicts a cold day but the
+# previous day's METAR peak is still in memory at midnight).
+_last_hrrr_highs: dict[str, float] = {}
+_last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
 
 # Maximum age (seconds) of the cached NOAA observed values before the fast loop
 # treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
@@ -380,6 +397,19 @@ NUMERIC_MIN_EDGE: float = float(os.environ.get("NUMERIC_MIN_EDGE", "0"))
 # Recommended starting value: 0.05 (5% of the reference scale per metric).
 # Examples at 0.05: BTC $250, ETH $15, EUR/USD 0.002, CPI 0.025pp, SPX 2.5pts.
 NUMERIC_MIN_EDGE_FRACTION: float = float(os.environ.get("NUMERIC_MIN_EDGE_FRACTION", "0.0"))
+
+# Gate: suppress noaa_observed / metar YES signals on KXLOWT daily-low markets
+# when any forecast model predicts the daily low will be within
+# LOWT_FORECAST_GATE_BUFFER_F degrees of (or below) the strike.
+# The buffer accounts for NWS day-1 MAE ≈ 3–4°F: a forecast of 54°F with a
+# 53°F strike is dangerously close given normal model uncertainty.
+# Set NUMERIC_LOWT_FORECAST_GATE=false to disable (not recommended).
+NUMERIC_LOWT_FORECAST_GATE: bool = os.environ.get(
+    "NUMERIC_LOWT_FORECAST_GATE", "true"
+).lower() not in ("false", "0", "no")
+LOWT_FORECAST_GATE_BUFFER_F: float = float(
+    os.environ.get("LOWT_FORECAST_GATE_BUFFER_F", "3.0")
+)
 
 # Weather-specific signal quality gates (applied after OWM consensus filter).
 #
@@ -1652,7 +1682,42 @@ async def _poll(
     executor: TradeExecutor,
     ledger: DryRunLedger | None,
 ) -> None:
-    """Run one full fetch-match-report cycle."""
+    """Run one complete fetch → match → score → execute → exit cycle.
+
+    This is the core of the bot.  Each call represents one poll cycle
+    (invoked every ``POLL_INTERVAL`` seconds by the outer loop in ``main()``).
+
+    Execution steps:
+      1. ``executor.poll_open_orders`` — confirm fills and cancel stale resting
+         orders so position state is current before any new logic runs.
+      2. ``asyncio.gather`` — all 30+ news sources are fetched concurrently.
+         Each source returns ``list[DataPoint]``; results are merged into a
+         single ``data_points`` list.  Per-source exceptions are caught and
+         logged; a failed source never blocks the cycle.
+      3. Signal generation — four generators scan data_points × open markets:
+         ``find_forecast_nos``, ``find_band_arbs``, ``find_strike_arbs``,
+         ``find_numeric_opportunities``, ``find_poly_opportunities``.
+      4. Scoring — ``score_numeric_opportunity`` / ``score_poly_opportunity``
+         assigns each signal a composite score in [0, 1].  Signals below
+         ``SCORE_THRESHOLD`` are dropped.
+      5. Deduplication — ``opp_log.recently_surfaced_pairs`` returns (ticker,
+         signal_key) pairs seen within the cooldown window; matching signals
+         are suppressed this cycle.
+      6. Trade execution — ``executor.maybe_execute`` runs Kelly sizing, places
+         a limit order (live) or writes a dry-run record, logs to ``opp_log``.
+      7. Exit checks — ``ledger.refresh_and_write`` enriches open positions with
+         live prices and calls ``ExitManager.check_exits``.  Also writes
+         ``dry_run_overview.txt`` and a ``price_snapshots`` row per position.
+
+    Args:
+        session:  Shared ``aiohttp.ClientSession`` for all outbound HTTP.
+        seen:     ``SeenDocuments`` instance for RSS/EDGAR deduplication.
+        opp_log:  ``OpportunityLog`` for cross-cycle signal deduplication and
+                  opportunity audit trail.
+        executor: ``TradeExecutor`` for order placement and trade DB writes.
+        ledger:   ``DryRunLedger`` for P&L tracking and exit management.
+                  ``None`` disables the ledger/exit step (used in testing).
+    """
 
     # ---- confirm fills / cancel stale resting orders (live mode only) ------
     # Runs before any new data is processed so fill state is current before
@@ -1669,7 +1734,7 @@ async def _poll(
         ("rss",          rss.fetch_all_feeds(session)),
         ("nws",          nws_alerts.fetch_alerts(session)),
         ("nws_signals",  nws_alerts.fetch_city_alert_signals(session)),
-        ("hrrr",         hrrr.fetch_hourly_highs(session)),
+        ("hrrr",         hrrr.fetch_hourly_temps(session)),
         ("edgar",        edgar.fetch_filings(session)),
         ("noaa",         noaa.fetch_city_forecasts(session)),
         ("nws_climo",    nws_climo.fetch_city_climo(session)),
@@ -1871,10 +1936,14 @@ async def _poll(
 
     # ---- HRRR hourly highs (quality gate + forecast corroboration source) ---
     hrrr_hourly_highs: dict[str, float] = {}
+    hrrr_hourly_lows:  dict[str, float] = {}
     if isinstance(hrrr_result, Exception):
         logging.warning("HRRR fetch error: %s", hrrr_result)
     elif hrrr_result:
-        hrrr_hourly_highs = hrrr_result  # type: ignore[assignment]
+        hrrr_hourly_highs, hrrr_hourly_lows = hrrr_result  # type: ignore[misc]
+        global _last_hrrr_highs, _last_hrrr_highs_time
+        _last_hrrr_highs = hrrr_hourly_highs
+        _last_hrrr_highs_time = time.monotonic()
 
     # ---- numeric matching (NOAA, OWM, Binance, Frankfurter, BLS, FRED, EIA) -
     # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
@@ -1979,6 +2048,7 @@ async def _poll(
             hrrr.to_data_points(
                 hrrr_hourly_highs,
                 datetime.now(timezone.utc).isoformat(),
+                hourly_lows=hrrr_hourly_lows or None,
             )
         )
 
@@ -2199,14 +2269,18 @@ async def _poll(
                 if _dp.source == "metar" or _dp.metric not in _obs_value:
                     _obs_value[_dp.metric] = _dp.value
 
-        # NWS "Tonight" (day1) forecast low per temp_low metric.
-        # source="noaa" carries the day-1 overnight low from fetch_city_forecasts().
-        # Used by _filter_weather_opportunities to suppress noaa_observed YES signals
-        # when tonight's forecast will push the daily minimum below the strike.
+        # Forecast low per temp_low metric from all model sources.
+        # Keeps the most conservative (lowest) value across noaa, hrrr,
+        # nws_hourly, and open_meteo so the KXLOWT contradiction gate has
+        # the broadest possible coverage.  Used by _filter_weather_opportunities
+        # and the inline KXLOWT gate below.
         _fc_low_by_metric: dict[str, float] = {}
+        _FC_LOW_SOURCES = {"noaa", "hrrr", "nws_hourly", "open_meteo"}
         for _dp in data_points:
-            if _dp.source == "noaa" and _dp.metric.startswith("temp_low_"):
-                _fc_low_by_metric[_dp.metric] = _dp.value
+            if _dp.source in _FC_LOW_SOURCES and _dp.metric.startswith("temp_low_"):
+                _existing = _fc_low_by_metric.get(_dp.metric)
+                if _existing is None or _dp.value < _existing:
+                    _fc_low_by_metric[_dp.metric] = _dp.value
 
         by_key: dict[tuple[str, str], list[NumericOpportunity]] = collections.defaultdict(list)
         for opp in numeric_opps:
@@ -2261,6 +2335,44 @@ async def _poll(
             _EXCLUDE = _EXCLUDE_BASE + (("noaa_day2", "open_meteo") if is_same_day_mkt else ())
             observed = [o for o in group if o.source in _PASS_THROUGH]
             forecasts = [o for o in group if o.source not in _PASS_THROUGH and o.source not in _EXCLUDE]
+
+            # ---- KXLOWT observed-YES contradiction gate ----------------------------
+            # For daily-low markets, a morning running-minimum above the strike does
+            # NOT lock in a YES outcome — temperatures can still fall later in the day
+            # (e.g. cold-front passage in Chicago in April).  Suppress noaa_observed /
+            # metar YES signals when any forecast model predicts the daily low will be
+            # within LOWT_FORECAST_GATE_BUFFER_F degrees of (or below) the strike.
+            # The buffer (default 3°F ≈ NWS day-1 MAE) catches "dangerously close"
+            # forecasts like 54°F vs 53°F strike where model uncertainty is material.
+            if (
+                NUMERIC_LOWT_FORECAST_GATE
+                and metric.startswith("temp_low_")
+                and "KXLOWT" in ticker
+            ):
+                _obs_yes = [
+                    o for o in observed
+                    if o.implied_outcome == "YES"
+                    and o.source in ("noaa_observed", "metar")
+                ]
+                if _obs_yes:
+                    _strike = min(
+                        (o.strike for o in _obs_yes if o.strike is not None),
+                        default=None,
+                    )
+                    _fc_low = _fc_low_by_metric.get(metric)
+                    if (
+                        _strike is not None
+                        and _fc_low is not None
+                        and _fc_low < _strike + LOWT_FORECAST_GATE_BUFFER_F
+                    ):
+                        logging.warning(
+                            "KXLOWT forecast-contradiction gate: suppressing %s "
+                            "observed YES for %s — forecast low %.1f°F < strike "
+                            "%.1f°F + buffer %.1f°F",
+                            ", ".join(o.source for o in _obs_yes),
+                            ticker, _fc_low, _strike, LOWT_FORECAST_GATE_BUFFER_F,
+                        )
+                        observed = [o for o in observed if o not in _obs_yes]
 
             # Date-alignment pre-filter: remove forecast DataPoints whose as_of
             # date does not match the market's resolution date.  Without this,
@@ -3345,10 +3457,45 @@ async def _poll(
                 _ld = (_dp.metadata or {}).get("local_date")
                 if _ld:
                     _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
-    _band_arb_noaa_obs_early: dict[str, float] = {
+    # Staleness filter: only accept noaa_observed DataPoints whose as_of UTC date
+    # matches today's UTC date.  At midnight the previous poll's noaa_observed value
+    # (e.g. April 17 data) may still be in data_points; without this guard it can
+    # accidentally corroborate a bad METAR signal on an April 18 market.
+    # noaa_observed as_of is always set to "today noon local" converted to UTC, so
+    # parsing the first 10 chars gives the UTC date of the fetch.
+    _noaa_obs_today_utc = datetime.now(timezone.utc).date()
+    _band_arb_noaa_obs_early: dict[str, float] = {}
+    _band_arb_noaa_obs_dates: dict[str, date] = {}
+    for _dp in data_points:
+        if (
+            _dp.source == "noaa_observed"
+            and _dp.metric.startswith(("temp_high", "temp_low"))
+            and _dp.as_of
+            and date.fromisoformat(_dp.as_of[:10]) == _noaa_obs_today_utc
+        ):
+            _band_arb_noaa_obs_early[_dp.metric] = _dp.value
+            _ld = (_dp.metadata or {}).get("local_date")
+            if _ld:
+                _band_arb_noaa_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+    # NOAA day-1 forecast values — used as a veto signal in find_band_arbs
+    # when noaa_observed is absent or stale (see BAND_ARB_NOAA_DAY1_VETO).
+    # source="noaa" is the NWS day-1 forecast; filtered to today's UTC date
+    # so extended-day points (day2-7) are excluded.
+    _band_arb_noaa_day1: dict[str, float] = {
         dp.metric: dp.value
         for dp in data_points
-        if dp.source == "noaa_observed" and dp.metric.startswith(("temp_high", "temp_low"))
+        if dp.source == "noaa"
+        and dp.metric.startswith(("temp_high", "temp_low"))
+        and dp.as_of
+        and date.fromisoformat(dp.as_of[:10]) == _noaa_obs_today_utc
+    }
+    # NWS CLI observed values — the exact Kalshi settlement source.
+    # Keyed by metric (temp_high_* / temp_low_*), already de-duped by source.
+    _band_arb_nws_climo: dict[str, float] = {
+        dp.metric: dp.value
+        for dp in data_points
+        if dp.source == "nws_climo"
+        and dp.metric.startswith(("temp_high", "temp_low"))
     }
     if _band_arb_obs_early:
         _early_band_arb_signals = find_band_arbs(
@@ -3356,6 +3503,10 @@ async def _poll(
             _band_arb_obs_early,
             noaa_obs_values=_band_arb_noaa_obs_early or None,
             obs_dates=_band_arb_obs_dates or None,
+            noaa_obs_dates=_band_arb_noaa_obs_dates or None,
+            noaa_day1_values=_band_arb_noaa_day1 or None,
+            hrrr_values=hrrr_hourly_highs or None,
+            nws_climo_values=_band_arb_nws_climo or None,
         )
         if _early_band_arb_signals:
             logging.info(
@@ -3542,7 +3693,7 @@ async def _poll(
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
     # inner loop only refreshes series prices for cities that matter.
-    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time
+    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time, _last_noaa_day1, _last_nws_climo
     _near_threshold_cities = set()
     for _wl_mkt in markets:
         _wl_parsed = parse_market(_wl_mkt)
@@ -3560,6 +3711,8 @@ async def _poll(
             _near_threshold_cities.add(_wl_parsed.metric)
     _last_noaa_obs = _band_arb_noaa_obs_early.copy()
     _last_noaa_obs_time = time.monotonic()
+    _last_noaa_day1 = _band_arb_noaa_day1.copy()
+    _last_nws_climo = _band_arb_nws_climo.copy()
     if _near_threshold_cities:
         logging.debug(
             "Fast-loop watchlist: %d near-threshold city(ies): %s",
@@ -3688,11 +3841,22 @@ async def _fast_loop(
     )
     if _noaa_for_arb is None and _last_noaa_obs:
         logging.debug("Fast loop: NOAA cache stale (%.0fs > %.0fs), using None", _noaa_age, NOAA_OBS_MAX_AGE_S)
+    # HRRR cache: same age gate as NOAA.  Passed to find_band_arbs to enable
+    # the HRRR contradiction veto (blocks stale METAR carry at midnight).
+    _hrrr_age = time.monotonic() - _last_hrrr_highs_time
+    _hrrr_for_arb = (
+        _last_hrrr_highs
+        if _last_hrrr_highs and _hrrr_age < NOAA_OBS_MAX_AGE_S
+        else None
+    )
     signals = find_band_arbs(
         fresh_markets,
         obs_values,
         noaa_obs_values=_noaa_for_arb,
         obs_dates=_fast_obs_dates or None,
+        noaa_day1_values=_last_noaa_day1 or None,
+        hrrr_values=_hrrr_for_arb,
+        nws_climo_values=_last_nws_climo or None,
     )
     if signals:
         logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))
