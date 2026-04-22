@@ -406,21 +406,27 @@ async def _check_station_drift(
 async def _fetch_observed_max_today(
     session: aiohttp.ClientSession, city_name: str, obs_url: str, city_tz: ZoneInfo
 ) -> float | None:
-    """Return the max temperature (°F) recorded at the station since local midnight.
+    """Return the max temperature (°F) recorded at the station since LST midnight.
 
     Queries the NWS observations endpoint with a ``start`` parameter equal to
-    midnight in the city's local timezone (not midnight UTC).  This ensures the
-    full calendar day's readings are captured — midnight UTC falls at 7–8 PM
-    local time for US Eastern/Central cities, so using it as the window start
-    would silently discard the afternoon high (the value Kalshi settles against).
+    midnight in Local Standard Time (LST).  The NWS CLI daily period runs from
+    midnight LST to midnight LST regardless of DST — during Daylight Saving Time
+    that means the period starts at 01:00 local clock time.  Using clock midnight
+    (00:00 local) during DST would include the last hour of the *previous* LST
+    day and produce a spuriously high running max (e.g. the 71.6°F overnight
+    warm reading at 00:55 EDT on April 19 belongs to the NWS April 18 period).
 
     Converts each reading from °C to °F and returns the maximum.  Returns None
-    if the endpoint is unavailable or returns no readings.
+    if the endpoint is unavailable or returns no readings for the LST day so far
+    (which is correct behaviour before 01:00 local clock during DST).
     """
     local_now = datetime.now(city_tz)
-    midnight_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Shift to LST midnight: if DST is active, midnight LST = 01:00 local clock.
+    dst_offset = local_now.dst() or timedelta(0)
+    lst_hour = 1 if dst_offset.total_seconds() > 0 else 0
+    midnight_lst = local_now.replace(hour=lst_hour, minute=0, second=0, microsecond=0)
     # Express as UTC ISO-8601 for NWS API compatibility
-    midnight_as_utc = midnight_local.astimezone(timezone.utc).isoformat()
+    midnight_as_utc = midnight_lst.astimezone(timezone.utc).isoformat()
 
     try:
         async with session.get(
@@ -528,7 +534,12 @@ async def _fetch_high_temp(
     #
     # Fix: derive day_offset from each period's actual startTime relative to
     # today_local, and set as_of from the period's own date (not today_noon_et).
-    today_local = datetime.now(city_tz).date()
+    # Use LST date (not clock date) to match NWS CLI daily period boundaries.
+    # During DST, midnight LST = 01:00 local clock, so before 01:00 the LST
+    # date is yesterday.  Subtracting the DST offset gives the LST datetime.
+    _now_city = datetime.now(city_tz)
+    _dst = _now_city.dst() or timedelta(0)
+    today_local = (_now_city - _dst).date()
 
     extended_summary: list[str] = []
     extended_points: list[DataPoint] = []
@@ -617,6 +628,7 @@ async def _fetch_high_temp(
                 "city":          city_name,
                 "forecast_high": forecast_temp,
                 "observed_max":  observed_max,
+                "local_date":    str(today_local),
             },
         ))
 
@@ -626,25 +638,29 @@ async def _fetch_high_temp(
 async def _fetch_observed_min_today(
     session: aiohttp.ClientSession, city_name: str, obs_url: str, city_tz: ZoneInfo
 ) -> float | None:
-    """Return the min temperature (°F) recorded at the station since local midnight.
+    """Return the min temperature (°F) recorded at the station since LST midnight.
 
     Analogous to _fetch_observed_max_today() but tracks the running minimum.
     Used to provide a hard upper bound on today's daily low (the actual low
     can only stay at or below the running minimum as the morning progresses).
+    Uses LST midnight as the window start (same reasoning as _fetch_observed_max_today).
     """
     local_now = datetime.now(city_tz)
-    midnight_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Cap query window to midnight→5 AM local so we only see overnight
+    # Shift to LST midnight: if DST is active, midnight LST = 01:00 local clock.
+    dst_offset = local_now.dst() or timedelta(0)
+    lst_hour = 1 if dst_offset.total_seconds() > 0 else 0
+    midnight_lst = local_now.replace(hour=lst_hour, minute=0, second=0, microsecond=0)
+    # Cap query window to LST midnight→5 AM local so we only see overnight
     # observations.  Without this, a call at 10 PM includes the afternoon high
     # (e.g. Phoenix 84°F) which becomes the spurious "observed minimum".
-    cutoff_local = midnight_local.replace(hour=5)
+    cutoff_local = midnight_lst.replace(hour=5 + lst_hour)
     end_local = min(local_now, cutoff_local)
 
     try:
         async with session.get(
             obs_url,
             params={
-                "start": midnight_local.astimezone(timezone.utc).isoformat(),
+                "start": midnight_lst.astimezone(timezone.utc).isoformat(),
                 "end":   end_local.astimezone(timezone.utc).isoformat(),
                 "limit": 20,  # at most ~5 hourly obs in a 5-hour window
             },
@@ -712,8 +728,10 @@ async def _fetch_low_temp(
         logging.warning("NOAA: no nighttime period found for %s", city_name)
         return []
 
-    today_local = datetime.now(city_tz).date()
-    today_noon_local = datetime.now(city_tz).replace(hour=12, minute=0, second=0, microsecond=0)
+    _now_city_low = datetime.now(city_tz)
+    _dst_low = _now_city_low.dst() or timedelta(0)
+    today_local = (_now_city_low - _dst_low).date()
+    today_noon_local = _now_city_low.replace(hour=12, minute=0, second=0, microsecond=0)
     as_of_today = today_noon_local.astimezone(timezone.utc).isoformat()
 
     unit = "°F"
@@ -794,6 +812,7 @@ async def _fetch_low_temp(
             metadata={
                 "city":         city_name,
                 "observed_min": observed_min,
+                "local_date":   str(today_local),
             },
         ))
 
