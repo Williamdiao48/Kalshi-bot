@@ -66,8 +66,8 @@ from .news.noaa import CITIES  # city timezone lookup for date-alignment guard
 BAND_ARB_EXECUTION_ENABLED: bool = (
     os.environ.get("BAND_ARB_EXECUTION_ENABLED", "true").lower() == "true"
 )
-BAND_ARB_MIN_NO_ASK: int = int(os.environ.get("BAND_ARB_MIN_NO_ASK", "1"))
-BAND_ARB_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_MAX_NO_ASK", "85"))
+BAND_ARB_MIN_NO_ASK: int = int(os.environ.get("BAND_ARB_MIN_NO_ASK", "20"))
+BAND_ARB_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_MAX_NO_ASK", "95"))
 # Maximum divergence between METAR and noaa_observed before suppressing a band
 # arb signal.  A 27.5°F gap (DEN, APR06) indicates sensor failure; 4°F is
 # a conservative threshold that catches gross errors while tolerating the
@@ -77,11 +77,59 @@ BAND_ARB_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_MAX_NO_ASK", "85"))
 BAND_ARB_MAX_SOURCE_DIVERGENCE_F: float = float(
     os.environ.get("BAND_ARB_MAX_SOURCE_DIVERGENCE_F", "4.0")
 )
+# HRRR contradiction veto: if the HRRR forecast for today's high is more than
+# BAND_ARB_HRRR_CONTRADICT_F below the METAR observed max AND HRRR is also
+# below the band ceiling (HRRR agrees with YES winning), block the band_arb
+# NO signal.  Catches stale METAR carry: at local midnight the previous day's
+# peak may still be in the METAR running-max while HRRR correctly forecasts a
+# cold next day.  Example: Denver Apr 17 — METAR=53.96°F (Apr 16 carry),
+# HRRR=39°F (correct), market=90¢ YES (also correct); gap=14.96°F >> 8°F.
+# Set to 0 to disable.  Default 8.0°F.
+BAND_ARB_HRRR_CONTRADICT_F: float = float(
+    os.environ.get("BAND_ARB_HRRR_CONTRADICT_F", "8.0")
+)
 # When NOAA has no data for this city yet (METAR is 5-8 min ahead), only act
 # if the market price provides soft confirmation (NO ask ≤ this cap).  At 40¢
 # NO ask the market is ~40% certain the band was crossed.  Set to 0 to block
 # all signals when NOAA is absent (restores old BLOCKER 1 behaviour).
 BAND_ARB_NOAA_NONE_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_NOAA_NONE_MAX_NO_ASK", "40"))
+# NWS rounding buffer for LOW-temp band_arb (KXLOWT markets) — applied always.
+# 0.5°F mirrors the +0.5 used for HIGH markets: ensures the METAR reading is
+# far enough below the floor that NWS integer rounding can't put the official
+# low back inside the band (e.g. METAR 24.4°F rounds to 24°F, but 24.6°F
+# rounds to 25°F which is still inside [25–26]).
+BAND_ARB_LOW_BUFFER_F: float = float(os.environ.get("BAND_ARB_LOW_BUFFER_F", "0.5"))
+# Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
+# data gap, or the midnight-to-1 AM window before the first QC obs arrives).
+# During this window only METAR and the market-price cap protect against
+# QC-rejected METAR anomalies; 2.0°F keeps the combined effective buffer at
+# floor − 2.5 until NOAA data is available to provide real confirmation.
+BAND_ARB_LOW_NOAA_ABSENT_BUFFER_F: float = float(
+    os.environ.get("BAND_ARB_LOW_NOAA_ABSENT_BUFFER_F", "2.0")
+)
+# NOAA day-1 forecast veto: when NOAA observed data is absent or stale, block
+# the band_arb NO signal if the NWS day-1 forecast places the official high
+# on the YES side of the strike (day1 < band_ceil for HIGH markets; > for LOW).
+# This catches overnight/early-morning windows where only METAR is available
+# but the official NWS forecast contradicts the observed crossing — the most
+# common cause being an inter-station gap (e.g. KATL vs KFFC) or a QC-failed
+# outlier.  Ignored when NOAA observed is fresh and in-range (trusted over
+# a day-ahead forecast).  Set to "false" to disable.  Default: true.
+BAND_ARB_NOAA_DAY1_VETO: bool = (
+    os.environ.get("BAND_ARB_NOAA_DAY1_VETO", "true").lower() not in ("0", "false", "no")
+)
+# NWS CLI (nws_climo) hard veto: if the NWS Climatological Report — the exact
+# settlement source Kalshi uses — has published today's preliminary maximum/minimum
+# and it contradicts a NO resolution, block the signal.
+#   HIGH markets: nws_climo_val < band_ceil → CLI says max is below ceiling → YES wins.
+#   LOW markets:  nws_climo_val > band_ceil → CLI says min is above floor   → YES wins.
+# The CLI preliminary report is typically published 5–8 PM local time, so this veto
+# is most relevant for late-afternoon band crossings where METAR and the settlement
+# station may disagree (inter-station gap, QC adjustment, etc.).
+# Set to "false" to disable.  Default: true.
+BAND_ARB_NWS_CLIMO_VETO: bool = (
+    os.environ.get("BAND_ARB_NWS_CLIMO_VETO", "true").lower() not in ("0", "false", "no")
+)
 
 # --- Band-arb YES signal configuration ------------------------------------
 BAND_ARB_YES_ENABLED: bool = os.environ.get("BAND_ARB_YES_ENABLED", "true").lower() == "true"
@@ -144,13 +192,23 @@ FORECAST_NO_OVERNIGHT_LOCK_HOUR: int = int(
 # Day-ahead models (open_meteo, noaa) have 4-5°F MAE vs 2-3°F for HRRR/NWS.
 # When neither near-term model confirms the edge, signal confidence is too low.
 FORECAST_NO_REQUIRE_NEAR_TERM: bool = os.environ.get(
-    "FORECAST_NO_REQUIRE_NEAR_TERM", "false"
+    "FORECAST_NO_REQUIRE_NEAR_TERM", "true"
 ).lower() != "false"
 # For LOW "under" markets (NO wins if overnight low stays above strike), block
 # entries after this local hour.  Afternoon cooling begins ~15:00 and forecast
 # model accuracy for overnight minimums degrades sharply past this point.
 FORECAST_NO_LOW_UNDER_MAX_HOUR: int = int(
     os.environ.get("FORECAST_NO_LOW_UNDER_MAX_HOUR", "15")
+)
+# Midnight METAR gap veto: block LOW "under" forecast_no signals during the
+# overnight window (local hour < FORECAST_NO_OVERNIGHT_LOCK_HOUR) when no
+# METAR observation has been collected yet for this metric.  Without an
+# observed minimum, the proximity veto cannot run — and the daily METAR
+# tracking resets at midnight, leaving a ~15-minute window where obs_min
+# is None even though the overnight low is already near the strike.
+FORECAST_NO_LOW_UNDER_REQUIRE_METAR: bool = (
+    os.environ.get("FORECAST_NO_LOW_UNDER_REQUIRE_METAR", "true").lower()
+    not in ("false", "0", "no")
 )
 # HRRR dissent veto: if HRRR is present and forecasts the daily high/low on the
 # WRONG side of the strike (i.e., HRRR thinks YES is likely), block the signal
@@ -179,15 +237,37 @@ FORECAST_NO_HIGH_LATE_MARGIN_F: float = float(
     os.environ.get("FORECAST_NO_HIGH_LATE_MARGIN_F", "2.0")
 )
 # Pre-dawn proximity veto for LOW "over" markets (T-type: YES = daily_low > strike).
-# After FORECAST_NO_LOW_OVER_OBS_MIN_HOUR local time the overnight low is largely set;
-# if the running observed minimum is still more than FORECAST_NO_LOW_OVER_OBS_MARGIN_F
-# above the strike, the drop required to reach (and cross) the strike is implausible.
-# Window: [OBS_MIN_HOUR, FORECAST_NO_OVERNIGHT_LOCK_HOUR).  Default: 3 AM, 4.0°F.
+# Fires when the running observed minimum is still more than a time-scaled margin
+# above the strike — meaning the required drop before dawn is implausible.
+#
+# The required margin grows linearly with hours remaining until dawn (lock hour),
+# so the veto is tight near dawn (small drop needed to be implausible) and lenient
+# near midnight (large drop needed before it's considered impossible):
+#
+#   required_margin = FORECAST_NO_LOW_OVER_OBS_MARGIN_F
+#                     + FORECAST_NO_LOW_OVER_OBS_MARGIN_PER_HOUR
+#                       × (FORECAST_NO_OVERNIGHT_LOCK_HOUR − local_hour − 1)
+#
+# Example with defaults (base=2.0°F, per_hour=0.75°F, lock=6):
+#   5 AM  → 2.0 + 0.75×0 = 2.00°F   (nearly dawn — tight)
+#   4 AM  → 2.0 + 0.75×1 = 2.75°F
+#   3 AM  → 2.0 + 0.75×2 = 3.50°F
+#   2 AM  → 2.0 + 0.75×3 = 4.25°F
+#   1 AM  → 2.0 + 0.75×4 = 5.00°F
+#   midnight → 2.0 + 0.75×5 = 5.75°F  (most of the night ahead — lenient)
+#
+# Window starts at FORECAST_NO_LOW_OVER_OBS_MIN_HOUR (default: midnight = 0).
 FORECAST_NO_LOW_OVER_OBS_MIN_HOUR: int = int(
-    os.environ.get("FORECAST_NO_LOW_OVER_OBS_MIN_HOUR", "3")
+    os.environ.get("FORECAST_NO_LOW_OVER_OBS_MIN_HOUR", "0")
 )
+# Base margin at the hour just before the lock (°F).  Smaller = tighter veto near dawn.
 FORECAST_NO_LOW_OVER_OBS_MARGIN_F: float = float(
-    os.environ.get("FORECAST_NO_LOW_OVER_OBS_MARGIN_F", "4.0")
+    os.environ.get("FORECAST_NO_LOW_OVER_OBS_MARGIN_F", "2.0")
+)
+# Additional margin added per hour of distance from the lock hour (°F/hr).
+# Higher = more lenient earlier in the night.
+FORECAST_NO_LOW_OVER_OBS_MARGIN_PER_HOUR: float = float(
+    os.environ.get("FORECAST_NO_LOW_OVER_OBS_MARGIN_PER_HOUR", "1.0")
 )
 # Terrain-city HRRR minimum-edge gate.  For cities in FORECAST_NO_HRRR_TERRAIN_CITIES,
 # HRRR must be present AND have edge ≥ this value (°F) before the signal fires.
@@ -209,6 +289,16 @@ FORECAST_NO_HRRR_TERRAIN_CITIES: frozenset[str] = frozenset(
 # edge < FORECAST_NO_HRRR_TERRAIN_MIN_EDGE_F, block regardless of city.
 FORECAST_NO_HRRR_SPREAD_F: float = float(
     os.environ.get("FORECAST_NO_HRRR_SPREAD_F", "4.0")
+)
+
+# Maximum allowed spread (°F) between the highest and lowest weather-model
+# forecast for a given metric before the signal is blocked.  When models
+# disagree by more than this amount, forecast uncertainty is too high to
+# justify a trade — backtests show 0% win rate above 5°F spread.
+# Applies to all directions (including band/"between" markets).
+# Set to 0 to disable.
+FORECAST_NO_MODEL_SPREAD_F: float = float(
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "5.0")
 )
 
 
@@ -322,6 +412,10 @@ def find_band_arbs(
     obs_values: dict[str, float],
     noaa_obs_values: dict[str, float] | None = None,
     obs_dates: dict[str, date] | None = None,
+    noaa_obs_dates: dict[str, date] | None = None,
+    noaa_day1_values: dict[str, float] | None = None,
+    hrrr_values: dict[str, float] | None = None,
+    nws_climo_values: dict[str, float] | None = None,
 ) -> list[BandArbSignal]:
     """Scan open KXHIGH and KXLOWT markets for bands definitively passed through by METAR.
 
@@ -349,6 +443,22 @@ def find_band_arbs(
         noaa_obs_values: noaa_observed values per metric (°F). When provided,
                          used to corroborate METAR and filter station mismatches.
                          Pass None to skip corroboration (METAR-only mode).
+        noaa_obs_dates:  Local calendar date of each noaa_observed reading
+                         (keyed by metric).  When provided, a NOAA reading
+                         whose local_date != the market date is treated as
+                         absent (stale carry from a prior day).
+        noaa_day1_values: NWS day-1 forecast highs/lows per metric (°F).
+                         Used as a veto only when noaa_obs_values is absent
+                         or stale: if the day-1 forecast places the official
+                         value on the YES side of the strike, the NO signal
+                         is suppressed (see BAND_ARB_NOAA_DAY1_VETO).
+        nws_climo_values: NWS CLI (Climatological Report) observed daily
+                         max/min temperatures per metric (°F).  This is the
+                         exact settlement source Kalshi uses.  When present
+                         and contradicting the NO signal (CLI value on the
+                         YES side of the strike), the signal is hard-vetoed
+                         regardless of METAR (see BAND_ARB_NWS_CLIMO_VETO).
+                         Typically only available after ~5 PM local time.
 
     Returns:
         List of BandArbSignal objects, one per definitively-NO market within
@@ -486,17 +596,40 @@ def find_band_arbs(
             # NWS rounds to nearest integer — use 0.5°F buffer same as highs.
             if parsed.direction == "between":
                 # "Between lo–hi°F": resolves NO when official low < lo.
-                # Fire when METAR_min ≤ strike_lo - 0.5 (rounds down to below lo).
-                if parsed.strike_lo is not None and observed_max <= parsed.strike_lo - 0.5:
+                # 0.5°F rounding buffer: METAR must be clearly below floor so
+                # NWS integer rounding can't put the official low back in-band.
+                # When NOAA is absent an extra buffer is applied below.
+                if parsed.strike_lo is not None and observed_max <= parsed.strike_lo - BAND_ARB_LOW_BUFFER_F:
                     is_definitive_no = True
                     band_ceil = parsed.strike_lo  # the floor that was breached
 
             elif parsed.direction == "over":
                 # "Over X°F": resolves NO when official low ≤ X.
-                # Fire when METAR_min ≤ strike - 0.5 (official low will be ≤ strike).
-                if parsed.strike is not None and observed_max <= parsed.strike - 0.5:
+                # Same 0.5°F rounding buffer as "between".
+                if parsed.strike is not None and observed_max <= parsed.strike - BAND_ARB_LOW_BUFFER_F:
                     is_definitive_no = True
                     band_ceil = parsed.strike
+
+        # --- LOW-market NOAA confirmation guard ----------------------------
+        # For KXLOWT NO signals: if noaa_observed has fresh data and shows
+        # the running-min is within NWS rounding distance of the floor, the
+        # official rounded value could still be ≥ the floor (YES territory).
+        # Threshold is band_ceil - 0.5: values ≥ 24.5 round to ≥ 25 under
+        # NWS integer rounding, so a 24.6°F NOAA reading on a 25°F floor
+        # means the official low may resolve 25°F → inside band → YES wins.
+        # This mirrors the +0.5 buffer used on the METAR side for HIGH markets.
+        if is_definitive_no and is_low_market and noaa_obs_values is not None:
+            _noaa_low_confirm = noaa_obs_values.get(parsed.metric)
+            if _noaa_low_confirm is not None and _noaa_low_confirm >= band_ceil - 0.5:
+                logging.warning(
+                    "BandArb skip (LOW NOAA contradict): %s —"
+                    " METAR_min=%.1f°F < floor=%.1f°F"
+                    " but NOAA_min=%.1f°F >= floor-0.5=%.1f°F"
+                    " (NWS rounds to ≥ floor; NOAA overrides METAR)",
+                    ticker, observed_max, band_ceil,
+                    _noaa_low_confirm, band_ceil - 0.5,
+                )
+                is_definitive_no = False
 
         if not is_definitive_no:
             # --- YES signal: temperature inside band -----------------------
@@ -574,6 +707,59 @@ def find_band_arbs(
             ))
             continue
 
+        # --- NWS CLI (nws_climo) hard veto ------------------------------------
+        # The NWS Climatological Report is the exact settlement source Kalshi
+        # uses.  If today's preliminary CLI value is available and contradicts
+        # the NO signal (CLI places the temperature on the YES side of the
+        # strike), block the signal — the settlement data overrides METAR.
+        #   HIGH: nws_climo_val < band_ceil → CLI max is below ceiling → YES wins.
+        #   LOW:  nws_climo_val > band_ceil → CLI min is above floor   → YES wins.
+        # No action when nws_climo confirms NO (value on correct side) — the
+        # existing corroboration path handles that case.
+        if BAND_ARB_NWS_CLIMO_VETO and nws_climo_values is not None:
+            _climo_val = nws_climo_values.get(parsed.metric)
+            if _climo_val is not None:
+                _climo_contradicts = (
+                    _climo_val < band_ceil if not is_low_market
+                    else _climo_val > band_ceil
+                )
+                if _climo_contradicts:
+                    logging.warning(
+                        "BandArb skip (nws_climo veto): %s —"
+                        " METAR=%.1f°F, CLI=%.1f°F %s band_ceil=%.1f°F"
+                        " (settlement source contradicts signal)",
+                        ticker, observed_max, _climo_val,
+                        "<" if not is_low_market else ">", band_ceil,
+                    )
+                    continue
+
+        # --- HRRR contradiction veto ---------------------------------------
+        # If HRRR forecast is more than BAND_ARB_HRRR_CONTRADICT_F below the
+        # METAR observed max AND HRRR is also below the band ceiling (HRRR
+        # predicts YES will win), the two sources directly contradict each
+        # other.  The most common cause is stale METAR carry at midnight: the
+        # previous day's peak persists in the running-max until the new day's
+        # first observation overwrites it.  Block rather than risk trading on
+        # yesterday's temperature against a market that is correctly priced for
+        # today's cold forecast.
+        if BAND_ARB_HRRR_CONTRADICT_F > 0 and hrrr_values is not None:
+            _hrrr_val = hrrr_values.get(parsed.metric)
+            if (
+                _hrrr_val is not None
+                and _hrrr_val < band_ceil
+                and (observed_max - _hrrr_val) > BAND_ARB_HRRR_CONTRADICT_F
+            ):
+                logging.warning(
+                    "BandArb skip (HRRR contradiction): %s —"
+                    " METAR=%.1f°F vs HRRR=%.1f°F"
+                    " (gap=%.1f°F > %.1f°F threshold),"
+                    " HRRR below ceil=%.1f°F — METAR likely stale carry",
+                    ticker, observed_max, _hrrr_val,
+                    observed_max - _hrrr_val, BAND_ARB_HRRR_CONTRADICT_F,
+                    band_ceil,
+                )
+                continue
+
         # --- noaa_observed corroboration -----------------------------------
         # BLOCKER 3 (require NOAA to confirm band crossing) has been removed.
         # METAR leads NOAA by 5-8 min; waiting for NOAA to cross the ceiling
@@ -585,9 +771,65 @@ def find_band_arbs(
         # identically to "NOAA present but missing this city" — the NOAA_NONE cap
         # must still apply so that a spurious METAR spike can't fire unchecked.
         noaa_val = (noaa_obs_values or {}).get(parsed.metric)
+        # Date-alignment check: if the NOAA observation is dated for a different
+        # local calendar day than the market (stale carry at midnight), treat it
+        # as absent so it can't corroborate a false signal on today's market.
+        if noaa_val is not None and noaa_obs_dates and _mkt_date is not None:
+            _noaa_date = noaa_obs_dates.get(parsed.metric)
+            if _noaa_date is not None and _noaa_date != _mkt_date:
+                logging.warning(
+                    "BandArb: %s — NOAA data dated %s != market date %s"
+                    " (stale carry); treating NOAA as absent",
+                    ticker, _noaa_date, _mkt_date,
+                )
+                noaa_val = None
         if noaa_val is None:
             # NOAA has no data for this city yet — METAR is ahead, or NOAA has
             # no data at all (early morning before first observations arrive).
+            # For LOW markets apply an extra buffer: without NOAA confirmation
+            # a QC-rejected METAR spike can't be ruled out.  The combined
+            # effective floor is band_ceil - (BUFFER_F + NOAA_ABSENT_BUFFER_F).
+            if is_low_market and BAND_ARB_LOW_NOAA_ABSENT_BUFFER_F > 0:
+                # Stack on top of the initial BAND_ARB_LOW_BUFFER_F already
+                # applied: effective floor = band_ceil - BUFFER_F - ABSENT_BUFFER_F.
+                # e.g. floor=25, BUFFER=0.5, ABSENT=2.0 → must be ≤ 22.5°F.
+                _absent_floor = band_ceil - BAND_ARB_LOW_BUFFER_F - BAND_ARB_LOW_NOAA_ABSENT_BUFFER_F
+                if observed_max > _absent_floor:
+                    logging.debug(
+                        "BandArb skip: %s — NOAA absent, METAR_min=%.1f°F"
+                        " > absent-buffer floor=%.1f°F"
+                        " (floor=%.1f - %.1f - %.1f°F);"
+                        " waiting for NOAA confirmation",
+                        ticker, observed_max, _absent_floor,
+                        band_ceil, BAND_ARB_LOW_BUFFER_F,
+                        BAND_ARB_LOW_NOAA_ABSENT_BUFFER_F,
+                    )
+                    continue
+            # NOAA day-1 forecast veto: NOAA observed is absent/stale, so the
+            # only observational source is METAR.  If the NWS day-1 forecast
+            # says the official value will land on the YES side of the strike
+            # (day1 < band_ceil for HIGH; day1 > band_ceil for LOW), the
+            # forecast directly contradicts the observed crossing.  This is
+            # the most reliable signal that METAR is reading a different
+            # station from Kalshi's resolution station (inter-station gap) or
+            # has a QC-failed outlier reading.  Block rather than trade.
+            if BAND_ARB_NOAA_DAY1_VETO and noaa_day1_values is not None:
+                _day1_val = noaa_day1_values.get(parsed.metric)
+                if _day1_val is not None:
+                    _day1_contradicts = (
+                        _day1_val < band_ceil if not is_low_market
+                        else _day1_val > band_ceil
+                    )
+                    if _day1_contradicts:
+                        logging.warning(
+                            "BandArb skip (day1 veto): %s —"
+                            " METAR=%.1f°F, NOAA observed absent/stale,"
+                            " day1=%.1f°F %s band_ceil=%.1f°F"
+                            " (forecast says YES wins)",
+                            ticker, observed_max, _day1_val,
+                            "<" if not is_low_market else ">", band_ceil,
+                        )
+                        continue
             # Use the market price as soft confirmation: if NO ask is above
             # the cap the market doesn't believe the crossing yet; skip.
             if BAND_ARB_NOAA_NONE_MAX_NO_ASK > 0 and no_ask > BAND_ARB_NOAA_NONE_MAX_NO_ASK:
@@ -808,23 +1050,28 @@ def find_forecast_nos(
                             ticker, _obs_min, parsed.strike, _local_hour,
                         )
                         continue
-                    # Pre-dawn proximity veto: after OBS_MIN_HOUR but before lock hour
-                    # the temperature has nearly bottomed out.  If the running minimum
-                    # is still more than MARGIN above the strike, the required drop is
-                    # implausible in the remaining pre-dawn window.
-                    if (
-                        FORECAST_NO_LOW_OVER_OBS_MIN_HOUR <= _local_hour < FORECAST_NO_OVERNIGHT_LOCK_HOUR
-                        and _obs_min > parsed.strike + FORECAST_NO_LOW_OVER_OBS_MARGIN_F
-                    ):
-                        logging.debug(
-                            "ForecastNO veto (over pre-dawn): %s — local_hour=%d"
-                            " obs_min=%.1f°F > strike+margin=%.1f°F"
-                            " (%.1f°F drop required before dawn is implausible)",
-                            ticker, _local_hour, _obs_min,
-                            parsed.strike + FORECAST_NO_LOW_OVER_OBS_MARGIN_F,
-                            _obs_min - parsed.strike,
+                    # Pre-dawn proximity veto: from OBS_MIN_HOUR through lock hour,
+                    # the required margin scales with hours remaining before dawn —
+                    # lenient at midnight, tight near 5 AM (see constant comments).
+                    if FORECAST_NO_LOW_OVER_OBS_MIN_HOUR <= _local_hour < FORECAST_NO_OVERNIGHT_LOCK_HOUR:
+                        _hours_to_lock = FORECAST_NO_OVERNIGHT_LOCK_HOUR - _local_hour - 1
+                        _scaled_margin = (
+                            FORECAST_NO_LOW_OVER_OBS_MARGIN_F
+                            + FORECAST_NO_LOW_OVER_OBS_MARGIN_PER_HOUR * _hours_to_lock
                         )
-                        continue
+                        if _obs_min > parsed.strike + _scaled_margin:
+                            logging.debug(
+                                "ForecastNO veto (over pre-dawn): %s — local_hour=%d"
+                                " obs_min=%.1f°F > strike+margin=%.1f°F"
+                                " (margin=%.1f + %.1f×%dh; %.1f°F drop implausible before dawn)",
+                                ticker, _local_hour, _obs_min,
+                                parsed.strike + _scaled_margin,
+                                FORECAST_NO_LOW_OVER_OBS_MARGIN_F,
+                                FORECAST_NO_LOW_OVER_OBS_MARGIN_PER_HOUR,
+                                _hours_to_lock,
+                                _obs_min - parsed.strike,
+                            )
+                            continue
 
                 elif parsed.direction == "under" and parsed.strike is not None:
                     # NO wins if daily_low ≥ strike.
@@ -864,6 +1111,26 @@ def find_forecast_nos(
                             ticker, _obs_min, parsed.strike_lo,
                         )
                         continue
+
+        # Midnight METAR gap veto: no METAR observation yet for this LOW "under"
+        # market during the overnight window.  The daily running-minimum resets at
+        # midnight, leaving a brief window (typically ~15 min) where obs_min is None
+        # but the temperature may already be near the strike — the proximity veto
+        # cannot run without data.  Block until the first METAR reading arrives.
+        if (
+            is_low_market
+            and parsed.direction == "under"
+            and parsed.strike is not None
+            and obs_low_values.get(parsed.metric) is None
+            and FORECAST_NO_LOW_UNDER_REQUIRE_METAR
+            and _local_hour < FORECAST_NO_OVERNIGHT_LOCK_HOUR
+        ):
+            logging.debug(
+                "ForecastNO veto (no METAR overnight): %s — no observed min for %s"
+                " at local hour %d (midnight gap, proximity veto cannot run)",
+                ticker, parsed.metric, _local_hour,
+            )
+            continue
 
         # Observed-data veto for HIGH markets: if METAR running maximum has already
         # crossed the strike, band_arb handles the confirmation — forecast_no would
@@ -982,6 +1249,27 @@ def find_forecast_nos(
                         " spread=%.1f°F > %.1f°F, hrrr_edge=%.1f°F < %.1f°F",
                         ticker, spread, FORECAST_NO_HRRR_SPREAD_F,
                         hrrr_edge, FORECAST_NO_HRRR_TERRAIN_MIN_EDGE_F,
+                    )
+                    continue
+
+        # --- Global model-spread gate (all directions) --------------------------
+        # If the spread between the highest and lowest model forecast exceeds
+        # FORECAST_NO_MODEL_SPREAD_F, models are too far apart to trust any
+        # single signal — block regardless of which direction the market faces.
+        # This catches band/"between" markets that the HRRR-specific spread veto
+        # (which only runs for direction=="under") would otherwise miss.
+        if FORECAST_NO_MODEL_SPREAD_F > 0:
+            _spread_sources = {"hrrr", "nws_hourly", "open_meteo", "noaa", "owm"}
+            _spread_vals = [v for s, v in sources_map if s in _spread_sources]
+            if len(_spread_vals) >= 2:
+                _model_spread = max(_spread_vals) - min(_spread_vals)
+                if _model_spread > FORECAST_NO_MODEL_SPREAD_F:
+                    logging.warning(
+                        "ForecastNO skip (model spread): %s —"
+                        " spread=%.1f°F > %.1f°F across %d models"
+                        " (forecast uncertainty too high)",
+                        ticker, _model_spread, FORECAST_NO_MODEL_SPREAD_F,
+                        len(_spread_vals),
                     )
                     continue
 
