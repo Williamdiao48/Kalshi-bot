@@ -149,8 +149,11 @@ async def _fetch_city_hourly(
         logging.warning("NWS Hourly: empty periods for %s", city_name)
         return []
 
-    # Build day → max_temp mapping using LOCAL dates from each period's timestamp.
+    # Build day → max_temp and day → min_temp mappings using LOCAL dates from
+    # each period's timestamp.  All 24 hours are used for min (overnight lows
+    # occur early morning, outside the daytime window used for highs in hrrr.py).
     day_highs: dict[str, float] = {}
+    day_lows:  dict[str, float] = {}
 
     for period in features:
         start_raw = period.get("startTime", "")
@@ -170,6 +173,11 @@ async def _fetch_city_hourly(
             day_highs[date_str] = max(day_highs[date_str], temp_f)
         else:
             day_highs[date_str] = temp_f
+        # Track daily low across all hours — overnight lows occur before 8 AM
+        if date_str in day_lows:
+            day_lows[date_str] = min(day_lows[date_str], temp_f)
+        else:
+            day_lows[date_str] = temp_f
 
     points: list[DataPoint] = []
     summary_parts: list[str] = []
@@ -178,6 +186,9 @@ async def _fetch_city_hourly(
     # heuristic that checked which of [UTC-1day, UTC-today] appeared in day_highs
     # (which could pick the wrong day if old forecast periods were in the data).
     local_today = datetime.now(city_tz).date()
+
+    low_metric = metric.replace("temp_high_", "temp_low_")
+    emit_lows = low_metric != metric  # only when metric is a temp_high_* key
 
     for day_offset in range(NWS_HOURLY_FORECAST_DAYS):
         target_date = local_today + timedelta(days=day_offset)
@@ -208,6 +219,23 @@ async def _fetch_city_hourly(
                 "fetched_at":      fetch_wall_time,
             },
         ))
+
+        # Also emit the daily low for the same date so KXLOWT markets have a
+        # nws_hourly forecast source for the contradiction gate in main.py.
+        if emit_lows and date_str in day_lows:
+            points.append(DataPoint(
+                source="nws_hourly",
+                metric=low_metric,
+                value=day_lows[date_str],
+                unit="°F",
+                as_of=as_of,
+                metadata={
+                    "city":            city_name,
+                    "forecast_date":   date_str,
+                    "forecast_offset": day_offset,
+                    "fetched_at":      fetch_wall_time,
+                },
+            ))
 
     if summary_parts:
         logging.info("NWS Hourly [%s]: %s", city_name, "  ".join(summary_parts))
