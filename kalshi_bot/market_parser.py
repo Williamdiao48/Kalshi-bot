@@ -183,9 +183,26 @@ def _metric_for_ticker(ticker: str) -> str | None:
 
 
 def parse_market(market: dict[str, Any]) -> ParsedMarket | None:
-    """Parse a single Kalshi market dict into a ParsedMarket.
+    """Parse a single Kalshi market dict into a structured ParsedMarket.
 
-    Returns None if the market's ticker is not in our supported set.
+    Extracts direction, strike(s), and the canonical metric key from the
+    market's ticker and title.  Direction is determined by scanning the title
+    for directional language (">75", "above", "below", "74-75°", etc.) before
+    falling back to the ticker suffix (`-T{N}` = over, `-B{N}` = under).
+
+    Ticker format: ``KX{SERIES}{CITY}-{YYMMDD}-{B|T}{STRIKE}``
+      - ``B`` suffix → ``direction="under"`` (market resolves YES if value < strike)
+      - ``T`` suffix → ``direction="over"``  (market resolves YES if value > strike)
+      - Decimal encoding: ``T695`` → 69.5, ``B65000`` → 65000.0
+
+    Args:
+        market: Raw market dict from the Kalshi API.  Expected keys: ``ticker``,
+                ``title``.  Missing keys produce empty strings (safe to call on
+                any dict).
+
+    Returns:
+        ``ParsedMarket`` if the ticker maps to a supported metric; ``None``
+        if the ticker prefix is not in ``TICKER_TO_METRIC`` (unrecognised series).
     """
     ticker = market.get("ticker", "")
     title = market.get("title", "")
@@ -233,7 +250,12 @@ def parse_market(market: dict[str, Any]) -> ParsedMarket | None:
 
 
 def parse_all_markets(markets: list[dict[str, Any]]) -> list[ParsedMarket]:
-    """Parse a list of Kalshi market dicts, dropping unrecognised tickers."""
+    """Parse a list of Kalshi market dicts, silently dropping unrecognised tickers.
+
+    Convenience wrapper around ``parse_market()`` for bulk processing.
+    Unrecognised tickers (not in TICKER_TO_METRIC) are filtered out; the
+    caller receives only markets we know how to score and trade.
+    """
     parsed = []
     for m in markets:
         result = parse_market(m)

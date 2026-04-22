@@ -259,18 +259,35 @@ def find_numeric_opportunities(
 ) -> list[NumericOpportunity]:
     """Match a list of live DataPoints against open Kalshi markets.
 
-    For crypto metrics, if both Binance and Coinbase prices are present and
-    they diverge by more than CROSS_EXCHANGE_DIVERGENCE_PCT, the effective
-    edge is multiplied by CROSS_EXCHANGE_EDGE_PENALTY before the min_edge
-    filter is applied.
+    For each (DataPoint, ParsedMarket) pair sharing the same ``metric`` key,
+    computes the implied outcome (YES/NO/UNKNOWN) and edge (|value − strike|).
+    One ``NumericOpportunity`` is emitted per matching pair.
+
+    The join key is ``DataPoint.metric == ParsedMarket.metric``.  ``ParsedMarket``
+    objects are derived by calling ``parse_all_markets(markets)`` internally.
+
+    **Cross-exchange guard (crypto)**: If both Binance and Coinbase prices are
+    present for the same metric and they diverge by > ``CROSS_EXCHANGE_DIVERGENCE_PCT``
+    (default 0.5%), the effective edge is multiplied by ``CROSS_EXCHANGE_EDGE_PENALTY``
+    (default 0.5) before the ``min_edge`` filter.  This discounts unvalidated signals
+    where two real-money venues disagree.
+
+    **Stale-market filter**: Markets with ``yes_bid=0 AND yes_ask≤1`` are dropped
+    before matching.  These are expired or halted markets the API still returns as
+    "open" but where no fills are possible.
 
     Args:
-        data_points: Live observations from NOAA, Binance, Coinbase, …
-        markets:     Raw market dicts from the Kalshi API.
-        min_edge:    Only emit opportunities where effective edge >= min_edge.
+        data_points: Live observations from all sources (NOAA, METAR, Binance, …).
+                     Multiple DataPoints from the same source for the same metric are
+                     each matched independently, producing separate opportunities.
+        markets:     Raw market dicts from the Kalshi API, as returned by
+                     ``fetch_markets()``.  Unrecognised tickers are skipped.
+        min_edge:    Filter threshold.  Opportunities with effective edge < min_edge
+                     are dropped.  Pass 0.0 to receive all matches.
 
     Returns:
-        List of NumericOpportunity objects, one per matching (data, market) pair.
+        List of ``NumericOpportunity`` objects sorted by (metric, edge desc).
+        Empty list if no DataPoints match any open market.
     """
     # Drop markets with no real order book (yes_bid=0 AND yes_ask≤1).
     # These are expired or halted markets that the Kalshi API still returns as

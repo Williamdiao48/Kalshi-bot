@@ -375,11 +375,17 @@ class OpportunityLog:
     ) -> None:
         """Persist a text/keyword opportunity to the log.
 
+        The dedup key written to ``signal_key`` is the first matched term
+        (lowercased), or ``opp.topic`` as fallback.  This means the same
+        topic can re-fire on the same market once the cooldown window expires,
+        but a different term on the same market fires immediately.
+
         Args:
-            opp:          The matched text opportunity.
-            detail:       Live market detail dict (may be None).
-            score:        Composite score in [0, 1].
-            days_to_close: Fractional days until market closes.
+            opp:           The matched text opportunity.
+            detail:        Live market detail dict from ``fetch_market_detail``
+                           (may be None if the fetch failed).
+            score:         Composite score in [0, 1] from ``score_text_opportunity``.
+            days_to_close: Fractional days until market close_time.
         """
         bid = detail.get("yes_bid") if detail else None
         ask = detail.get("yes_ask") if detail else None
@@ -420,11 +426,18 @@ class OpportunityLog:
     ) -> None:
         """Persist a numeric/data opportunity to the log.
 
+        The dedup key written to ``signal_key`` is ``opp.metric`` (e.g.
+        ``"temp_high_lax"``).  This means one NOAA DataPoint and one METAR
+        DataPoint for the same metric on the same market share a dedup key —
+        the second source is suppressed within the cooldown window.  This is
+        intentional: both point to the same underlying signal.
+
         Args:
-            opp:          The matched numeric opportunity.
-            detail:       Live market detail dict (may be None).
-            score:        Composite score in [0, 1].
-            days_to_close: Fractional days until market closes.
+            opp:           The matched numeric opportunity.
+            detail:        Live market detail dict from ``fetch_market_detail``
+                           (may be None if the fetch failed).
+            score:         Composite score in [0, 1] from ``score_numeric_opportunity``.
+            days_to_close: Fractional days until market close_time.
         """
         bid = detail.get("yes_bid") if detail else None
         ask = detail.get("yes_ask") if detail else None
