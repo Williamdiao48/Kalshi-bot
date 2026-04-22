@@ -104,6 +104,14 @@ LOW_CLIMO_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
 # Set to 0 to attempt only once per UTC day (old behavior).
 CLIMO_RETRY_INTERVAL_MINUTES: int = int(os.environ.get("CLIMO_RETRY_INTERVAL_MINUTES", "30"))
 
+# Earliest local hour at which we attempt to fetch today's CLI product.
+# The NWS preliminary CLI is published 5–8 PM local; the morning final report
+# (1–2 AM local) covers the *previous* day's data and must not be used.
+# A gate of 14:00 (2 PM) eliminates all morning fetches while still giving
+# a 3-hour polling window before the preliminary becomes available.
+# Set via env var NWS_CLIMO_MIN_LOCAL_HOUR. Default: 14.
+CLIMO_MIN_LOCAL_HOUR: int = int(os.environ.get("NWS_CLIMO_MIN_LOCAL_HOUR", "14"))
+
 # Cache: (metric, utc_date_str) → parsed max temperature (°F).
 # Re-populated once per calendar day per city — avoids re-fetching the same
 # CLI product on every 60-second poll cycle.
@@ -251,6 +259,14 @@ async def _fetch_city_climo(
                 metadata={"location": location, "city_name": city_name, "cached": True},
             ))
         return points
+
+    # Local-hour gate: the NWS preliminary CLI is published 5–8 PM local.
+    # The morning final report (1–2 AM local) covers the *previous* day's data
+    # and is NOT marked PRELIMINARY — but to be safe, don't even attempt a
+    # fetch before CLIMO_MIN_LOCAL_HOUR (default 14:00 / 2 PM local).
+    _local_hour = now_utc.astimezone(city_tz).hour
+    if _local_hour < CLIMO_MIN_LOCAL_HOUR:
+        return []
 
     _last_attempt = _last_attempted.get(cache_key, 0.0)
     if CLIMO_RETRY_INTERVAL_MINUTES > 0 and (time.monotonic() - _last_attempt) < CLIMO_RETRY_INTERVAL_MINUTES * 60:
