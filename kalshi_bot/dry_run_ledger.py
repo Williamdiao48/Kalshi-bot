@@ -125,6 +125,10 @@ class _Trade:
         # (peak_past=True on NumericOpportunity).  Used by exit_manager to
         # suppress stop-loss on post-peak KXHIGH:no positions near close.
         "peak_past",
+        # spread identifier: non-empty for arb spread legs.  Used by
+        # exit_manager to suppress stop-loss on arb positions that must be
+        # held to settlement for the spread to converge.
+        "spread_id",
     )
 
     def __init__(
@@ -149,6 +153,7 @@ class _Trade:
         yes_bid_entry:    int   | None = None,
         yes_ask_entry:    int   | None = None,
         peak_past:        bool  | None = None,
+        spread_id:        str   | None = None,
     ) -> None:
         self.trade_id       = trade_id
         self.logged_at      = logged_at
@@ -166,6 +171,7 @@ class _Trade:
         self.yes_bid_entry    = yes_bid_entry
         self.yes_ask_entry    = yes_ask_entry
         self.peak_past        = bool(peak_past)
+        self.spread_id        = spread_id or ""
 
         # Exit state — locked-in P&L from early exit.
         self.exited      = exited_at is not None
@@ -433,13 +439,15 @@ class DryRunLedger:
         called cheaply before every trade.  Unrealized P&L is excluded — only
         settled/exited results count as real cash.
         """
+        # Realized P&L: early exits (exited_at IS NOT NULL) + Kalshi settlements
+        # (outcome IS NOT NULL but no early exit).  Both return capital to the pool.
         row = self._conn.execute(
             """
             SELECT
                 COALESCE(SUM(exit_pnl_cents), 0) AS realized_pnl
             FROM trades
             WHERE status NOT IN ('rejected', 'error')
-              AND exited_at IS NOT NULL
+              AND (exited_at IS NOT NULL OR outcome IS NOT NULL)
             """
         ).fetchone()
         realized_cents = int(row[0]) if row else 0
@@ -452,6 +460,7 @@ class DryRunLedger:
             ), 0)
             FROM trades
             WHERE exited_at IS NULL
+              AND outcome IS NULL
               AND status NOT IN ('rejected', 'error')
             """
         ).fetchone()
@@ -732,7 +741,7 @@ class DryRunLedger:
                        score, kelly_fraction, p_estimate, outcome,
                        exited_at, exit_pnl_cents, exit_reason, source, note,
                        opportunity_kind, market_p_entry, yes_bid_entry, yes_ask_entry,
-                       peak_past
+                       peak_past, spread_id
                 FROM trades
                 WHERE mode = 'dry_run'
                 ORDER BY logged_at ASC
@@ -764,6 +773,7 @@ class DryRunLedger:
                 yes_bid_entry    = row[17],
                 yes_ask_entry    = row[18],
                 peak_past        = bool(row[19]) if row[19] is not None else False,
+                spread_id        = row[20] if len(row) > 20 else None,
             )
             for row in rows
         ]

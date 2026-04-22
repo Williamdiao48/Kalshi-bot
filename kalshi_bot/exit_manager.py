@@ -117,6 +117,14 @@ if TYPE_CHECKING:
 EXIT_PROFIT_TAKE: float = float(os.environ.get("EXIT_PROFIT_TAKE", "0.20"))
 EXIT_STOP_LOSS: float   = float(os.environ.get("EXIT_STOP_LOSS",   "0.70"))
 
+# Tight stop-loss for YES trades on KXLOWT (daily-low) markets backed by
+# observed sources (noaa_observed, metar).  Unlike KXHIGHT observed YES trades
+# (where a high above the strike is permanently locked in), a KXLOWT morning
+# running-minimum above the strike is not locked — temps can still fall due to
+# cold fronts.  A tight SL cuts losses quickly if the market moves against us.
+# Set to 0 to disable (falls back to source-specific EXIT_SOURCE_STOP_LOSS).
+KXLOWT_OBS_YES_STOP_LOSS: float = float(os.environ.get("KXLOWT_OBS_YES_STOP_LOSS", "0.20"))
+
 # Capital recycling: force-exit near-settled positions to free capital for new trades.
 # Sources eligible for recycling — observed-data sources only (high confidence).
 CAPITAL_RECYCLE_SOURCES: frozenset[str] = frozenset(
@@ -233,7 +241,8 @@ _pt_raw = os.environ.get(
     ' "noaa_day2:yes": 0.35, "noaa_day2_early:yes": 0.35,'
     ' "noaa": 0.40, "noaa_day2": 0.20, "polymarket": 0.25,'
     ' "obs_trajectory:yes": 0.30,'
-    ' "band_arb:yes": 0.15,'
+    ' "band_arb:yes": 0.15, "band_arb:no": 2.00,'
+    ' "forecast_no": 0.40, "numeric": 0.75,'
     ' "binance": 0.35, "coinbase": 0.35}',
 )
 _sl_raw = os.environ.get(
@@ -245,6 +254,7 @@ _sl_raw = os.environ.get(
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
     ' "band_arb": 0.95, "band_arb:yes": 0.70, "forecast_no": 0.90,'
+    ' "numeric": 0.70,'
     ' "binance": 0.25, "coinbase": 0.25}',
 )
 try:
@@ -325,6 +335,17 @@ EXIT_STOP_LOSS_NEARCLOSE_HOURS: float = float(
 # 0.0 = fully disabled (never stop out within the near-close window).
 EXIT_STOP_LOSS_LOCKED_NEARCLOSE: float = float(
     os.environ.get("EXIT_STOP_LOSS_LOCKED_NEARCLOSE", "0.0")
+)
+# Floor-price stop-loss suppression: if the current exit price (NO price for
+# NO positions, YES bid for YES positions) is at or below this many cents,
+# suppress the stop-loss entirely.  At 0-2¢ there is no further downside to
+# protect against — the position has already hit rock bottom and can only
+# recover toward 100¢ at settlement.  Stopping out locks in the full loss
+# with zero chance of recovery, which is strictly worse than holding.
+# Example: KXHIGHTATL-26APR19-T70 stopped at 0¢ for -$7.38 when METAR+NOAA
+# both confirmed the official high was above the strike.
+EXIT_STOP_LOSS_FLOOR_PRICE: int = int(
+    os.environ.get("EXIT_STOP_LOSS_FLOOR_PRICE", "2")
 )
 
 # Sources where intraday price moves are noise — hold to settlement, skip all exits.
@@ -487,14 +508,31 @@ class ExitManager:
         """Evaluate all open positions and execute exits where thresholds are met.
 
         Should be called every poll cycle with the already-enriched trade list
-        from DryRunLedger._enrich() so no extra API calls are needed.
+        from ``DryRunLedger._enrich()`` so no extra API calls are needed.
+
+        Trigger evaluation order (first match wins, rest are skipped):
+          1. Already settled or exited — skip entirely.
+          2. Minimum hold period (``EXIT_MIN_HOLD_MINUTES``) not elapsed — skip.
+          3. Near-close suppression — within ``EXIT_STOP_LOSS_NEARCLOSE_HOURS``
+             of market close, stop-loss is tightened to ``EXIT_STOP_LOSS_LOCKED_NEARCLOSE``
+             (near-zero, allowing the position to ride to settlement).
+          4. Floor-price suppression — if current exit price ≤ ``EXIT_STOP_LOSS_FLOOR_PRICE``¢,
+             stop-loss is disabled (position is at rock bottom; only upside remains).
+          5. Locked-signal suppression — if ``_is_locked_signal()`` returns True
+             (daily temperature peak confirmed past), stop-loss is suppressed.
+          6. Source-specific profit-take — ``EXIT_SOURCE_PROFIT_TAKE`` per-source overrides.
+          7. Profit-take — ``pct_gain >= EXIT_PROFIT_TAKE``.
+          8. Trailing stop — drawdown from peak > ``EXIT_TRAILING_DRAWDOWN``.
+          9. Stop-loss — ``pct_gain <= -EXIT_STOP_LOSS``.
 
         Args:
             session: Shared aiohttp session (used only for live sell orders).
-            trades:  Enriched _Trade objects — must have current_mid populated.
+            trades:  Enriched ``_Trade`` objects — must have ``current_mid`` populated.
+                     Typically the output of ``DryRunLedger._enrich()``.
 
         Returns:
-            List of ExitEvent for every exit triggered this cycle.
+            List of ``ExitEvent`` for every exit triggered this cycle.  An empty
+            list means no thresholds were breached.
         """
         # Load already-exited IDs to prevent double-firing.
         exited_ids: set[int] = {
@@ -550,6 +588,34 @@ class ExitManager:
             if getattr(trade, "opportunity_kind", "") == "numeric" and src in _HOLD_TO_SETTLEMENT_SOURCES:
                 continue
 
+            # Arb spread legs: never stop-loss, never trailing-stop.
+            # Arb trades are paired legs of a spread (arb_detector, bracket_arb,
+            # etc.) identified by a non-null spread_id.  Stopping out one leg
+            # breaks the hedge: the other leg continues open, converting a
+            # near-certain positive-EV spread into a one-sided loss.
+            # Trade #73: BTC arb YES leg stopped out at 24¢ during a 25-minute
+            # flash crash; BTC recovered to 93¢ two minutes later and settled YES.
+            # The full spread would have been +$3 net; instead it was -$11.
+            # Profit-take is still allowed (both legs landing in-the-money is fine).
+            _spread_id = getattr(trade, "spread_id", "") or ""
+            if _spread_id:
+                # Re-classify to profit-take only: skip stop_loss / trailing entirely.
+                # We still want to capture profit if the spread moves our way quickly.
+                # Only apply to opportunity kinds that represent spread legs.
+                _opp_kind = getattr(trade, "opportunity_kind", "") or ""
+                if _opp_kind in ("arb", "bracket_arb", "bracket_set", "spread", "crossed_book"):
+                    pnl = trade._unrealized_cents()
+                    pct = pnl / cost  # cost already validated > 0 above
+                    lp = getattr(trade, "limit_price", 100)
+                    side = getattr(trade, "side", "") or ""
+                    entry_cost = lp if side == "yes" else (100 - lp)
+                    pt_thresh = self._resolve_profit_take(src, side, entry_cost)
+                    if pct >= pt_thresh:
+                        event = await self._execute_exit(session, trade, pnl, "profit_take")
+                        events.append(event)
+                        exited_ids.add(trade.trade_id)
+                    continue  # skip stop_loss / trailing regardless
+
             pnl = trade._unrealized_cents()
             pct = pnl / cost
 
@@ -566,6 +632,19 @@ class ExitManager:
                 _sl_composite,
                 EXIT_SOURCE_STOP_LOSS.get(src, EXIT_STOP_LOSS),
             )
+
+            # Tighter stop-loss for KXLOWT YES trades from observed sources.
+            # A morning running-minimum above the strike does not lock in a YES
+            # outcome (unlike KXHIGHT) — cold fronts can push the daily low well
+            # below the strike later in the day.  Cut losses fast.
+            _ticker = getattr(trade, "ticker", "") or ""
+            if (
+                KXLOWT_OBS_YES_STOP_LOSS > 0
+                and "KXLOWT" in _ticker
+                and side == "yes"
+                and src in ("noaa_observed", "metar")
+            ):
+                stop_loss_thresh = KXLOWT_OBS_YES_STOP_LOSS
 
             # Compute hours to close from the trade's close_time (populated by
             # _enrich).  Used for the time-gated trailing stop below and for
@@ -607,6 +686,31 @@ class ExitManager:
                         EXIT_STOP_LOSS_LOCKED_NEARCLOSE * 100,
                     )
                 stop_loss_thresh = EXIT_STOP_LOSS_LOCKED_NEARCLOSE
+
+            # Floor-price stop-loss suppression: if the current exit price has
+            # already reached rock bottom (≤ EXIT_STOP_LOSS_FLOOR_PRICE cents),
+            # there is no further downside to protect against — the position
+            # can only recover toward 100¢ at settlement.  Stopping out here
+            # locks in the full loss with zero chance of recovery, which is
+            # strictly worse than holding.
+            # Example: KXHIGHTATL-26APR19-T70 stopped at 0¢ for -$7.38 when
+            # METAR+NOAA had both confirmed the high was above the strike.
+            _current_exit_price = getattr(trade, "current_mid", None)
+            if (
+                EXIT_STOP_LOSS_FLOOR_PRICE > 0
+                and _current_exit_price is not None
+                and _current_exit_price <= EXIT_STOP_LOSS_FLOOR_PRICE
+                and stop_loss_thresh > 0
+            ):
+                logging.debug(
+                    "[floor-SL] trade #%d %s %s: exit_price=%d¢ ≤ floor=%d¢"
+                    " — suppressing stop-loss (position at rock bottom,"
+                    " only upside remains at settlement)",
+                    trade.trade_id, side.upper(),
+                    getattr(trade, "ticker", "?"),
+                    _current_exit_price, EXIT_STOP_LOSS_FLOOR_PRICE,
+                )
+                stop_loss_thresh = 0.0
 
             # Locked signals (observed/advisory): hold to settlement, no profit-take.
             # Forecast YES signals: profit-take enabled (model-projected, not locked).

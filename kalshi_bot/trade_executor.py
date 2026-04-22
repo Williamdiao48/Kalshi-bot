@@ -101,6 +101,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from pathlib import Path
 
 import aiohttp
@@ -3129,8 +3130,10 @@ class TradeExecutor:
         For NO  trades: cost = 100 − limit_price cents (limit_price is the YES-
                         equivalent bid used to size the NO order).
 
-        Excludes rejected/error trades; includes dry_run, resting, and filled
-        trades that have not yet been exited (exited_at IS NULL).
+        Excludes rejected/error trades and any trade that has been closed —
+        either via early exit (exited_at IS NOT NULL) or Kalshi settlement
+        (outcome IS NOT NULL).  Settled trades without an exited_at would
+        otherwise phantom-block capital indefinitely.
         """
         row = self._conn.execute(
             """
@@ -3140,6 +3143,7 @@ class TradeExecutor:
             ), 0)
             FROM trades
             WHERE exited_at IS NULL
+              AND outcome IS NULL
               AND status NOT IN ('rejected', 'error')
             """
         ).fetchone()
