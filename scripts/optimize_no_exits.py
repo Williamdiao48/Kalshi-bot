@@ -47,6 +47,7 @@ def load_trades(
     kinds: list[str] | None,
     min_snaps: int,
     resolved_only: bool,
+    from_id: int | None = None,
 ) -> list[dict]:
     """Load NO trades with their snapshot trajectories."""
     where_clauses = ["t.side = 'no'"]
@@ -59,6 +60,10 @@ def load_trades(
 
     if resolved_only:
         where_clauses.append("t.outcome IS NOT NULL")
+
+    if from_id is not None:
+        where_clauses.append("t.id >= ?")
+        params.append(from_id)
 
     where_sql = " AND ".join(where_clauses)
 
@@ -330,7 +335,7 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"Loading NO trades (min_snaps={args.min_snaps}, "
           f"kinds={args.kinds or 'all'}, resolved_only={args.resolved_only})…")
-    trades = load_trades(db, args.kinds, args.min_snaps, args.resolved_only)
+    trades = load_trades(db, args.kinds, args.min_snaps, args.resolved_only, args.from_id)
     db.close()
 
     if not trades:
@@ -532,6 +537,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resolved-only", action="store_true",
         help="Only include trades with a known outcome (won/lost).",
+    )
+    parser.add_argument(
+        "--from-id", type=int, default=None, metavar="ID",
+        help="Only include trades with id >= ID (e.g. --from-id 58 to skip trades "
+             "without post-exit snapshot tracking).",
     )
     args = parser.parse_args()
     main(args)
