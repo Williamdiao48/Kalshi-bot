@@ -125,6 +125,36 @@ EXIT_STOP_LOSS: float   = float(os.environ.get("EXIT_STOP_LOSS",   "0.70"))
 # Set to 0 to disable (falls back to source-specific EXIT_SOURCE_STOP_LOSS).
 KXLOWT_OBS_YES_STOP_LOSS: float = float(os.environ.get("KXLOWT_OBS_YES_STOP_LOSS", "0.20"))
 
+# Dynamic stop widening for KXLOWT YES positions far from close.
+# KXLOWT markets are illiquid overnight (5–15¢ bid-ask spreads common from
+# midnight to 5 AM).  KXLOWT_OBS_YES_STOP_LOSS=0.20 fires on spread noise
+# at e.g. 21¢ on a 27¢ entry, stopping out correct signals before the morning
+# confirms.  When hours_remaining > KXLOWT_EARLY_STOP_HOURS, override the stop
+# to KXLOWT_EARLY_STOP_LOSS so the position can breathe through the illiquid
+# window.  The tight 0.20 threshold resumes once within KXLOWT_EARLY_STOP_HOURS.
+# Set to 0 to disable (always use normal threshold).
+KXLOWT_EARLY_STOP_LOSS: float = float(
+    os.environ.get("KXLOWT_EARLY_STOP_LOSS", "0.60")
+)
+KXLOWT_EARLY_STOP_HOURS: float = float(
+    os.environ.get("KXLOWT_EARLY_STOP_HOURS", "4.0")
+)
+
+# Dynamic stop widening for KXHIGHT NO positions far from close.
+# Default EXIT_STOP_LOSS=0.70 fires when YES_bid rises to ~85¢ on a 59¢ NO entry.
+# KXHIGHT NO entered 14h+ before close can see YES_bid spike to 80¢+ intraday on
+# thin books before collapsing to 0 at resolution (trade #12: YES_bid peaked 81¢,
+# resolved NO 10 min later).  When hours_remaining > KXHIGHT_EARLY_STOP_HOURS,
+# override the stop to KXHIGHT_EARLY_STOP_LOSS so the position survives intraday
+# noise.  The tighter 0.70 threshold resumes once within KXHIGHT_EARLY_STOP_HOURS.
+# Set to 0 to disable (always use EXIT_STOP_LOSS).
+KXHIGHT_EARLY_STOP_LOSS: float = float(
+    os.environ.get("KXHIGHT_EARLY_STOP_LOSS", "0.85")
+)
+KXHIGHT_EARLY_STOP_HOURS: float = float(
+    os.environ.get("KXHIGHT_EARLY_STOP_HOURS", "4.0")
+)
+
 # Capital recycling: force-exit near-settled positions to free capital for new trades.
 # Sources eligible for recycling — observed-data sources only (high confidence).
 CAPITAL_RECYCLE_SOURCES: frozenset[str] = frozenset(
@@ -134,6 +164,34 @@ CAPITAL_RECYCLE_SOURCES: frozenset[str] = frozenset(
 # Minimum current NO value (¢) to be eligible.  At 97¢ the YES bid is ≤ 3¢ —
 # the market has essentially priced in settlement.  Set to 0 to disable recycling.
 CAPITAL_RECYCLE_MIN_NO_VALUE: int = int(os.environ.get("CAPITAL_RECYCLE_MIN_NO_VALUE", "97"))
+
+# Contra-signal exit: if this many independent real-time sources all say NO on
+# a ticker where we hold a noaa_day2:yes between position, exit immediately.
+# Eligible sources: noaa_observed, metar, hrrr, open_meteo, nws_hourly.
+# CONTRA_SIGNAL_MIN_EDGE_F: each source must have at least this edge (°F) on
+# its NO signal to count (filters out marginal forecasts near the band edge).
+CONTRA_SIGNAL_MIN_SOURCES: int   = int(os.environ.get("CONTRA_SIGNAL_MIN_SOURCES", "2"))
+CONTRA_SIGNAL_MIN_EDGE_F:  float = float(os.environ.get("CONTRA_SIGNAL_MIN_EDGE_F",  "3.0"))
+
+# KXLOWT between YES contra-signal exit.
+# While holding a KXLOWT between YES position, if KXLOWT_CONTRA_MIN_SOURCES
+# independent forecast models update to predict fc_low < strike_lo (the daily
+# low will fall BELOW the band floor), exit immediately before the market
+# reprices.  Uses a much lower edge threshold than the global counter-signal
+# (which is calibrated for over/under markets with wide strike ranges) because
+# a 1°F-wide between band means even a 2°F shift below the floor is definitive.
+# Only real-time/forecast sources count (hrrr, nws_hourly, noaa, open_meteo,
+# weatherapi) — observed sources (metar, noaa_observed) would confirm YES.
+# Set KXLOWT_CONTRA_MIN_SOURCES=0 to disable.
+KXLOWT_CONTRA_MIN_EDGE_F: float = float(
+    os.environ.get("KXLOWT_CONTRA_MIN_EDGE_F", "2.0")
+)
+KXLOWT_CONTRA_MIN_SOURCES: int = int(
+    os.environ.get("KXLOWT_CONTRA_MIN_SOURCES", "2")
+)
+_KXLOWT_CONTRA_FORECAST_SOURCES: frozenset[str] = frozenset({
+    "hrrr", "nws_hourly", "noaa", "noaa_day1", "open_meteo", "weatherapi",
+})
 
 # Trailing stop: exit if the position has *ever* been up by at least this
 # fraction of cost, and has since drawn back by EXIT_TRAILING_DRAWDOWN below
@@ -163,7 +221,7 @@ _src_trailing_raw = os.environ.get(
     '{"noaa_day2": 0.00, "noaa_day2_early": 0.05,'
     ' "noaa_day2:yes": 0.12, "noaa_day2_early:yes": 0.12,'
     ' "noaa_day2:no": 0.10, "noaa_day2_early:no": 0.10,'
-    ' "noaa:no": 0.08, "owm:no": 0.08, "open_meteo:no": 0.08,'
+    ' "noaa:no": 0.08, "open_meteo:no": 0.08,'
     ' "noaa_observed:no": 0.30, "hrrr:no": 0.08,'
     ' "noaa": 0.00, "noaa_observed": 0.15, "polymarket": 0.00,'
     ' "binance": 0.20, "coinbase": 0.20}',
@@ -222,7 +280,7 @@ EXIT_PROFIT_TAKE_LONGSHOT_MULT: float = float(
 #                           ground truth; let the position run.
 # eia                0.40 — EIA is a public, already-priced-in signal; treat
 # eia_inventory      0.40   like a weak forecast (same tier as polymarket).
-# noaa / owm / open_meteo  0.50 — raw forecast: symmetric risk each way.
+# noaa / open_meteo  0.50 — raw forecast: symmetric risk each way.
 # polymarket / manifold    0.40 — text matches are noisier; cut losses fast.
 # noaa_day2:no  0.04 — day-ahead NWS forecast NO trades:
 #   The market is betting the temperature won't reach the strike.  These
@@ -248,12 +306,12 @@ _pt_raw = os.environ.get(
 _sl_raw = os.environ.get(
     "EXIT_SOURCE_STOP_LOSS",
     '{"noaa_observed:yes": 0.50, "metar:yes": 0.05, "nws_climo:yes": 0.05, "nws_alert:yes": 0.05,'
-    ' "noaa_observed": 0.70, "metar": 0.60, "noaa": 0.30, "owm": 0.50, "open_meteo": 0.50,'
+    ' "noaa_observed": 0.70, "metar": 0.60, "noaa": 0.30, "open_meteo": 0.50,'
     ' "polymarket": 0.20, "manifold": 0.40, "metaculus": 0.50, "eia": 0.50, "eia_inventory": 0.50,'
     ' "noaa_day2:yes": 0.45, "noaa_day2_early:yes": 0.45,'
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
-    ' "band_arb": 0.95, "band_arb:yes": 0.70, "forecast_no": 0.90,'
+    ' "band_arb:no": 0.70, "band_arb:yes": 0.70, "forecast_no": 0.90,'
     ' "numeric": 0.70,'
     ' "binance": 0.25, "coinbase": 0.25}',
 )
@@ -348,6 +406,18 @@ EXIT_STOP_LOSS_FLOOR_PRICE: int = int(
     os.environ.get("EXIT_STOP_LOSS_FLOOR_PRICE", "2")
 )
 
+# Absolute NO-price profit-take for band_arb:no positions.
+# band_arb:no trades buy NO when YES is priced above a physical ceiling (e.g. the
+# temperature strip can never reach the strike).  The ideal exit is when the market
+# fully corrects and YES drops near zero — but waiting for 100¢ risks a late reversal
+# that wipes the gain (see trades #87 and #95: peaked at 96–97¢ then reversed to loss).
+# When current_mid (= 100 − yes_ask for NO positions) reaches this threshold, exit
+# immediately regardless of the percentage gain.
+# Set to 0 to disable (falls back to the standard EXIT_SOURCE_PROFIT_TAKE logic).
+BAND_ARB_NO_EXIT_PRICE_CENTS: int = int(
+    os.environ.get("BAND_ARB_NO_EXIT_PRICE_CENTS", "95")
+)
+
 # Sources where intraday price moves are noise — hold to settlement, skip all exits.
 # EIA/BLS/Fed/crypto: single data-release resolution; thin books before release
 # don't reflect new information.
@@ -378,7 +448,7 @@ _LOCKED_STOP_LOSS_ONLY: frozenset[str] = frozenset({
 _FORECAST_PROFIT_TAKE_SOURCES: frozenset[str] = frozenset({
     "noaa", "noaa_day1", "noaa_day2",
     "nws_hourly", "hrrr",
-    "open_meteo", "weatherapi", "owm",
+    "open_meteo", "weatherapi",
     # obs_trajectory: projects likely peak from current METAR warming trend.
     # Enter YES when slope × parabolic model says peak > strike; profit-take
     # when the market catches up to the trajectory projection (~30% gain).
@@ -611,7 +681,8 @@ class ExitManager:
                     entry_cost = lp if side == "yes" else (100 - lp)
                     pt_thresh = self._resolve_profit_take(src, side, entry_cost)
                     if pct >= pt_thresh:
-                        event = await self._execute_exit(session, trade, pnl, "profit_take")
+                        _pt_d = self._profit_take_detail(src, side, entry_cost)
+                        event = await self._execute_exit(session, trade, pnl, "profit_take", _pt_d)
                         events.append(event)
                         exited_ids.add(trade.trade_id)
                     continue  # skip stop_loss / trailing regardless
@@ -632,6 +703,12 @@ class ExitManager:
                 _sl_composite,
                 EXIT_SOURCE_STOP_LOSS.get(src, EXIT_STOP_LOSS),
             )
+            # Track which gate last set the stop_loss_thresh for audit logging.
+            _sl_detail = (
+                "stop_loss:source"
+                if (_sl_composite in EXIT_SOURCE_STOP_LOSS or src in EXIT_SOURCE_STOP_LOSS)
+                else "stop_loss:global"
+            )
 
             # Tighter stop-loss for KXLOWT YES trades from observed sources.
             # A morning running-minimum above the strike does not lock in a YES
@@ -645,6 +722,7 @@ class ExitManager:
                 and src in ("noaa_observed", "metar")
             ):
                 stop_loss_thresh = KXLOWT_OBS_YES_STOP_LOSS
+                _sl_detail = "stop_loss:kxlowt_obs_yes"
 
             # Compute hours to close from the trade's close_time (populated by
             # _enrich).  Used for the time-gated trailing stop below and for
@@ -657,6 +735,53 @@ class ExitManager:
                     hours_to_close = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
                 except (ValueError, TypeError):
                     pass
+
+            # Dynamic stop widening for KXLOWT YES positions far from close.
+            # Overrides the tight KXLOWT_OBS_YES_STOP_LOSS upward during the
+            # illiquid overnight window; once inside KXLOWT_EARLY_STOP_HOURS
+            # of close, the tight threshold resumes naturally.
+            if (
+                KXLOWT_EARLY_STOP_LOSS > 0
+                and "KXLOWT" in _ticker
+                and side == "yes"
+                and hours_to_close is not None
+                and hours_to_close > KXLOWT_EARLY_STOP_HOURS
+            ):
+                if stop_loss_thresh < KXLOWT_EARLY_STOP_LOSS:
+                    logging.debug(
+                        "[KXLOWT-early-SL] trade #%d %s: %.1fh to close — "
+                        "SL %.0f%% → %.0f%% (overnight illiquid window)",
+                        trade.trade_id, _ticker,
+                        hours_to_close,
+                        stop_loss_thresh * 100,
+                        KXLOWT_EARLY_STOP_LOSS * 100,
+                    )
+                    stop_loss_thresh = KXLOWT_EARLY_STOP_LOSS
+                    _sl_detail = "stop_loss:kxlowt_early"
+
+            # Dynamic stop widening for KXHIGHT NO positions far from close.
+            # KXHIGHT NO trades entered 10–15h before resolution can see YES_bid
+            # spike intraday on thin books before collapsing to 0 at settlement.
+            # Trade #12 (Boston): YES_bid peaked 81¢ intraday, resolved 0¢ 10
+            # minutes later; the 70% default stop fired prematurely at ~85¢.
+            if (
+                KXHIGHT_EARLY_STOP_LOSS > 0
+                and "KXHIGH" in _ticker
+                and side == "no"
+                and hours_to_close is not None
+                and hours_to_close > KXHIGHT_EARLY_STOP_HOURS
+            ):
+                if stop_loss_thresh < KXHIGHT_EARLY_STOP_LOSS:
+                    logging.debug(
+                        "[KXHIGH-early-SL] trade #%d %s: %.1fh to close — "
+                        "SL %.0f%% → %.0f%% (intraday noise window)",
+                        trade.trade_id, _ticker,
+                        hours_to_close,
+                        stop_loss_thresh * 100,
+                        KXHIGHT_EARLY_STOP_LOSS * 100,
+                    )
+                    stop_loss_thresh = KXHIGHT_EARLY_STOP_LOSS
+                    _sl_detail = "stop_loss:kxhight_early"
 
             # Near-close locked-signal stop-loss suppression.
             # When the market is closing soon and the signal's underlying
@@ -686,6 +811,7 @@ class ExitManager:
                         EXIT_STOP_LOSS_LOCKED_NEARCLOSE * 100,
                     )
                 stop_loss_thresh = EXIT_STOP_LOSS_LOCKED_NEARCLOSE
+                _sl_detail = "stop_loss:locked_nearclose"
 
             # Floor-price stop-loss suppression: if the current exit price has
             # already reached rock bottom (≤ EXIT_STOP_LOSS_FLOOR_PRICE cents),
@@ -720,11 +846,53 @@ class ExitManager:
             suppress_profit_take = is_locked or is_forecast_no
 
             reason: str | None = None
-            if not suppress_profit_take and pct >= profit_take_thresh:
+            detail: str | None = None
+
+            # Absolute-price profit-take for band_arb:no.
+            # band_arb:no is normally held to settlement (suppress_profit_take=True),
+            # but a near-zero YES price means the arbitrage has fully corrected and
+            # further holding risks a reversal.  Exit when NO bid reaches the threshold.
+            if (
+                BAND_ARB_NO_EXIT_PRICE_CENTS > 0
+                and src == "band_arb"
+                and side == "no"
+                and _current_exit_price is not None
+                and _current_exit_price >= BAND_ARB_NO_EXIT_PRICE_CENTS
+            ):
+                logging.info(
+                    "[band_arb-PT] trade #%d %s: NO price %.0f¢ ≥ %d¢ threshold — profit_take",
+                    trade.trade_id, getattr(trade, "ticker", "?"),
+                    _current_exit_price, BAND_ARB_NO_EXIT_PRICE_CENTS,
+                )
                 reason = "profit_take"
-            elif stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
+                detail = "profit_take:band_arb_abs_price"
+
+            if reason is None and not suppress_profit_take and pct >= profit_take_thresh:
+                reason = "profit_take"
+                detail = self._profit_take_detail(src, side, entry_cost)
+            elif reason is None and stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
                 reason = "stop_loss"
-            elif not suppress_profit_take and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)):
+                detail = _sl_detail
+            elif reason is None and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)) and not ("KXLOWT" in _ticker and side == "yes"):
+                # Trailing stop is NOT gated by suppress_profit_take.
+                #
+                # suppress_profit_take blocks early profit-taking for locked
+                # observed sources (noaa_observed, metar) and forecast NO positions
+                # (noaa:no, noaa_day2:no) — correct, since those should hold toward
+                # settlement.  But that flag was also blocking trailing stops, which
+                # are a *different* mechanism: they protect against a peak gain that
+                # has decisively reversed, regardless of whether the signal is locked.
+                #
+                # Bug evidence: trade #10 (noaa_observed YES, KXLOWTCHI) peaked at
+                # +97% at 03:32 UTC then fell 23pp to +74% — the 15% trailing
+                # threshold should have fired at 03:35 UTC.  Instead the code skipped
+                # the trailing block entirely (suppress_profit_take=True for
+                # noaa_observed), and the position rode down to -20% via stop_loss.
+                #
+                # Similarly, EXIT_SOURCE_TRAILING_DRAWDOWN entries for noaa:no (0.08),
+                # noaa_day2:no (0.10), open_meteo:no (0.08) were all
+                # dead config — forecast NO positions (is_forecast_no=True →
+                # suppress_profit_take=True) never reached this block.
                 peak = self._get_peak_pct_gain(trade.trade_id)
                 if peak is not None and peak > 0:
                     # Resolve trailing drawdown threshold: source-specific
@@ -753,15 +921,17 @@ class ExitManager:
                     else:
                         drawdown_thresh = base_drawdown
                     if (
-                        peak > drawdown_thresh   # was ever meaningfully up
+                        drawdown_thresh > 0          # 0.0 = trailing disabled for this source
+                        and peak > drawdown_thresh   # was ever meaningfully up
                         and pct < peak - drawdown_thresh  # drawn back by threshold
                     ):
                         reason = "trailing_stop"
+                        detail = "trailing_stop"
 
             if reason is None:
                 continue
 
-            event = await self._execute_exit(session, trade, pnl, reason)
+            event = await self._execute_exit(session, trade, pnl, reason, detail)
             events.append(event)
             exited_ids.add(trade.trade_id)
 
@@ -882,13 +1052,65 @@ class ExitManager:
                         ", ".join(counter_sources),
                     )
                     event = await self._execute_exit(
-                        session, trade, pnl_cs, "counter_signal"
+                        session, trade, pnl_cs, "counter_signal", "counter_signal"
                     )
                     events.append(event)
                     exited_ids.add(trade.trade_id)
 
             if trade.trade_id in exited_ids:
                 continue  # already handled above
+
+            # ---- KXLOWT between YES contra-signal check ----------------------
+            # When 2+ forecast models update to predict fc_low < strike_lo
+            # (temperature will fall BELOW the band floor), exit before the
+            # market reprices.  Uses a tighter edge threshold than the global
+            # counter-signal because a 1°F-wide between band makes even a 2°F
+            # shift below the floor definitive.
+            if (
+                KXLOWT_CONTRA_MIN_SOURCES > 0
+                and "KXLOWT" in trade.ticker
+                and trade.side == "yes"
+                and profit_pct <= COUNTER_SIGNAL_MAX_PROFIT_PCT
+            ):
+                try:
+                    _note = json.loads(
+                        getattr(trade, "note", None) or "{}"
+                    )
+                    _is_between = _note.get("direction") == "between"
+                except (json.JSONDecodeError, TypeError):
+                    _is_between = False
+
+                if _is_between:
+                    _contra_sources: list[str] = []
+                    for opp in numeric_lookup.get(trade.ticker, []):
+                        if opp.source not in _KXLOWT_CONTRA_FORECAST_SOURCES:
+                            continue
+                        if opp.implied_outcome != "NO":
+                            continue
+                        if opp.edge < KXLOWT_CONTRA_MIN_EDGE_F:
+                            continue
+                        _contra_sources.append(opp.source)
+
+                    _contra_distinct = set(_contra_sources)
+                    if len(_contra_distinct) >= KXLOWT_CONTRA_MIN_SOURCES:
+                        logging.info(
+                            "[KXLOWT-CONTRA] trade #%d YES %s"
+                            " — %d forecast sources now predict NO"
+                            " (edge>=%.1f°F): %s",
+                            trade.trade_id, trade.ticker,
+                            len(_contra_distinct),
+                            KXLOWT_CONTRA_MIN_EDGE_F,
+                            ", ".join(sorted(_contra_distinct)),
+                        )
+                        _pnl_contra = trade._unrealized_cents()
+                        event = await self._execute_exit(
+                            session, trade, _pnl_contra, "data_contra", "data_contra"
+                        )
+                        events.append(event)
+                        exited_ids.add(trade.trade_id)
+
+            if trade.trade_id in exited_ids:
+                continue
 
             # ---- Poly counter-signal check -----------------------------------
             poly_opp = poly_lookup.get(trade.ticker)
@@ -912,7 +1134,7 @@ class ExitManager:
                 poly_opp.divergence * 100, COUNTER_SIGNAL_MIN_EDGE * 100,
             )
             event = await self._execute_exit(
-                session, trade, pnl, "counter_signal"
+                session, trade, pnl, "counter_signal", "counter_signal:poly"
             )
             events.append(event)
             exited_ids.add(trade.trade_id)
@@ -963,6 +1185,16 @@ class ExitManager:
             )
         return base
 
+    @staticmethod
+    def _profit_take_detail(src: str, side: str, entry_cost: int = 100) -> str:
+        """Return exit_reason_detail string for a profit-take exit."""
+        composite = f"{src}:{side}"
+        if composite in EXIT_SOURCE_PROFIT_TAKE or src in EXIT_SOURCE_PROFIT_TAKE:
+            return "profit_take:source"
+        if EXIT_PROFIT_TAKE_LONGSHOT_CENTS > 0 and entry_cost <= EXIT_PROFIT_TAKE_LONGSHOT_CENTS:
+            return "profit_take:longshot"
+        return "profit_take:global"
+
     def _get_peak_pct_gain(self, trade_id: int) -> float | None:
         """Return the highest pct_gain ever recorded for this trade in price_snapshots.
 
@@ -973,6 +1205,18 @@ class ExitManager:
             (trade_id,),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+    def _get_peak_at(self, trade_id: int) -> str | None:
+        """Return the snapshot_at timestamp when pct_gain was highest for this trade."""
+        row = self._conn.execute(
+            """
+            SELECT snapshot_at FROM price_snapshots
+            WHERE trade_id = ? AND post_exit = 0
+            ORDER BY pct_gain DESC LIMIT 1
+            """,
+            (trade_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     @staticmethod
     def _is_locked_signal(src: str, side: str, ticker: str, peak_past: bool = False) -> bool:
@@ -1010,11 +1254,73 @@ class ExitManager:
                 return True   # daily max already peaked — locked NO
         return False
 
+    async def check_contra_exits(
+        self,
+        session:      aiohttp.ClientSession,
+        trades:       "list[_Trade]",
+        numeric_opps: list,
+    ) -> list["ExitEvent"]:
+        """Exit noaa_day2:yes between positions when observational consensus flips to NO.
+
+        Called each poll cycle before check_exits().  For every open noaa_day2:yes trade
+        on a between market, count how many independent real-time sources (noaa_observed,
+        metar, hrrr, open_meteo, nws_hourly) currently predict NO with edge ≥
+        CONTRA_SIGNAL_MIN_EDGE_F.  If the count reaches CONTRA_SIGNAL_MIN_SOURCES,
+        force-exit immediately — the data that motivated entry has been contradicted.
+
+        This is intentionally asymmetric: entry required noaa_day2 + 1 corroborator;
+        exit requires 2 real-time contra sources.  A single dissenting model is noise.
+        """
+        _CONTRA_SOURCES: frozenset[str] = frozenset({
+            "noaa_observed", "metar", "hrrr", "open_meteo", "nws_hourly",
+        })
+        exited_ids: set[int] = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT id FROM trades WHERE exited_at IS NOT NULL"
+            ).fetchall()
+        }
+        events: list[ExitEvent] = []
+        for trade in trades:
+            if trade.settled or trade.current_mid is None:
+                continue
+            if trade.trade_id in exited_ids:
+                continue
+            if trade.source != "noaa_day2" or trade.side != "yes":
+                continue
+            # Only between markets (YES = high inside band).
+            try:
+                note = json.loads(trade.note) if trade.note else {}
+            except (ValueError, TypeError):
+                note = {}
+            if note.get("direction") != "between":
+                continue
+            ticker = trade.ticker
+            contra = [
+                o for o in numeric_opps
+                if getattr(o, "market_ticker", None) == ticker
+                and getattr(o, "implied_outcome", None) == "NO"
+                and getattr(o, "source", None) in _CONTRA_SOURCES
+                and getattr(o, "edge", 0.0) >= CONTRA_SIGNAL_MIN_EDGE_F
+            ]
+            contra_sources = {o.source for o in contra}
+            if len(contra_sources) >= CONTRA_SIGNAL_MIN_SOURCES:
+                logging.info(
+                    "Contra-signal exit: noaa_day2:yes %s — %d sources now predict NO"
+                    " (%s); exiting position.",
+                    ticker, len(contra_sources), ", ".join(sorted(contra_sources)),
+                )
+                ev = await self.force_exit(session, trade, reason="data_contra", detail="data_contra")
+                if ev is not None:
+                    events.append(ev)
+        return events
+
     async def force_exit(
         self,
         session: aiohttp.ClientSession,
         trade:   "_Trade",
         reason:  str = "capital_recycle",
+        detail:  str | None = None,
     ) -> "ExitEvent | None":
         """Force-exit a specific trade immediately, bypassing threshold checks.
 
@@ -1027,7 +1333,7 @@ class ExitManager:
         if getattr(trade, "current_mid", None) is None:
             return None
         pnl = trade._unrealized_cents()
-        return await self._execute_exit(session, trade, pnl, reason)
+        return await self._execute_exit(session, trade, pnl, reason, detail or reason)
 
     async def _execute_exit(
         self,
@@ -1035,6 +1341,7 @@ class ExitManager:
         trade:   "_Trade",
         pnl:     float,
         reason:  str,
+        detail:  str | None = None,
     ) -> ExitEvent:
         """Record the exit in the DB and (in live mode) place a sell order."""
         exit_price = int(trade.current_mid)
@@ -1062,17 +1369,31 @@ class ExitManager:
                 session, trade.ticker, trade.side, trade.count, exit_price
             )
 
+        peak_pct = self._get_peak_pct_gain(trade.trade_id)
+        peak_at  = self._get_peak_at(trade.trade_id)
+
         self._conn.execute(
             """
             UPDATE trades
-            SET exited_at        = ?,
-                exit_price_cents = ?,
-                exit_pnl_cents   = ?,
-                exit_reason      = ?,
-                exit_order_id    = ?
+            SET exited_at          = ?,
+                exit_price_cents   = ?,
+                exit_pnl_cents     = ?,
+                exit_reason        = ?,
+                exit_order_id      = ?,
+                exit_reason_detail = ?,
+                peak_pct_gain      = ?,
+                peak_at            = ?,
+                exit_yes_bid       = ?,
+                exit_yes_ask       = ?
             WHERE id = ?
             """,
-            (now, exit_price, pnl, reason, order_id, trade.trade_id),
+            (
+                now, exit_price, pnl, reason, order_id,
+                detail, peak_pct, peak_at,
+                getattr(trade, "yes_bid", None),
+                getattr(trade, "yes_ask", None),
+                trade.trade_id,
+            ),
         )
 
         return ExitEvent(

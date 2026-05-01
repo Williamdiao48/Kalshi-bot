@@ -98,6 +98,8 @@ import logging
 import math
 import os
 import sqlite3
+
+from .db import open_db
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -267,16 +269,52 @@ DRAWDOWN_LOOKBACK_TRADES: int = int(os.environ.get("DRAWDOWN_LOOKBACK_TRADES", "
 # trade 229 (first midnight ghost band-arb) onward.
 # 0 = disabled (use all trades within DRAWDOWN_LOOKBACK_TRADES).
 DRAWDOWN_IGNORE_BEFORE_ID: int = int(os.environ.get("DRAWDOWN_IGNORE_BEFORE_ID", "0"))
+# Rolling time window for drawdown calculation.  Only trades exited within the
+# last N hours feed into the per-category equity curve.  Losses older than
+# this window are not held against current sizing.
+# Default 48 h.  Set to 0 to disable the window (use all history within
+# DRAWDOWN_LOOKBACK_TRADES).
+DRAWDOWN_WINDOW_HOURS: int = int(os.environ.get("DRAWDOWN_WINDOW_HOURS", "48"))
 
-# Module-level drawdown factor, updated each cycle by main.py via
-# set_drawdown_factor().  Applied to pos_max_cents in all trade paths.
+# Module-level drawdown factors, updated each cycle by main.py via
+# set_drawdown_factors().  Per-category dict for numeric trades; _dd_factor
+# is the "other" bucket used by non-numeric paths (band_arb, text, etc.).
 _dd_factor: float = 1.0
+_dd_factors: dict[str, float] = {}
+
+
+def _metric_to_dd_category(metric: str) -> str:
+    """Map a DataPoint metric to a drawdown bucket (mirrors dry_run_ledger)."""
+    if metric.startswith("temp_high_"):
+        return "temp_high"
+    if metric.startswith("temp_low_"):
+        return "temp_low"
+    if metric.startswith("price_"):
+        return "crypto"
+    if metric.startswith("rate_"):
+        return "forex"
+    return "other"
+
+
+def _get_dd_factor(metric: str) -> float:
+    """Return the drawdown sizing factor for the given metric category."""
+    cat = _metric_to_dd_category(metric)
+    return _dd_factors.get(cat, _dd_factor)
+
+
+def set_drawdown_factors(factors: dict[str, float]) -> None:
+    """Update per-category drawdown sizing factors.  Called once per poll cycle."""
+    global _dd_factor, _dd_factors
+    _dd_factors = {k: max(DRAWDOWN_MIN_FACTOR, min(1.0, v)) for k, v in factors.items()}
+    # _dd_factor = "other" bucket for non-numeric paths
+    _dd_factor = _dd_factors.get("other", max(_dd_factors.values()) if _dd_factors else 1.0)
 
 
 def set_drawdown_factor(factor: float) -> None:
-    """Update the global drawdown sizing factor.  Called once per poll cycle."""
-    global _dd_factor
+    """Legacy single-factor interface.  Prefer set_drawdown_factors()."""
+    global _dd_factor, _dd_factors
     _dd_factor = max(DRAWDOWN_MIN_FACTOR, min(1.0, factor))
+    _dd_factors = {}  # clear per-category; _get_dd_factor falls back to _dd_factor
 
 
 # Fractional Kelly multiplier.  1.0 = full Kelly (aggressive).
@@ -422,7 +460,7 @@ ADVERSE_PEAK_SOURCES: frozenset[str] = frozenset(
     s.strip()
     for s in os.environ.get(
         "ADVERSE_PEAK_SOURCES",
-        "hrrr,noaa,owm,open_meteo,nws_hourly,weatherapi",
+        "hrrr,noaa,open_meteo,nws_hourly,weatherapi",
     ).split(",")
     if s.strip()
 )
@@ -770,16 +808,21 @@ def _implied_p_yes(opp: NumericOpportunity) -> float | None:
                 1.0,
             )
             sigma = scale / 2.0
+        # NWS resolves to the nearest integer, so the effective YES band is
+        # ±0.5°F wider than the nominal strike boundaries for temperature markets.
+        _buf = 0.5 if opp.metric.startswith("temp_") else 0.0
+        _eff_lo = opp.strike_lo - _buf
+        _eff_hi = opp.strike_hi + _buf
         if getattr(opp, "peak_past", False):
             # After 4:30 PM local the daily max is locked — temperature cannot
             # rise above strike_hi.  Drop the upper tail and use a one-sided
             # CDF: only lower-boundary risk (observed drifting below strike_lo
             # before official CLI reading) remains.
-            p_in_range = 1.0 - _normal_cdf((opp.strike_lo - opp.data_value) / sigma)
+            p_in_range = 1.0 - _normal_cdf((_eff_lo - opp.data_value) / sigma)
         else:
             p_in_range = (
-                _normal_cdf((opp.strike_hi - opp.data_value) / sigma)
-                - _normal_cdf((opp.strike_lo - opp.data_value) / sigma)
+                _normal_cdf((_eff_hi - opp.data_value) / sigma)
+                - _normal_cdf((_eff_lo - opp.data_value) / sigma)
             )
         return max(0.0, min(1.0, p_in_range))
 
@@ -978,12 +1021,7 @@ class TradeExecutor:
     def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
         self._dry_run = TRADE_DRY_RUN
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,   # autocommit
-        )
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = open_db(self._db_path)
         self._init_schema()
         self.stats = FilterStats()
         self._ledger: "Any | None" = None  # DryRunLedger, set via set_ledger()
@@ -1504,7 +1542,10 @@ class TradeExecutor:
         pos_max_cents  = LOCKED_OBS_MAX_POSITION_CENTS if _is_locked_obs else MAX_POSITION_CENTS
         pos_kelly      = LOCKED_OBS_KELLY_FRACTION     if _is_locked_obs else effective_kelly
         pos_hard_cap   = LOCKED_OBS_MAX_CONTRACTS      if _is_locked_obs else TRADE_MAX_CONTRACTS
-        pos_max_cents  = max(1, int(pos_max_cents * _dd_factor))
+        # Use per-category drawdown factor: a bad day on Boston temps should not
+        # suppress Dallas or crypto sizing.
+        _cat_dd_factor = _get_dd_factor(opp.metric)
+        pos_max_cents  = max(1, int(pos_max_cents * _cat_dd_factor))
 
         count = kelly_contracts(
             win_prob=win_prob,
@@ -1725,6 +1766,30 @@ class TradeExecutor:
             "All filters passed — executing: %s %s %d×%d¢  p=%.3f  score=%.2f  src=%s",
             opp.market_ticker, side.upper(), count, limit_price, p, score, opp.source,
         )
+
+        # Build signal snapshot note for future analysis
+        _num_note: dict = {
+            "data_value":      opp.data_value,
+            "edge":            round(opp.edge, 2),
+            "direction":       opp.direction,
+            "implied_outcome": opp.implied_outcome,
+        }
+        if opp.strike is not None:
+            _num_note["strike"] = opp.strike
+        if opp.strike_lo is not None:
+            _num_note["strike_lo"] = opp.strike_lo
+        if opp.strike_hi is not None:
+            _num_note["strike_hi"] = opp.strike_hi
+        if opp.hours_to_close is not None:
+            _num_note["hours_to_close"] = round(opp.hours_to_close, 1)
+        if opp.cross_exchange_divergence is not None:
+            _num_note["cross_exchange_div"] = round(opp.cross_exchange_divergence, 4)
+        # Carry through any source-specific metadata (e.g. ensemble_spread from HRRR)
+        if opp.metadata:
+            _num_note["metadata"] = opp.metadata
+        if opp.consensus_meta is not None:
+            _num_note["consensus"] = opp.consensus_meta
+
         self.stats.trades_attempted += 1
         await self._execute(
             session=session,
@@ -1742,6 +1807,7 @@ class TradeExecutor:
             signal_p_yes=implied_p,  # raw CDF model output, before noaa floor / fedwatch override
             corroborating_sources=opp.corroborating_sources or None,
             peak_past=getattr(opp, "peak_past", False),
+            note=json.dumps(_num_note),
         )
 
     async def maybe_trade_poly_opportunity(
@@ -2148,6 +2214,14 @@ class TradeExecutor:
         arb_id = str(uuid.uuid4())
         self.stats.trades_attempted += 1
 
+        _arb_note = json.dumps({
+            "guaranteed_profit_cents": arb.guaranteed_profit_cents,
+            "direction":               arb.direction,
+            "strike_lo":               arb.strike_lo,
+            "strike_hi":               arb.strike_hi,
+            "spread_id":               arb_id,
+        })
+
         await self._execute(
             session=session,
             ticker=arb.ticker_lo,
@@ -2159,6 +2233,7 @@ class TradeExecutor:
             p_estimate=1.0,
             source="arb_detector",
             spread_id=arb_id,
+            note=_arb_note,
         )
         await self._execute(
             session=session,
@@ -2171,6 +2246,7 @@ class TradeExecutor:
             p_estimate=1.0,
             source="arb_detector",
             spread_id=arb_id,
+            note=_arb_note,
         )
 
     async def execute_crossed_book(
@@ -2472,6 +2548,27 @@ class TradeExecutor:
                         freed, signal.ticker,
                     )
 
+        # Build corroborating sources list for this signal
+        _band_corr: list[str] = ["metar"]
+        if signal.corr_status in ("metar_noaa_corroborated", "metar_noaa_lagging"):
+            _band_corr.append("noaa_observed")
+        if signal.nws_climo_val is not None:
+            _band_corr.append("nws_climo")
+
+        # Encode signal snapshot as JSON note for future analysis
+        _note_data: dict = {
+            "observed_f":    round(signal.observed_max, 1),
+            "band_ceil_f":   round(signal.band_ceil,   1),
+            "margin_f":      round(signal.observed_max - signal.band_ceil, 2),
+            "corr_status":   signal.corr_status,
+        }
+        if signal.noaa_val is not None:
+            _note_data["noaa_val_f"] = round(signal.noaa_val, 1)
+        if signal.hrrr_val is not None:
+            _note_data["hrrr_val_f"] = round(signal.hrrr_val, 1)
+        if signal.nws_climo_val is not None:
+            _note_data["nws_climo_val_f"] = round(signal.nws_climo_val, 1)
+
         self.stats.trades_attempted += 1
         await self._execute(
             session=session,
@@ -2484,6 +2581,10 @@ class TradeExecutor:
             p_estimate=p_win,
             source="band_arb",
             kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
+            yes_bid=signal.yes_bid,
+            yes_ask=signal.yes_ask_entry or None,
+            corroborating_sources=_band_corr,
+            note=json.dumps(_note_data),
         )
 
     async def _maybe_trade_band_arb_yes(
@@ -2611,6 +2712,29 @@ class TradeExecutor:
             count, signal.yes_ask, p_win,
             "locked" if signal.is_locked else "pre-lock",
         )
+
+        # Corroborating sources: YES always requires NOAA (enforced upstream)
+        _yes_corr: list[str] = ["metar", "noaa_observed"]
+        if signal.nws_climo_val is not None:
+            _yes_corr.append("nws_climo")
+
+        # Signal snapshot note
+        _yes_note: dict = {
+            "observed_f":  round(signal.observed_max, 1),
+            "band_lo_f":   round(signal.strike_lo,    1),
+            "band_ceil_f": round(signal.band_ceil,    1),
+            "margin_lo_f": round(signal.observed_max - signal.strike_lo, 2),
+            "margin_hi_f": round(signal.band_ceil - signal.observed_max, 2),
+            "is_locked":   signal.is_locked,
+            "corr_status": signal.corr_status,
+        }
+        if signal.noaa_val is not None:
+            _yes_note["noaa_val_f"] = round(signal.noaa_val, 1)
+        if signal.hrrr_val is not None:
+            _yes_note["hrrr_val_f"] = round(signal.hrrr_val, 1)
+        if signal.nws_climo_val is not None:
+            _yes_note["nws_climo_val_f"] = round(signal.nws_climo_val, 1)
+
         await self._execute(
             session=session,
             ticker=signal.ticker,
@@ -2625,6 +2749,8 @@ class TradeExecutor:
             yes_bid=signal.yes_bid,
             yes_ask=signal.yes_ask,
             peak_past=signal.is_locked,
+            corroborating_sources=_yes_corr,
+            note=json.dumps(_yes_note),
         )
 
     async def maybe_trade_forecast_no(
@@ -2729,6 +2855,18 @@ class TradeExecutor:
                     self.stats.filtered_exposure += 1
                     return
 
+        # Build note JSON for future analysis
+        _fno_note: dict = {
+            "min_edge_f":    round(signal.min_edge_f, 1),
+            "max_edge_f":    round(max(e for _, _v, e in signal.source_details), 1) if signal.source_details else None,
+            "source_count":  signal.source_count,
+            "sources_detail": [[s, round(v, 1), round(e, 1)] for s, v, e in signal.source_details],
+        }
+        if signal.model_spread_f is not None:
+            _fno_note["model_spread_f"] = signal.model_spread_f
+        if signal.hours_to_close is not None:
+            _fno_note["hours_to_close"] = round(signal.hours_to_close, 1)
+
         self.stats.trades_attempted += 1
         await self._execute(
             session=session,
@@ -2741,6 +2879,10 @@ class TradeExecutor:
             p_estimate=signal.p_estimate,
             source="forecast_no",
             kelly_fraction=KELLY_FRACTION,
+            yes_bid=signal.yes_bid,
+            yes_ask=signal.yes_ask or None,
+            corroborating_sources=signal.sources,
+            note=json.dumps(_fno_note),
         )
 
     # -----------------------------------------------------------------------
@@ -3325,6 +3467,7 @@ class TradeExecutor:
         signal_p_yes: float | None = None,
         corroborating_sources: list[str] | None = None,
         peak_past: bool = False,
+        note: str | None = None,
     ) -> None:
         """Place the order (or log it in dry-run mode) and persist to SQLite."""
         mode = "dry_run" if self._dry_run else "live"
@@ -3365,15 +3508,15 @@ class TradeExecutor:
                 opportunity_kind, score, kelly_fraction, p_estimate,
                 status, order_id, error_msg, source, spread_id,
                 market_p_entry, yes_bid_entry, yes_ask_entry, signal_p_yes,
-                corroborating_sources, peak_past
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                corroborating_sources, peak_past, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 logged_at, mode, ticker, side, count, limit_price,
                 opportunity_kind, score, _logged_kelly, p_estimate,
                 status, order_id, error_msg, source or None, spread_id,
                 market_p_entry, yes_bid, yes_ask, signal_p_yes,
-                corroboration_str, 1 if peak_past else 0,
+                corroboration_str, 1 if peak_past else 0, note,
             ),
         )
 

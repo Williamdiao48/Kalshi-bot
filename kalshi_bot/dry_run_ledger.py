@@ -71,6 +71,8 @@ import logging
 import math
 import os
 import sqlite3
+
+from .db import open_db
 import statistics
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,6 +101,7 @@ from .trade_executor import (
     DRAWDOWN_ENABLED,
     DRAWDOWN_LOOKBACK_TRADES,
     DRAWDOWN_IGNORE_BEFORE_ID,
+    DRAWDOWN_WINDOW_HOURS,
 )
 
 
@@ -306,12 +309,7 @@ class DryRunLedger:
         self._db_path = Path(db_path)
         self._overview_path = Path(overview_path)
         self._starting_capital = starting_capital_cents
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = open_db(self._db_path)
         self._conn.execute(_CREATE_SNAPSHOTS_SQL)
         self._conn.execute(_CREATE_SNAPSHOTS_IDX_SQL)
         self._migrate_snapshots()
@@ -381,6 +379,13 @@ class DryRunLedger:
         try:
             await self._enrich(session, trades)
             await self._exit_manager.check_exits(session, trades)
+
+            # Contra-signal exit: check noaa_day2:yes between positions before
+            # the general counter-signal sweep, using a targeted source filter.
+            if numeric_opps is not None:
+                await self._exit_manager.check_contra_exits(
+                    session, trades, numeric_opps,
+                )
 
             if numeric_opps is not None or poly_opps is not None:
                 await self._exit_manager.check_counter_signals(
@@ -566,16 +571,75 @@ class DryRunLedger:
             "profit_factor": pf,
         }
 
-    def current_drawdown_factor(self) -> float:
-        """Return a position-size multiplier in [DRAWDOWN_MIN_FACTOR, 1.0].
+    # ------------------------------------------------------------------
+    # Per-category drawdown helpers
+    # ------------------------------------------------------------------
 
-        Reads resolved trades from the DB, builds the equity curve, and maps
-        the current drawdown linearly to a sizing factor.  Returns 1.0 (no
-        scaling) when drawdown scaling is disabled or fewer than 5 resolved
-        trades exist.
+    @staticmethod
+    def _ticker_to_dd_category(ticker: str) -> str:
+        """Map a Kalshi ticker to a drawdown bucket.
+
+        Buckets are broad enough to have meaningful sample sizes, yet
+        independent enough that a localised data failure in one bucket does
+        not penalise unrelated strategies.
+
+          temp_high — KXHIGHT* daily-high temperature markets
+          temp_low  — KXLOWT*  daily-low  temperature markets
+          crypto    — KXBTC*, KXETH*, KXSOL* intraday / daily crypto
+          forex     — KXUSDJPY*, KXEURUSD*, KXGBPUSD* intraday forex
+          other     — everything else (economics, politics, etc.)
         """
-        if not DRAWDOWN_ENABLED:
+        t = ticker.upper()
+        if t.startswith(("KXHIGHT", "KXHIGH")):
+            return "temp_high"
+        if t.startswith("KXLOWT"):
+            return "temp_low"
+        if t.startswith(("KXBTC", "KXETH", "KXSOL")):
+            return "crypto"
+        if t.startswith(("KXUSDJPY", "KXEURUSD", "KXGBPUSD")):
+            return "forex"
+        return "other"
+
+    def _dd_factor_from_pnl(self, pnl_series: list[float], category: str) -> float:
+        """Compute a drawdown sizing factor from a chronological PnL series."""
+        if len(pnl_series) < 3:
             return 1.0
+        equity = float(self._starting_capital)
+        peak   = equity
+        for pnl in pnl_series:
+            equity += pnl
+            peak    = max(peak, equity)
+        if peak <= 0:
+            return DRAWDOWN_MIN_FACTOR
+        current_dd = max(0.0, (peak - equity) / peak)
+        if current_dd <= 0:
+            return 1.0
+        t      = min(1.0, current_dd / DRAWDOWN_FULL_REDUCE_PCT)
+        factor = 1.0 - t * (1.0 - DRAWDOWN_MIN_FACTOR)
+        factor = max(DRAWDOWN_MIN_FACTOR, factor)
+        logging.info(
+            "Drawdown [%s]: %.1f%% below peak → sizing at %.0f%% of normal",
+            category, current_dd * 100, factor * 100,
+        )
+        return factor
+
+    def current_drawdown_factors(self) -> dict[str, float]:
+        """Return per-category position-size multipliers in [DRAWDOWN_MIN_FACTOR, 1.0].
+
+        Categories: temp_high | temp_low | crypto | forex | other.
+
+        Trades marked bug_loss=1 are excluded from the equity curve so that
+        known-buggy losses do not suppress sizing on unrelated strategies.
+
+        Returns a dict with all five categories always present.  Returns all
+        1.0s when drawdown scaling is disabled.
+        """
+        _ALL_CATEGORIES = ("temp_high", "temp_low", "crypto", "forex", "other")
+        default = {cat: 1.0 for cat in _ALL_CATEGORIES}
+
+        if not DRAWDOWN_ENABLED:
+            return default
+
         try:
             limit_clause = (
                 f"LIMIT {DRAWDOWN_LOOKBACK_TRADES}" if DRAWDOWN_LOOKBACK_TRADES > 0 else ""
@@ -583,28 +647,31 @@ class DryRunLedger:
             id_clause = (
                 f"AND id >= {DRAWDOWN_IGNORE_BEFORE_ID}" if DRAWDOWN_IGNORE_BEFORE_ID > 0 else ""
             )
+            window_clause = (
+                f"AND exited_at >= datetime('now', '-{DRAWDOWN_WINDOW_HOURS} hours')"
+                if DRAWDOWN_WINDOW_HOURS > 0 else ""
+            )
             rows = self._conn.execute(
                 f"""
-                SELECT exit_pnl_cents, outcome, side, count, limit_price
+                SELECT ticker, exit_pnl_cents, outcome, side, count, limit_price
                 FROM trades
                 WHERE mode = 'dry_run'
                   AND (outcome IN ('won', 'lost') OR exited_at IS NOT NULL)
                   AND outcome IS NOT 'void'
+                  AND COALESCE(bug_loss, 0) = 0
                   {id_clause}
+                  {window_clause}
                 ORDER BY logged_at DESC
                 {limit_clause}
                 """
             ).fetchall()
-            rows = list(reversed(rows))  # restore chronological order
+            rows = list(reversed(rows))  # chronological order
         except Exception:
-            return 1.0
+            return default
 
-        if len(rows) < 5:
-            return 1.0
-
-        equity = float(self._starting_capital)
-        peak   = equity
-        for exit_pnl, outcome, side, count, limit_price in rows:
+        # Bucket PnL series by category
+        buckets: dict[str, list[float]] = {cat: [] for cat in _ALL_CATEGORIES}
+        for ticker, exit_pnl, outcome, side, count, limit_price in rows:
             if exit_pnl is not None:
                 pnl = float(exit_pnl)
             elif outcome == "won":
@@ -613,25 +680,18 @@ class DryRunLedger:
                 pnl = float(-limit_price * count if side == "yes" else -(100 - limit_price) * count)
             else:
                 continue
-            equity += pnl
-            peak    = max(peak, equity)
+            cat = self._ticker_to_dd_category(ticker or "")
+            buckets[cat].append(pnl)
 
-        if peak <= 0:
-            return DRAWDOWN_MIN_FACTOR
+        return {
+            cat: self._dd_factor_from_pnl(pnl_list, cat)
+            for cat, pnl_list in buckets.items()
+        }
 
-        current_dd = max(0.0, (peak - equity) / peak)
-        if current_dd <= 0:
-            return 1.0
-
-        # Linear: 0% drawdown → 1.0, DRAWDOWN_FULL_REDUCE_PCT → DRAWDOWN_MIN_FACTOR
-        t      = min(1.0, current_dd / DRAWDOWN_FULL_REDUCE_PCT)
-        factor = 1.0 - t * (1.0 - DRAWDOWN_MIN_FACTOR)
-        factor = max(DRAWDOWN_MIN_FACTOR, factor)
-        logging.info(
-            "Drawdown scaling: equity %.1f%% below peak → sizing at %.0f%% of normal",
-            current_dd * 100, factor * 100,
-        )
-        return factor
+    def current_drawdown_factor(self) -> float:
+        """Legacy single-factor interface — returns the minimum across all categories."""
+        factors = self.current_drawdown_factors()
+        return min(factors.values()) if factors else 1.0
 
     def source_performance_summary(self, n_recent: int = 20) -> dict[str, dict]:
         """Return per-source performance stats over the last n_recent resolved trades.
