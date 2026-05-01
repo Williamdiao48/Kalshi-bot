@@ -17,6 +17,8 @@ __pycache__/
 
 # Logs and runtime output
 bot.log
+logs/
+archives/
 dry_run_overview.txt
 dry_run_overview_archive*.txt
 pnl_attribution.txt
@@ -43,3 +45,5 @@ ROADMAP.md
 rules.md
 ARCHITECTURE.md
 CONTRIBUTING.md
+INTERNALS.md
+findings.md
