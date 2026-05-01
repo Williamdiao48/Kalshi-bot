@@ -34,38 +34,32 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
-# ---------------------------------------------------------------------------
-# Inline city / station config (mirrors kalshi_bot/news/noaa.py / metar.py)
-# ---------------------------------------------------------------------------
+import os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from kalshi_bot.news.noaa import CITIES
 
-_ET  = ZoneInfo("America/New_York")
-_CT  = ZoneInfo("America/Chicago")
-_MT  = ZoneInfo("America/Denver")
-_PT  = ZoneInfo("America/Los_Angeles")
-_PHX = ZoneInfo("America/Phoenix")
-
-# metric → (city_name, lat, lon, timezone, ICAO_station)
-CITIES: dict[str, tuple[str, float, float, ZoneInfo, str]] = {
-    "temp_high_lax": ("Los Angeles",      33.9425, -118.4081, _PT,  "KLAX"),
-    "temp_high_den": ("Denver",           39.8561, -104.6737, _MT,  "KDEN"),
-    "temp_high_chi": ("Chicago",          41.7868,  -87.7522, _CT,  "KMDW"),
-    "temp_high_ny":  ("New York",         40.7789,  -73.9692, _ET,  "KNYC"),
-    "temp_high_mia": ("Miami",            25.7959,  -80.2870, _ET,  "KMIA"),
-    "temp_high_aus": ("Austin",           30.1975,  -97.6664, _CT,  "KAUS"),
-    "temp_high_bos": ("Boston",           42.3643,  -71.0052, _ET,  "KBOS"),
-    "temp_high_hou": ("Houston",          29.6454,  -95.2789, _CT,  "KHOU"),
-    "temp_high_dfw": ("Dallas/Fort Worth",32.8998,  -97.0403, _CT,  "KDFW"),
-    "temp_high_sfo": ("San Francisco",    37.6190, -122.3750, _PT,  "KSFO"),
-    "temp_high_sea": ("Seattle",          47.4502, -122.3088, _PT,  "KSEA"),
-    "temp_high_phx": ("Phoenix",          33.4373, -112.0078, _PHX, "KPHX"),
-    "temp_high_phl": ("Philadelphia",     39.8729,  -75.2437, _ET,  "KPHL"),
-    "temp_high_atl": ("Atlanta",          33.6407,  -84.4277, _ET,  "KATL"),
-    "temp_high_msp": ("Minneapolis",      44.8848,  -93.2223, _CT,  "KMSP"),
-    "temp_high_dca": ("Washington DC",    38.8512,  -77.0402, _ET,  "KDCA"),
-    "temp_high_las": ("Las Vegas",        36.0840, -115.1537, _PT,  "KLAS"),
-    "temp_high_okc": ("Oklahoma City",    35.3931,  -97.6007, _CT,  "KOKC"),
-    "temp_high_sat": ("San Antonio",      29.5337,  -98.4698, _CT,  "KSAT"),
-    "temp_high_msy": ("New Orleans",      29.9934,  -90.2580, _CT,  "KMSY"),
+# ICAO weather station IDs for METAR fetching (index 4 in the old local CITIES dict).
+CITY_STATION: dict[str, str] = {
+    "temp_high_lax": "KLAX",
+    "temp_high_den": "KDEN",
+    "temp_high_chi": "KMDW",
+    "temp_high_ny":  "KNYC",
+    "temp_high_mia": "KMIA",
+    "temp_high_aus": "KAUS",
+    "temp_high_bos": "KBOS",
+    "temp_high_hou": "KHOU",
+    "temp_high_dfw": "KDFW",
+    "temp_high_sfo": "KSFO",
+    "temp_high_sea": "KSEA",
+    "temp_high_phx": "KPHX",
+    "temp_high_phl": "KPHL",
+    "temp_high_atl": "KATL",
+    "temp_high_msp": "KMSP",
+    "temp_high_dca": "KDCA",
+    "temp_high_las": "KLAS",
+    "temp_high_okc": "KOKC",
+    "temp_high_sat": "KSAT",
+    "temp_high_msy": "KMSY",
 }
 
 # Per-city diurnal parameters (used by the trajectory model)
@@ -311,7 +305,7 @@ async def run_backtest(
             print(f"Unknown city filter: {city_filter}. Use one of: {', '.join(k.replace('temp_high_', '') for k in CITIES)}")
             return
 
-    station_ids = [CITIES[m][4] for m in metrics]
+    station_ids = [CITY_STATION[m] for m in metrics if m in CITY_STATION]
 
     print(f"\nFetching {hours_to_fetch}h of METAR observations for {len(metrics)} cities...")
     async with aiohttp.ClientSession() as session:
@@ -322,7 +316,7 @@ async def run_backtest(
         return
 
     # Map station → metric
-    station_to_metric = {CITIES[m][4]: m for m in metrics}
+    station_to_metric = {CITY_STATION[m]: m for m in metrics if m in CITY_STATION}
 
     # Aggregate results
     # Structure: metric → list of result dicts
@@ -334,7 +328,7 @@ async def run_backtest(
         if metric is None:
             continue
 
-        city_name, _, _, city_tz, _ = CITIES[metric]
+        city_name, _, _, city_tz = CITIES[metric]
         dawn_hour, peak_hour = DIURNAL_PARAMS.get(metric, (6, 16))
 
         # Split series into per-day buckets (local date)
