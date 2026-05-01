@@ -61,6 +61,7 @@ execute a trade without a live orderbook.
 from __future__ import annotations
 
 import math
+import os
 
 from .matcher import Opportunity
 from .numeric_matcher import NumericOpportunity
@@ -200,7 +201,6 @@ _SOURCE_SCORES: dict[str, float] = {
     "open_meteo":        0.70,   # Open-Meteo standard forecast (deterministic)
     "yahoo_finance":     0.85,   # official index level, ~1–3 min delay
     "yahoo_finance_premarket": 0.70,  # pre-market price (thinner market, wider spread)
-    "owm":               0.60,   # third-party weather forecast (less calibrated)
     "manifold":      0.50,   # play-money market (noisy)
 }
 _DEFAULT_SOURCE_SCORE: float = 0.60  # fallback for unlisted sources
@@ -495,3 +495,79 @@ def score_poly_opportunity(
         + NUM_WEIGHT_EDGE        * s_edge
         + NUM_WEIGHT_SOURCE      * s_source
     )
+
+
+# ---------------------------------------------------------------------------
+# Minimum-edge thresholds for forecast-source opportunities
+# (moved here from main.py so scoring owns all threshold config)
+# ---------------------------------------------------------------------------
+
+TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "5.0"))
+TEMP_LOW_FORECAST_MIN_EDGE: float = float(
+    os.environ.get("TEMP_LOW_FORECAST_MIN_EDGE", "6.0")
+)
+TEMP_DAY2_MIN_EDGE: float = float(os.environ.get("TEMP_DAY2_MIN_EDGE", "5.0"))
+TEMP_DAY2_BETWEEN_YES_MIN_EDGE: float = float(
+    os.environ.get("TEMP_DAY2_BETWEEN_YES_MIN_EDGE", "0.3")
+)
+
+TEMP_FORECAST_MIN_EDGE_OVER: dict[str, float] = {
+    "noaa":        5.0,
+    "noaa_day1":   5.0,
+    "nws_hourly":  5.0,
+    "open_meteo":  5.0,
+    "weatherapi":  5.0,
+}
+
+TEMP_FORECAST_MIN_EDGE_UNDER: dict[str, float] = {
+    "noaa":        5.0,
+    "noaa_day1":   5.0,
+    "nws_hourly":  5.0,
+    "open_meteo":  7.0,
+    "weatherapi":  float("inf"),
+}
+
+# Load env-var overrides: TEMP_EDGE_OVER_{SOURCE} / TEMP_EDGE_UNDER_{SOURCE}
+for _src, _over_env, _under_env in [
+    ("noaa",       "TEMP_EDGE_OVER_NOAA",       "TEMP_EDGE_UNDER_NOAA"),
+    ("open_meteo", "TEMP_EDGE_OVER_OPEN_METEO",  "TEMP_EDGE_UNDER_OPEN_METEO"),
+    ("weatherapi", "TEMP_EDGE_OVER_WEATHERAPI",  "TEMP_EDGE_UNDER_WEATHERAPI"),
+    ("noaa_day2",  "TEMP_EDGE_OVER_NOAA_DAY2",   "TEMP_EDGE_UNDER_NOAA_DAY2"),
+    ("hrrr",       "TEMP_EDGE_OVER_HRRR",        "TEMP_EDGE_UNDER_HRRR"),
+    ("nws_hourly", "TEMP_EDGE_OVER_NWS_HOURLY",  "TEMP_EDGE_UNDER_NWS_HOURLY"),
+]:
+    for _d, _env in [("over", _over_env), ("under", _under_env)]:
+        _v = os.environ.get(_env)
+        if _v is not None:
+            try:
+                (_d == "over" and TEMP_FORECAST_MIN_EDGE_OVER or TEMP_FORECAST_MIN_EDGE_UNDER)[_src] = float(_v)
+            except ValueError:
+                pass
+del _src, _over_env, _under_env, _d, _env, _v  # type: ignore[name-defined]
+
+
+def resolve_min_edge(source: str, direction: str, metric: str = "",
+                     implied_outcome: str = "") -> float:
+    """Return the calibrated minimum edge (°F) for a source + market direction.
+
+    Priority:
+      1. TEMP_LOW_FORECAST_MIN_EDGE for temp_low_* metrics (KXLOWT override)
+      2. between+YES for noaa_day2+: TEMP_DAY2_BETWEEN_YES_MIN_EDGE
+      3. Per-source direction override (TEMP_FORECAST_MIN_EDGE_OVER/UNDER)
+      4. TEMP_DAY2_MIN_EDGE for noaa_day2+ (direction-agnostic legacy gate)
+      5. TEMP_FORECAST_MIN_EDGE global default
+    """
+    _is_day2 = source.startswith("noaa_day") and source != "noaa_day1"
+    if metric.startswith("temp_low_") and TEMP_LOW_FORECAST_MIN_EDGE > 0:
+        if _is_day2 and TEMP_DAY2_MIN_EDGE > 0:
+            return TEMP_DAY2_MIN_EDGE
+        return TEMP_LOW_FORECAST_MIN_EDGE
+    if direction == "between" and implied_outcome == "YES" and _is_day2:
+        return TEMP_DAY2_BETWEEN_YES_MIN_EDGE
+    if direction == "over" and source in TEMP_FORECAST_MIN_EDGE_OVER:
+        return TEMP_FORECAST_MIN_EDGE_OVER[source]
+    if direction == "under" and source in TEMP_FORECAST_MIN_EDGE_UNDER:
+        return TEMP_FORECAST_MIN_EDGE_UNDER[source]
+    if _is_day2 and TEMP_DAY2_MIN_EDGE > 0:
+        return TEMP_DAY2_MIN_EDGE
+    return TEMP_FORECAST_MIN_EDGE

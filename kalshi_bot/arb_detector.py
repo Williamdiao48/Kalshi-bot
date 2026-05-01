@@ -43,15 +43,45 @@ Environment variables
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from .market_parser import parse_market, ParsedMarket
 
 ARB_MIN_PROFIT_CENTS: int = int(os.environ.get("ARB_MIN_PROFIT_CENTS", "2"))
 ARB_EXECUTION_ENABLED: bool = (
     os.environ.get("ARB_EXECUTION_ENABLED", "true").lower() != "false"
+)
+
+# ---------------------------------------------------------------------------
+# Safe-metric guard
+# ---------------------------------------------------------------------------
+# The monotonicity arb ONLY works on markets where "B{strike}" means
+# "cumulative below X" (i.e., the whole series is a CDF, not a PDF).
+#
+# Forex intraday markets (KXUSDJPY, KXEURUSD, KXGBPUSD) use *band* pricing:
+# each "B" ticker covers a mutually-exclusive price range.  Adjacent bands
+# have NO ordering guarantee — P(band at k_lo) vs P(band at k_hi) can be
+# anything — so the monotonicity arb formula is WRONG for them.
+#
+# Disaster: trades 150/151 (KXUSDJPY-26APR2310-B159.625 / B160.375).
+#   The bot computed "guaranteed profit = 8¢" using bid_lo=18 > ask_hi=10,
+#   interpreting them as cumulative CDF probabilities.  They were band
+#   probabilities.  USD/JPY landed in the 159.625 band → both legs lost
+#   simultaneously → -$18.40.
+#
+# Only allow arb detection on metrics whose market structure is confirmed
+# monotone over/under.  Add metric prefixes here as they are verified.
+_ARB_SAFE_METRIC_PREFIXES: tuple[str, ...] = (
+    "temp_high_",   # KXHIGH* / KXHIGHT* daily-high temperature
+    "temp_low_",    # KXLOWT* daily-low temperature
+    "price_btc_usd",  # KXBTCD daily close (T=above, B=below — genuine CDF)
+    "price_eth_usd",
+    "price_sol_usd",
 )
 
 CROSSED_BOOK_MIN_PROFIT: int = int(os.environ.get("CROSSED_BOOK_MIN_PROFIT", "2"))
@@ -256,6 +286,16 @@ def find_arb_opportunities(
 
     for (metric, direction, close_date), group in groups.items():
         if len(group) < 2:
+            continue
+
+        # Reject any metric not in the confirmed-monotone safelist.
+        # Forex/crypto intraday "B" markets are band (PDF) markets, not
+        # cumulative CDFs — the monotonicity arb formula does not apply.
+        if not any(metric.startswith(p) for p in _ARB_SAFE_METRIC_PREFIXES):
+            log.debug(
+                "arb_detector: skipping metric=%s direction=%s (not in safe-metric list)",
+                metric, direction,
+            )
             continue
 
         # Sort by strike ascending

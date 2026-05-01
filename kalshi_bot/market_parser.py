@@ -13,6 +13,7 @@ against open market positions.
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 
@@ -327,3 +328,28 @@ def scan_unknown_series(markets: list[dict[str, Any]]) -> None:
         for series in sorted(unknown):
             lines.append(f"  {series:<18}  e.g. {unknown[series]}")
         logging.info("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Ticker date parsing
+# ---------------------------------------------------------------------------
+
+_TICKER_DATE_RE = re.compile(r"^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$")
+_MONTH_NUM = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+
+def ticker_date(ticker: str) -> date | None:
+    """Parse the market date from a Kalshi ticker (e.g. KXHIGHAUS-26MAR10-T75 → date(2026,3,10))."""
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    m = _TICKER_DATE_RE.match(parts[1])
+    if not m:
+        return None
+    try:
+        return date(2000 + int(m.group(1)), _MONTH_NUM[m.group(2)], int(m.group(3)))
+    except (ValueError, KeyError):
+        return None
