@@ -55,7 +55,8 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -71,6 +72,16 @@ METAR_LOOKBACK_HOURS: int = int(os.environ.get("METAR_LOOKBACK_HOURS", "24"))
 _STATION_TO_METRIC: dict[str, str] = {
     v: k for k, v in KALSHI_STATION_IDS.items()
 }
+
+# NWS resolves markets midnight-to-midnight Local Standard Time (LST) year-round,
+# regardless of DST.  During summer, DST-aware local midnight is 1 h earlier than
+# NWS midnight, creating a gap window where the bot would include readings that
+# NWS attributes to the previous calendar day.  We fix this by always bucketing
+# observations using the standard-time UTC offset (no DST adjustment).
+def _lst_tz(city_tz: ZoneInfo) -> timezone:
+    """Return a fixed-offset timezone matching the city's standard time (no DST)."""
+    std_offset = city_tz.utcoffset(datetime(2000, 1, 15))  # January = standard time
+    return timezone(std_offset)
 
 # Module-level cache: (monotonic_ts, list[DataPoint])
 _cache_time: float = 0.0
@@ -91,7 +102,7 @@ def _filter_cache_to_today(now_utc: datetime) -> list[DataPoint]:
         if city_entry is None:
             continue
         _, _, _, city_tz = city_entry
-        local_today_str = now_utc.astimezone(city_tz).date().strftime("%Y-%m-%d")
+        local_today_str = now_utc.astimezone(_lst_tz(city_tz)).date().strftime("%Y-%m-%d")
         cached_date = (dp.metadata or {}).get("local_date", "")
         if cached_date == local_today_str:
             valid.append(dp)
@@ -167,9 +178,13 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         if city_entry is None:
             continue
         city_name, _lat, _lon, city_tz = city_entry
+        lst = _lst_tz(city_tz)
 
-        # Local "today" for this city
-        local_today = now_utc.astimezone(city_tz).date()
+        # Local "today" using NWS Local Standard Time (LST) — no DST adjustment.
+        # NWS resolves midnight-to-midnight LST year-round, so we must use the
+        # same boundary or readings in the DST gap hour count as "today" for us
+        # but "yesterday" for NWS settlement.
+        local_today = now_utc.astimezone(lst).date()
 
         # Find the max and min temperatures across all observations for today,
         # and collect the time-series for trajectory projection.
@@ -184,7 +199,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             if obs_epoch is None:
                 continue
             obs_dt = datetime.fromtimestamp(obs_epoch, tz=timezone.utc)
-            obs_local_date = obs_dt.astimezone(city_tz).date()
+            obs_local_date = obs_dt.astimezone(lst).date()
             if obs_local_date != local_today:
                 continue
             temp_f = _c_to_f(float(temp_c))
@@ -232,11 +247,12 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
                     unit="°F",
                     as_of=as_of,
                     metadata={
-                        "city":         city_name,
-                        "station":      station_id,
-                        "observed_min": daily_min_f,
-                        "local_date":   date_str,
-                        "obs_series":   obs_today,
+                        "city":           city_name,
+                        "station":        station_id,
+                        "observed_min":   daily_min_f,
+                        "current_temp_f": obs_today[-1][1],  # most recent reading
+                        "local_date":     date_str,
+                        "obs_series":     obs_today,
                     },
                 ))
 

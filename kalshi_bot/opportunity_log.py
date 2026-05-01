@@ -46,6 +46,8 @@ Written to `opportunity_log.db` in the project root (same directory as
 import logging
 import os
 import sqlite3
+
+from .db import open_db
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -74,8 +76,30 @@ CREATE TABLE IF NOT EXISTS raw_forecasts (
     data_value  REAL    NOT NULL,   -- forecast temperature (°F)
     strike      REAL,               -- market strike threshold
     direction   TEXT,               -- "over" | "under" | "between"
-    edge        REAL                -- |forecast - strike| (°F)
+    edge        REAL,               -- |forecast - strike| (°F)
+    yes_bid     INTEGER             -- Kalshi YES bid price in cents at time of logging
 )
+"""
+
+_CREATE_SIGNAL_SUPPRESSION_SQL = """
+CREATE TABLE IF NOT EXISTS signal_suppression_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at  TEXT    NOT NULL,
+    ticker     TEXT    NOT NULL,
+    source     TEXT    NOT NULL,
+    metric     TEXT,
+    gate       TEXT    NOT NULL,
+    edge_f     REAL,
+    value      REAL,
+    strike     REAL,
+    yes_bid    INTEGER,
+    note       TEXT
+)
+"""
+
+_CREATE_SUPPRESSION_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_suppression_ticker
+    ON signal_suppression_log (ticker, logged_at)
 """
 
 _CREATE_RAW_IDX_SQL = """
@@ -196,12 +220,7 @@ class OpportunityLog:
 
     def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,   # autocommit; we manage transactions manually
-        )
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = open_db(self._db_path)
         self._init_schema()
         self._purge_old_rows()
         logging.debug("OpportunityLog opened at %s", self._db_path)
@@ -252,6 +271,27 @@ class OpportunityLog:
         self._conn.execute(_CREATE_RAW_IDX_SQL)
         self._conn.execute(_CREATE_RAW_DAILY_VIEW_SQL)
         self._conn.execute(_CREATE_TRADE_CONTEXT_VIEW_SQL)
+        self._conn.execute(_CREATE_SIGNAL_SUPPRESSION_SQL)
+        self._conn.execute(_CREATE_SUPPRESSION_IDX_SQL)
+        self._migrate_trades_exit_columns()
+
+    def _migrate_trades_exit_columns(self) -> None:
+        """Add analysis columns to trades that didn't exist in older schema versions."""
+        table_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'"
+        ).fetchone()
+        if not table_exists:
+            return
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(trades)")}
+        for col, typedef in [
+            ("exit_reason_detail", "TEXT"),
+            ("peak_pct_gain",      "REAL"),
+            ("peak_at",            "TEXT"),
+            ("exit_yes_bid",       "INTEGER"),
+            ("exit_yes_ask",       "INTEGER"),
+        ]:
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
 
     # -----------------------------------------------------------------------
     # Cross-cycle deduplication
@@ -303,8 +343,13 @@ class OpportunityLog:
         intentionally kept — they show how forecasts evolve intraday.
         """
         now = datetime.now(timezone.utc).isoformat()
-        rows = [
-            (
+        rows = []
+        for opp in opps:
+            if not opp.metric.startswith(("temp_high_", "temp_low_")):
+                continue
+            # current_market_price is yes_bid in cents (int) or "N/A"
+            yes_bid = opp.current_market_price if isinstance(opp.current_market_price, int) else None
+            rows.append((
                 now,
                 opp.source,
                 opp.metric,
@@ -313,16 +358,14 @@ class OpportunityLog:
                 opp.strike,
                 opp.direction,
                 opp.edge,
-            )
-            for opp in opps
-            if opp.metric.startswith(("temp_high_", "temp_low_"))
-        ]
+                yes_bid,
+            ))
         if rows:
             self._conn.executemany(
                 """
                 INSERT INTO raw_forecasts
-                    (logged_at, source, metric, ticker, data_value, strike, direction, edge)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge, yes_bid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -355,13 +398,14 @@ class OpportunityLog:
                     None,       # strike — not available on ForecastNoSignal
                     sig.direction,
                     edge,
+                    None,       # yes_bid — not available here
                 ))
         if rows:
             self._conn.executemany(
                 """
                 INSERT INTO raw_forecasts
-                    (logged_at, source, metric, ticker, data_value, strike, direction, edge)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge, yes_bid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -524,6 +568,52 @@ class OpportunityLog:
                 opp.kalshi_mid,
                 opp.implied_side.upper(),
                 opp.divergence,
+            ),
+        )
+
+    def log_suppression(
+        self,
+        ticker: str,
+        source: str,
+        gate: str,
+        *,
+        metric: str | None = None,
+        edge_f: float | None = None,
+        value: float | None = None,
+        strike: float | None = None,
+        yes_bid: int | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Record a signal that was suppressed by a quality gate.
+
+        Builds an audit trail of filtered-out signals so future analysis can
+        ask "what did the gates block and was it correct to block it?"
+
+        Args:
+            ticker:  Kalshi market ticker.
+            source:  Data source (e.g. "hrrr", "noaa", "nws_hourly").
+            gate:    Short label identifying which gate suppressed the signal.
+                     Vocabulary: "hrrr_spread", "corr_lone_rt_no",
+                     "corr_lone_daily_no", "corr_solo_yes", "corr_future_lone",
+                     "band_arb_metar_only", "kxlowt_fc_contra",
+                     "obs_afternoon_gate", "edge_min", "ttc_window".
+            metric:  Metric name (e.g. "temp_high_lax").
+            edge_f:  Edge in °F (or other units) at suppression time.
+            value:   Source forecast value.
+            strike:  Market strike threshold.
+            yes_bid: YES bid price in cents at suppression time.
+            note:    Optional free-text (e.g. the threshold that fired).
+        """
+        self._conn.execute(
+            """
+            INSERT INTO signal_suppression_log
+                (logged_at, ticker, source, metric, gate, edge_f, value, strike, yes_bid, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                ticker, source, metric, gate,
+                edge_f, value, strike, yes_bid, note,
             ),
         )
 

@@ -59,6 +59,22 @@ SKIP_METRICS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# Overnight-low gap gate
+# ---------------------------------------------------------------------------
+
+# For KXLOWT* NO signals from the metar source, require that the current METAR
+# temperature is at least this many °F above the running daily minimum before
+# entry.  A gap near zero means either (a) the minimum has not yet occurred and
+# the current reading IS the minimum, or (b) the bot started watching this
+# market in the afternoon and never observed the actual pre-dawn minimum.  Both
+# cases produce a false edge.  Backtest on 5-yr / 20-city ASOS data shows
+# G=5°F blocks ~56% of pre-minimum overnight entries while allowing ~65%+ of
+# legitimate post-minimum (evening) entries.  See findings.md.
+METAR_LOW_MIN_GAP_F: float = float(
+    os.environ.get("METAR_LOW_MIN_GAP_F", "5.0")
+)
+
+# ---------------------------------------------------------------------------
 # Cross-exchange confirmation config
 # ---------------------------------------------------------------------------
 
@@ -123,6 +139,10 @@ class NumericOpportunity:
     # Stored in trades.corroborating_sources (comma-separated) for win-rate
     # analysis by source combination.
     corroborating_sources: list = field(default_factory=list)
+    # Consensus statistics across all agreeing sources in the same key group.
+    # Populated by the by_key loop in main.py; None for single-source signals.
+    # Written to the "consensus" block in the trade note JSON by trade_executor.
+    consensus_meta: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +248,21 @@ def _implied_outcome(
         return ("YES" if edge >= 0 else "NO"), abs(edge)
 
     if pm.direction == "between" and pm.strike_lo is not None and pm.strike_hi is not None:
-        in_range = pm.strike_lo <= value <= pm.strike_hi
+        # NWS resolves temperature markets to the nearest integer, so the
+        # effective YES band is ±0.5°F wider than the nominal strike boundaries.
+        # e.g. B60.5 (strike_lo=60, strike_hi=61) resolves YES for any observed
+        # temperature in [59.5, 61.5) after rounding.
+        buf = 0.5 if pm.metric.startswith("temp_") else 0.0
+        eff_lo = pm.strike_lo - buf
+        eff_hi = pm.strike_hi + buf
+        in_range = eff_lo <= value <= eff_hi
         if in_range:
-            # Clearance: how far the value sits from the nearest boundary.
+            # Clearance: how far the value sits from the nearest effective boundary.
             # Large clearance = firmly inside range = strong YES signal.
-            edge = min(value - pm.strike_lo, pm.strike_hi - value)
+            edge = min(value - eff_lo, eff_hi - value)
         else:
-            # Distance from the nearest boundary for NO signals.
-            edge = min(abs(value - pm.strike_lo), abs(value - pm.strike_hi))
+            # Distance from the nearest effective boundary for NO signals.
+            edge = min(abs(value - eff_lo), abs(value - eff_hi))
         return ("YES" if in_range else "NO"), edge
 
     # Direction-only markets (up/down) — use inter-cycle momentum when available.
@@ -385,6 +412,28 @@ def find_numeric_opportunities(
             effective_edge = raw_edge * multiplier
             if effective_edge < min_edge:
                 continue
+
+            # Overnight-low gap gate: for KXLOWT* NO signals from METAR,
+            # require current_temp - running_min >= METAR_LOW_MIN_GAP_F.
+            # Blocks entries where the minimum hasn't been captured yet.
+            if (
+                outcome == "NO"
+                and dp.source == "metar"
+                and dp.metric.startswith("temp_low_")
+            ):
+                _meta = dp.metadata or {}
+                _current = _meta.get("current_temp_f")
+                _obs_min = _meta.get("observed_min")
+                if _current is not None and _obs_min is not None:
+                    _gap = _current - _obs_min
+                    if _gap < METAR_LOW_MIN_GAP_F:
+                        logging.debug(
+                            "GapGate skip %s: current=%.1f°F observed_min=%.1f°F"
+                            " gap=%.1f°F < %.1f°F",
+                            pm.ticker, _current, _obs_min, _gap, METAR_LOW_MIN_GAP_F,
+                        )
+                        continue
+
             opportunities.append(
                 NumericOpportunity(
                     metric=dp.metric,
