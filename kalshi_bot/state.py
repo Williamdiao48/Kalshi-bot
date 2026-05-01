@@ -8,6 +8,8 @@ import sqlite3
 import logging
 from pathlib import Path
 
+from .db import open_db
+
 _DEFAULT_DB_PATH = Path(__file__).parent.parent / "state.db"
 
 
@@ -23,8 +25,7 @@ class SeenDocuments:
 
     def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = open_db(self._db_path)
         self._init_schema()
         logging.debug("SeenDocuments store opened at %s", self._db_path)
 

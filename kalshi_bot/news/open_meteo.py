@@ -74,7 +74,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES  # same city registry as NOAA / OWM
+from .noaa import CITIES, CITY_TZ_STRINGS as _CITY_TZ_STRINGS  # same city registry as NOAA
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -90,53 +90,7 @@ OPEN_METEO_CACHE_MINUTES: int = int(os.environ.get("OPEN_METEO_CACHE_MINUTES", "
 
 _BASE_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Open-Meteo timezone strings for each city — used so the API returns daily
-# dates in local time rather than UTC, matching what Kalshi settles against.
-_CITY_TZ_STRINGS: dict[str, str] = {
-    "temp_high_lax": "America/Los_Angeles",
-    "temp_high_den": "America/Denver",
-    "temp_high_chi": "America/Chicago",
-    "temp_high_ny":  "America/New_York",
-    "temp_high_mia": "America/New_York",
-    "temp_high_aus": "America/Chicago",
-    "temp_high_dal": "America/Chicago",
-    "temp_high_bos": "America/New_York",
-    "temp_high_hou": "America/Chicago",
-    "temp_high_dfw": "America/Chicago",
-    # New cities — active from 2026-04
-    "temp_high_sfo": "America/Los_Angeles",
-    "temp_high_sea": "America/Los_Angeles",
-    "temp_high_phx": "America/Phoenix",
-    "temp_high_phl": "America/New_York",
-    "temp_high_atl": "America/New_York",
-    "temp_high_msp": "America/Chicago",
-    "temp_high_dca": "America/New_York",
-    "temp_high_las": "America/Los_Angeles",
-    "temp_high_okc": "America/Chicago",
-    "temp_high_sat": "America/Chicago",
-    "temp_high_msy": "America/Chicago",
-    # Daily low temperature — same timezone strings as high counterparts
-    "temp_low_lax": "America/Los_Angeles",
-    "temp_low_den": "America/Denver",
-    "temp_low_chi": "America/Chicago",
-    "temp_low_ny":  "America/New_York",
-    "temp_low_mia": "America/New_York",
-    "temp_low_aus": "America/Chicago",
-    "temp_low_bos": "America/New_York",
-    "temp_low_hou": "America/Chicago",
-    "temp_low_dfw": "America/Chicago",
-    "temp_low_sfo": "America/Los_Angeles",
-    "temp_low_sea": "America/Los_Angeles",
-    "temp_low_phx": "America/Phoenix",
-    "temp_low_phl": "America/New_York",
-    "temp_low_atl": "America/New_York",
-    "temp_low_msp": "America/Chicago",
-    "temp_low_dca": "America/New_York",
-    "temp_low_las": "America/Los_Angeles",
-    "temp_low_okc": "America/Chicago",
-    "temp_low_sat": "America/Chicago",
-    "temp_low_msy": "America/Chicago",
-}
+# _CITY_TZ_STRINGS is imported from noaa (covers both temp_high_* and temp_low_*).
 
 
 def _warn_tz_fallback(metric: str) -> str:

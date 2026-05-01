@@ -1,8 +1,8 @@
 """WeatherAPI.com forecast high temperature fetcher.
 
-Provides a reliable replacement for OWM as a second independent weather
-forecast source.  WeatherAPI's free tier allows 1 million calls/month
-(vs OWM's slot-based approach which frequently returns no data for today).
+Provides a second independent weather forecast source alongside HRRR/NOAA.
+WeatherAPI's free tier allows 1 million calls/month and returns consistent
+daily high/low forecasts without the slot-aggregation issues of some APIs.
 
 Set the env var ``WEATHERAPI_KEY`` to enable (free key at weatherapi.com).
 If the key is absent the module returns an empty list and the poll continues.
@@ -42,7 +42,7 @@ WeatherAPI updates forecasts every few hours so a 15-minute cache wastes
 no meaningful signal while staying well within free-tier limits.
 
 Source tag: ``"weatherapi"``
-Counted as a forecast corroboration source alongside "noaa", "owm",
+Counted as a forecast corroboration source alongside "noaa",
 "nws_hourly", "open_meteo", and "hrrr" in the consensus filter in main.py.
 
 Environment variables

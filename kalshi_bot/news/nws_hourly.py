@@ -30,7 +30,7 @@ The points lookup (step 1) is cached indefinitely per (lat, lon) pair since
 grid office assignments do not change.
 
 Source tag: ``"nws_hourly"``
-Counted as a forecast corroboration source alongside "noaa", "owm",
+Counted as a forecast corroboration source alongside "noaa",
 "open_meteo", and "hrrr" in the consensus filter in main.py.
 
 Environment variables

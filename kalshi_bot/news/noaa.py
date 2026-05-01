@@ -98,6 +98,16 @@ CITIES: dict[str, tuple[str, float, float, ZoneInfo]] = {
     "temp_high_msy": ("New Orleans",   29.9934,  -90.2580, _CT),   # KMSY
 }
 
+# Derived look-ups used by open_meteo.py, backtest scripts, and audit scripts.
+CITY_TZ: dict[str, ZoneInfo] = {k: v[3] for k, v in CITIES.items()}
+CITY_TZ_STRINGS: dict[str, str] = {k: str(v[3]) for k, v in CITIES.items()}
+# Include daily-low variants (same timezone as the corresponding daily-high city).
+CITY_TZ_STRINGS.update({
+    k.replace("temp_high_", "temp_low_"): tz
+    for k, tz in list(CITY_TZ_STRINGS.items())
+    if k.startswith("temp_high_")
+})
+
 # ---------------------------------------------------------------------------
 # Per-city seasonal sigma (NWS day-1 MAE, °F)
 # ---------------------------------------------------------------------------
@@ -443,7 +453,19 @@ async def _fetch_observed_max_today(
 
     max_f: float | None = None
     for feature in data.get("features", []):
-        temp_c = (feature.get("properties") or {}).get("temperature", {}).get("value")
+        props = feature.get("properties") or {}
+        # Skip 5-minute synoptic readings: they round temperatures to integer °C
+        # (vs. 0.1°C for METAR), inflating the apparent max by up to 0.9°C = 1.62°F.
+        # METAR reports arrive at non-round-5 minutes (typically :53); synoptic
+        # reports arrive at :00/:05/:10/…/:55.
+        ts = props.get("timestamp", "")
+        try:
+            ts_min = datetime.fromisoformat(ts).minute
+        except (ValueError, TypeError):
+            ts_min = -1
+        if ts_min >= 0 and ts_min % 5 == 0:
+            continue
+        temp_c = props.get("temperature", {}).get("value")
         if temp_c is not None:
             temp_f = temp_c * 9.0 / 5.0 + 32.0
             if max_f is None or temp_f > max_f:

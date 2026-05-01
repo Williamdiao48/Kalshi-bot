@@ -5,7 +5,7 @@ Each cycle concurrently fetches:
   - Federal Register documents  (keyword matching)
   - RSS feeds (AP, Reuters, BBC, NPR, ESPN, Billboard, Politico, The Hill)
   - SEC EDGAR 8-K filings       (keyword matching)
-  - NOAA / OWM city forecasts   (numeric matching)
+  - NOAA city forecasts         (numeric matching)
   - Binance crypto prices       (numeric matching)
   - Frankfurter forex rates     (numeric matching)
   - BLS economic releases       (numeric matching, new releases only)
@@ -21,14 +21,13 @@ import collections
 from datetime import datetime, timezone, timedelta, date
 import logging
 import os
-import re
 import time
 from zoneinfo import ZoneInfo
 
 import aiohttp
 
-from .markets import fetch_all_markets, fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES, TEXT_SERIES
-from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC
+from .markets import fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES, TEXT_SERIES
+from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC, ticker_date as _ticker_date
 from .matcher import find_opportunities, Opportunity
 from .data import DataPoint
 from .numeric_matcher import find_numeric_opportunities, NumericOpportunity
@@ -41,19 +40,21 @@ from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_
 from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import federal_register
-from .news import noaa, owm, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
+from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
 from .news import polymarket, metaculus, manifold, edgar, predictit
 from .news import box_office
 from .box_office_matcher import match_box_office_to_kalshi
+from .display import print_text_opportunity as _print_text_opportunity, print_numeric_opportunity as _print_numeric_opportunity, print_poly_opportunity as _print_poly_opportunity
 from .dry_run_ledger import DryRunLedger
 from .opportunity_log import OpportunityLog
 from .portfolio import fetch_positions, build_position_index, summarise_portfolio
-from .trade_executor import TRADE_DRY_RUN, TradeExecutor, set_drawdown_factor, POLY_ENABLED
+from .trade_executor import TRADE_DRY_RUN, TradeExecutor, set_drawdown_factors, POLY_ENABLED
 from .scoring import (
     score_text_opportunity,
     score_numeric_opportunity,
     score_poly_opportunity,
     METRIC_EDGE_SCALES,
+    resolve_min_edge as _resolve_min_edge,
 )
 from .release_schedule import is_within_release_window, next_release
 from .state import SeenDocuments
@@ -133,6 +134,17 @@ _last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
 # treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
 # the cached reading may no longer represent the current observed daily max.
 NOAA_OBS_MAX_AGE_S: float = float(os.environ.get("NOAA_OBS_MAX_AGE_S", "1800"))
+
+# Require NWS corroboration for band_arb:no signals on KXLOWT markets.
+# METAR is a spot-temperature reading at an airport station; KXLOWT markets
+# settle against an official NWS station reading, and the two can diverge.
+# A lone METAR band_arb:no on KXLOWT carries station-mismatch risk that is
+# not present for KXHIGHT markets.  Trade #11 (−$14) is the canonical failure:
+# METAR-only corroboration, corr_status="metar_only", signal was wrong.
+# Set to false to allow metar-only band_arb:no on all markets.
+BAND_ARB_REQUIRE_NWS_FOR_KXLOWT: bool = os.environ.get(
+    "BAND_ARB_REQUIRE_NWS_FOR_KXLOWT", "true"
+).lower() not in ("false", "0", "no")
 
 # How often to re-fetch the NUMERIC series markets (KXHIGH, KXBTCD, etc.).
 # These are the markets the bot actually trades; stale prices cause bad fills.
@@ -410,79 +422,40 @@ NUMERIC_LOWT_FORECAST_GATE: bool = os.environ.get(
 LOWT_FORECAST_GATE_BUFFER_F: float = float(
     os.environ.get("LOWT_FORECAST_GATE_BUFFER_F", "3.0")
 )
+# Minimum independent forecast sources required to agree on YES for KXLOWT
+# markets.  Daily lows have ~10% higher MAE than daily highs (overnight lows
+# harder to forecast, cold-front timing uncertain).  Requiring 3 sources (vs
+# global FORECAST_CORROBORATION_MIN=2) is now achievable since hrrr, nws_hourly,
+# and open_meteo all emit temp_low_* DataPoints.
+KXLOWT_FORECAST_CORROBORATION_MIN: int = int(
+    os.environ.get("KXLOWT_FORECAST_CORROBORATION_MIN", "3")
+)
+# Maximum bid-ask spread (¢) for KXLOWT daily-low numeric signals.  Tighter
+# than the global LIQUIDITY_MAX_SPREAD (20¢) because KXLOWT markets are newer
+# and thinner — a 15¢ spread costs ~8% round-trip on a typical 50¢ contract.
+# Set to 0 to use the global spread limit for KXLOWT (disables override).
+KXLOWT_MAX_SPREAD_CENTS: int = int(os.environ.get("KXLOWT_MAX_SPREAD_CENTS", "15"))
+# When noaa_observed/metar fires YES on a KXLOWT market and is NOT suppressed by
+# the contradiction gate, require at least this many forecast sources to actively
+# confirm the YES direction (fc_low > strike) before allowing the signal through.
+# 1 = require one model to agree; 0 = disable (allow if not contradicted).
+KXLOWT_OBS_YES_FC_CONFIRM_MIN: int = int(
+    os.environ.get("KXLOWT_OBS_YES_FC_CONFIRM_MIN", "1")
+)
+# Require that at least one of the confirming forecast sources is a near-term
+# model (HRRR or NWS hourly) before allowing a KXLOWT observed-YES trade.
+# Near-term models have 2–3°F MAE vs 3–5°F for day-ahead global models and
+# resolve terrain and cold-front timing that noaa/open_meteo miss overnight.
+# Trades #141/#142 (KXLOWTCHI-26APR22-T53): 0 corroborating sources, Chicago
+# cold front dropped temp below 53°F after sunrise — near-term gate would
+# have blocked both entries. Default: true. Set to false to use any model.
+KXLOWT_OBS_YES_NEAR_TERM_REQUIRED: bool = os.environ.get(
+    "KXLOWT_OBS_YES_NEAR_TERM_REQUIRED", "true"
+).lower() not in ("false", "0", "no")
+_KXLOWT_NEAR_TERM_SOURCES: frozenset[str] = frozenset({"hrrr", "nws_hourly"})
 
-# Weather-specific signal quality gates (applied after OWM consensus filter).
-#
-# TEMP_FORECAST_MIN_EDGE — Minimum edge (°F) required for raw NWS forecast
-#   signals (source="noaa").  NWS day-1 forecasts have MAE ≈ 3–4°F, so a
-#   7°F edge (≈ 2σ) is the threshold where the signal likely reflects genuine
-#   information rather than forecast noise.  Downstream gates (corroboration
-#   requiring 2+ sources, score gate at 0.75) handle residual false positives;
-#   a higher threshold is no longer needed to maintain trade quality.
-TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "5.0"))
-
-# Minimum edge (°F) for day-2+ NWS extended forecasts (source="noaa_day2" etc.).
-# Day-2 NWS MAE ≈ 5–6°F (1.4× day-1); the same 7°F edge represents only ~1.1σ
-# vs ~1.6σ for day-1. Requiring 9°F was calibrated for winter cold extremes but
-# kills all day-ahead signals in spring/summer when NWS forecasts are 4–7°F from
-# strikes. Lowered to 5.0°F — equivalent to same-day TEMP_FORECAST_MIN_EDGE.
-# Quality is guarded downstream by FORECAST_CORROBORATION_MIN=2 (requires an
-# independent model to agree) and NOAA_DAY2_MIN_SCORE=0.90 (score gate).
-# Set to 0 to use TEMP_FORECAST_MIN_EDGE for all forecast sources uniformly.
-TEMP_DAY2_MIN_EDGE: float = float(os.environ.get("TEMP_DAY2_MIN_EDGE", "5.0"))
-
-# Per-source minimum edge overrides (°F), split by market direction.
-#
-# OVER thresholds — used when the market resolves YES if actual > strike.
-#   Sources with a cold bias (forecast < actual on average) are more conservative
-#   on over signals: a 5°F raw edge already implies ~10°F true edge for open_meteo.
-#
-# UNDER thresholds — used when the market resolves YES if actual < strike.
-#   Cold-biased sources overstate apparent under-edge: their forecast is already
-#   below actual, so a 7°F apparent edge may represent ~0°F true edge.
-#   Set to float("inf") to disable under signals from that source entirely.
-#
-# Justified by:
-#   noaa       — published NWS day-1 MAE ≈ 3–4°F, bias ≈ 0 → 5°F is ~1.4σ
-#   open_meteo — ERA5 backtest bias ≈ -5°F cold → over gains buffer, under loses it
-#   weatherapi — ERA5 backtest bias ≈ -8°F cold → under signals have ~-1°F true edge
-#
-# Override any value via env var (e.g. TEMP_EDGE_OVER_NOAA=4.0).
-TEMP_FORECAST_MIN_EDGE_OVER: dict[str, float] = {
-    "noaa":        5.0,
-    "noaa_day1":   5.0,
-    "nws_hourly":  5.0,  # NWS HRRR-driven hourly — same agency/station as settlement
-    "open_meteo":  5.0,
-    "weatherapi":  5.0,  # rarely fires; cold bias makes any over signal very reliable
-}
-
-TEMP_FORECAST_MIN_EDGE_UNDER: dict[str, float] = {
-    "noaa":        5.0,
-    "noaa_day1":   5.0,
-    "nws_hourly":  5.0,  # NWS product, near-zero bias expected
-    "open_meteo":  7.0,  # -5°F cold bias → 7°F raw nets ~2°F true edge; FORECAST_CORROBORATION_MIN=2
-                          # prevents open_meteo from trading solo; its role is corroboration only.
-                          # Lowered from 12°F (was too aggressive; suppressed all spring signals).
-    "weatherapi":  float("inf"),  # -8°F cold bias → under signals have ~-1°F true edge
-}
-
-# Load env-var overrides: TEMP_EDGE_OVER_{SOURCE} / TEMP_EDGE_UNDER_{SOURCE}
-for _src, _over_env, _under_env in [
-    ("noaa",       "TEMP_EDGE_OVER_NOAA",       "TEMP_EDGE_UNDER_NOAA"),
-    ("open_meteo", "TEMP_EDGE_OVER_OPEN_METEO",  "TEMP_EDGE_UNDER_OPEN_METEO"),
-    ("weatherapi", "TEMP_EDGE_OVER_WEATHERAPI",  "TEMP_EDGE_UNDER_WEATHERAPI"),
-    ("noaa_day2",  "TEMP_EDGE_OVER_NOAA_DAY2",   "TEMP_EDGE_UNDER_NOAA_DAY2"),
-    ("hrrr",       "TEMP_EDGE_OVER_HRRR",        "TEMP_EDGE_UNDER_HRRR"),
-    ("nws_hourly", "TEMP_EDGE_OVER_NWS_HOURLY",  "TEMP_EDGE_UNDER_NWS_HOURLY"),
-]:
-    for _d, _env in [("over", _over_env), ("under", _under_env)]:
-        _v = os.environ.get(_env)
-        if _v is not None:
-            try:
-                (_d == "over" and TEMP_FORECAST_MIN_EDGE_OVER or TEMP_FORECAST_MIN_EDGE_UNDER)[_src] = float(_v)
-            except ValueError:
-                pass
-del _src, _over_env, _under_env, _d, _env, _v  # type: ignore[name-defined]
+# TEMP_FORECAST_MIN_EDGE, TEMP_FORECAST_MIN_EDGE_OVER/UNDER, and resolve_min_edge
+# are imported from scoring.py (which owns all threshold config).
 
 # ---------------------------------------------------------------------------
 # Intraday temperature trajectory (obs_trajectory) configuration
@@ -520,22 +493,6 @@ TRAJ_PEAK_LOCAL_HOUR: dict[str, int] = {
 }
 
 
-def _resolve_min_edge(source: str, direction: str) -> float:
-    """Return the calibrated minimum edge (°F) for a source + market direction.
-
-    Priority:
-      1. Per-source direction override (TEMP_FORECAST_MIN_EDGE_OVER/UNDER)
-      2. TEMP_DAY2_MIN_EDGE for noaa_day2+ (direction-agnostic legacy gate)
-      3. TEMP_FORECAST_MIN_EDGE global default
-    """
-    if direction == "over" and source in TEMP_FORECAST_MIN_EDGE_OVER:
-        return TEMP_FORECAST_MIN_EDGE_OVER[source]
-    if direction == "under" and source in TEMP_FORECAST_MIN_EDGE_UNDER:
-        return TEMP_FORECAST_MIN_EDGE_UNDER[source]
-    _day2 = source.startswith("noaa_day") and source != "noaa_day1"
-    if _day2 and TEMP_DAY2_MIN_EDGE > 0:
-        return TEMP_DAY2_MIN_EDGE
-    return TEMP_FORECAST_MIN_EDGE
 
 
 # Minimum edge (°F) for observed-temperature YES signals, split by direction:
@@ -559,6 +516,18 @@ TEMP_OBSERVED_MIN_EDGE_OVER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDG
 TEMP_OBSERVED_MIN_EDGE_BETWEEN: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_BETWEEN", "0.2"))
 TEMP_OBSERVED_MIN_EDGE_UNDER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_UNDER", "2.0"))
 
+# Stricter min edge for noaa_observed/metar between YES on KXLOWT daily-low
+# markets.  Unlike KXHIGHT between YES (where the daily peak is confirmed past
+# 4:30 PM and the outcome is locked), a KXLOWT between YES entered overnight
+# requires the temperature to fall further into the band before settlement.
+# The observed running minimum is a ceiling, not the final daily low — cold
+# fronts and radiative cooling can push it below the band floor.
+# Default 0 = disabled (use TEMP_OBSERVED_MIN_EDGE_BETWEEN for all).
+# Will be calibrated from backtest_kxlowt_entry_timing.py results.
+KXLOWT_OBS_BETWEEN_YES_MIN_EDGE: float = float(
+    os.environ.get("KXLOWT_OBS_BETWEEN_YES_MIN_EDGE", "0.0")
+)
+
 # TEMP_OBSERVED_MAX_EDGE — Upper edge cap for noaa_observed signals.
 #
 # Very large edges (>10°F) on an observed source indicate a faulty reading
@@ -580,9 +549,9 @@ TEMP_OBSERVED_MAX_HOURS: float = float(os.environ.get("TEMP_OBSERVED_MAX_HOURS",
 #   forecast high and the HRRR-derived hourly daytime high.  When the two
 #   model products disagree by more than this threshold, the atmosphere is
 #   unstable / convectively uncertain and the daily forecast is unreliable.
-#   Signals from source="noaa" or "owm" are suppressed; noaa_observed and
+#   Signals from source="noaa" are suppressed; noaa_observed and
 #   nws_alert DataPoints are never gated (they are ground truth / official).
-HRRR_MAX_SPREAD_F: float = float(os.environ.get("HRRR_MAX_SPREAD_F", "5.0"))
+HRRR_MAX_SPREAD_F: float = float(os.environ.get("HRRR_MAX_SPREAD_F", "8.0"))
 
 # MORNING_OBS_GAP_F — Maximum allowed gap (°F) between the Kalshi strike and
 #   the current noaa_observed max (recorded since midnight) before a *forecast*
@@ -604,7 +573,7 @@ MORNING_OBS_GAP_F: float = float(os.environ.get("MORNING_OBS_GAP_F", "20.0"))
 NWS_HOURLY_MAX_AGE_HOURS: float = float(os.environ.get("NWS_HOURLY_MAX_AGE_HOURS", "3.0"))
 
 # FORECAST_CORROBORATION_MIN — Minimum number of distinct forecast sources
-#   (from {noaa, owm, open_meteo}) that must independently agree on a YES
+#   (from {noaa, open_meteo}) that must independently agree on a YES
 #   direction before the signal is traded.  Lone signals (only one source)
 #   are suppressed — they are more likely to be model noise than genuine alpha.
 #   Set to 1 to disable (allow single-source signals).
@@ -741,10 +710,14 @@ OPPORTUNITY_COOLDOWN_MINUTES: int = int(os.environ.get("OPPORTUNITY_COOLDOWN_MIN
 # repeatedly entering a position that has already been stopped out.
 # Historical impact: KXHIGHNY-26MAR27-T62 had 4 entries totalling -151¢;
 # a 4h cooldown after the first trailing_stop would have limited it to -9¢.
+# KXLOWT impact: trades #7/#8/#10 on KXLOWTCHI-26APR25-B45.5 each stopped out,
+# then re-entered 2h01m and 2h03m later (just past the 120-min window) and
+# stopped out again, totalling -780¢.  Raising to 240 min (4h) blocks both
+# re-entries in that scenario.
 # Profit-take exits are NOT blocked — a market that hit its profit target
 # may still have actionable upside worth re-entering.
 # Set to 0 to disable.
-EXIT_REENTRY_COOLDOWN_MINUTES: int = int(os.environ.get("EXIT_REENTRY_COOLDOWN_MINUTES", "120"))
+EXIT_REENTRY_COOLDOWN_MINUTES: int = int(os.environ.get("EXIT_REENTRY_COOLDOWN_MINUTES", "240"))
 
 # Minimum absolute net position (in contracts) at which an opportunity in that
 # market is suppressed from display. Prevents re-alerting on a market where we
@@ -913,104 +886,7 @@ def _days_to_close(ticker: str, ticker_detail: dict[str, dict]) -> float:
 # Display helpers
 # ---------------------------------------------------------------------------
 
-_SEP  = "-" * 64
 _WIDE = "=" * 64
-
-
-def _fmt_liquidity(detail: dict | None) -> str:
-    """Format bid/ask/spread/volume from a market detail dict."""
-    if not detail:
-        return "  Liquidity: (unavailable)"
-    bid  = detail.get("yes_bid")
-    ask  = detail.get("yes_ask")
-    vol  = detail.get("volume")
-    if bid is not None and ask is not None:
-        spread = ask - bid
-        price_str = f"{bid}¢ bid / {ask}¢ ask  (spread: {spread}¢)"
-    else:
-        last = detail.get("last_price", "N/A")
-        price_str = f"{last}¢ last  (no bid/ask)"
-    vol_str = f"  |  Volume: {vol:,}" if vol is not None else ""
-    return f"  Liquidity: {price_str}{vol_str}"
-
-
-def _fmt_position(net_position: int) -> str:
-    """Format an existing position for inline display (returns empty string if flat)."""
-    if net_position == 0:
-        return ""
-    side = "YES" if net_position > 0 else "NO"
-    return f"  Position: {abs(net_position)} {side} contracts held"
-
-
-def _print_text_opportunity(
-    idx: int, opp: Opportunity, detail: dict | None, score: float,
-    existing_position: int = 0,
-) -> None:
-    print(_SEP)
-    alts = f"  (+{opp.n_alternatives} similar markets)" if opp.n_alternatives else ""
-    print(f"  [TEXT #{idx}  score={score:.2f}  display-only]  {opp.topic}  |  {opp.market_ticker}{alts}")
-    print(f"  Market:   {opp.market_title}")
-    print(_fmt_liquidity(detail) + f"  |  Source: {opp.source}")
-    pos_line = _fmt_position(existing_position)
-    if pos_line:
-        print(pos_line)
-    print(f"  Article:  {opp.doc_title}")
-    print(f"  URL:      {opp.doc_url}")
-
-
-def _print_numeric_opportunity(
-    idx: int, opp: NumericOpportunity, detail: dict | None, score: float,
-    existing_position: int = 0,
-) -> None:
-    if opp.direction == "between":
-        strike_str = f"{opp.strike_lo}–{opp.strike_hi}"
-    elif opp.strike is not None:
-        strike_str = str(opp.strike)
-    else:
-        strike_str = "N/A"
-
-    print(_SEP)
-    print(f"  [DATA #{idx}  score={score:.2f}]  {opp.metric}  |  {opp.market_ticker}")
-    print(f"  Market:   {opp.market_title}")
-    print(f"  Live:     {opp.data_value}{opp.unit}  (as of {opp.as_of})")
-    print(
-        f"  Strike:   {opp.direction.upper()} {strike_str}"
-        f"  →  implied {opp.implied_outcome}  (edge {opp.edge:.3f})"
-    )
-    print(_fmt_liquidity(detail) + f"  |  Source: {opp.source}")
-    pos_line = _fmt_position(existing_position)
-    if pos_line:
-        print(pos_line)
-
-
-def _print_poly_opportunity(
-    idx: int, opp: PolyOpportunity, detail: dict | None, score: float,
-    existing_position: int = 0,
-) -> None:
-    _SOURCE_LABELS = {
-        "polymarket": "Polymarket",
-        "metaculus":  "Metaculus",
-        "manifold":   "Manifold",
-        "predictit":  "PredictIt",
-    }
-    source_label = _SOURCE_LABELS.get(opp.source, opp.source.capitalize())
-    # Liquidity label varies by platform
-    if opp.source == "metaculus":
-        liq_str = f"{opp.poly_liquidity:.0f} forecasters"
-    elif opp.source == "predictit":
-        liq_str = f"vol=${opp.poly_liquidity:,.0f}"
-    else:
-        liq_str = f"liq=${opp.poly_liquidity:,.0f}"
-    print(_SEP)
-    print(f"  [EXT #{idx}  score={score:.2f}  src={source_label}]  divergence={opp.divergence:.2%}  |  {opp.kalshi_ticker}")
-    print(f"  Kalshi:   {opp.kalshi_title}")
-    print(f"  Kalshi p: {opp.kalshi_mid:.0f}¢  →  side={opp.implied_side.upper()}")
-    print(f"  {source_label} ({opp.poly_p_yes:.1%}  {liq_str}):")
-    print(f"    {opp.poly_question}")
-    print(f"  Match:    {opp.match_score:.2f}  |  " + _fmt_liquidity(detail))
-    pos_line = _fmt_position(existing_position)
-    if pos_line:
-        print(pos_line)
 
 
 # ---------------------------------------------------------------------------
@@ -1103,27 +979,6 @@ TEMP_LOW_YES_REQUIRE_FORECAST: bool = (
 TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR: int = int(
     os.environ.get("TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR", "12")
 )
-
-# Regex for the date segment in KXHIGH tickers: e.g. "26MAR10" in KXHIGHAUS-26MAR10-T75
-_TICKER_DATE_RE = re.compile(r"^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$")
-_MONTH_NUM = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
-
-def _ticker_date(ticker: str) -> date | None:
-    """Parse the market date from a KXHIGH ticker segment (e.g. KXHIGHAUS-26MAR10-T75 → date(2026,3,10))."""
-    parts = ticker.split("-")
-    if len(parts) < 2:
-        return None
-    m = _TICKER_DATE_RE.match(parts[1])
-    if not m:
-        return None
-    try:
-        return date(2000 + int(m.group(1)), _MONTH_NUM[m.group(2)], int(m.group(3)))
-    except (ValueError, KeyError):
-        return None
 
 
 def _compute_trajectory_projections(
@@ -1226,12 +1081,151 @@ def _compute_trajectory_projections(
     return points
 
 
+# ---------------------------------------------------------------------------
+# Weather gate helpers (sub-functions of _filter_weather_opportunities)
+# ---------------------------------------------------------------------------
+
+_OBS_CONFIRMED = frozenset({"noaa_observed", "nws_climo", "metar"})
+
+
+def _gate_date_alignment(
+    opp: "NumericOpportunity",
+    now: "datetime",
+) -> bool:
+    """Return False if opp should be dropped due to date mismatch, True otherwise."""
+    if opp.as_of:
+        try:
+            as_of_utc = datetime.fromisoformat(opp.as_of.replace("Z", "+00:00"))
+            as_of_et_date = as_of_utc.astimezone(_ET).date()
+            market_date = _ticker_date(opp.market_ticker)
+            if market_date is not None and market_date != as_of_et_date:
+                logging.debug(
+                    "NOAA date guard: dropped %s — market date %s ≠ data ET date %s",
+                    opp.market_ticker, market_date, as_of_et_date,
+                )
+                return False
+        except (ValueError, AttributeError):
+            pass
+    elif opp.source in ("noaa_observed", "metar", "nws_climo"):
+        _city_tz_dg = _CITY_TZ.get(opp.metric)
+        if _city_tz_dg is not None:
+            _local_date_dg = now.astimezone(_city_tz_dg).date()
+            _mkt_date_dg = _ticker_date(opp.market_ticker)
+            if _mkt_date_dg is not None and _mkt_date_dg != _local_date_dg:
+                logging.debug(
+                    "NOAA date guard (no as_of): dropped %s — market %s ≠ local %s",
+                    opp.market_ticker, _mkt_date_dg, _local_date_dg,
+                )
+                return False
+    return True
+
+
+def _gate_forecast_source(
+    opp: "NumericOpportunity",
+    hrrr_hourly_highs: "dict[str, float] | None",
+    observed_values: "dict[str, float] | None",
+    opp_log,
+) -> bool:
+    """Return True to keep this forecast-source opp, False to suppress.
+
+    Applies: edge gate, morning observation gap gate, HRRR spread gate.
+    """
+    _min_edge = _resolve_min_edge(
+        opp.source, opp.direction,
+        metric=opp.metric, implied_outcome=opp.implied_outcome,
+    )
+    if opp.edge < _min_edge:
+        if opp_log is not None:
+            opp_log.log_suppression(
+                ticker=opp.market_ticker,
+                source=opp.source,
+                gate="edge_min",
+                metric=opp.metric,
+                edge_f=opp.edge,
+                value=opp.data_value,
+                strike=opp.strike,
+                yes_bid=int(opp.current_market_price) if isinstance(opp.current_market_price, (int, float)) else None,
+                note=f"min_edge={_min_edge:.1f} direction={opp.direction}",
+            )
+        return False
+
+    # Morning observation gap gate: block forecast YES when observed is far below strike.
+    if (
+        opp.implied_outcome == "YES"
+        and not opp.source.startswith("noaa_day")
+        and MORNING_OBS_GAP_F > 0
+        and observed_values is not None
+        and opp.strike is not None
+    ):
+        obs_val = observed_values.get(opp.metric)
+        if obs_val is not None and (opp.strike - obs_val) > MORNING_OBS_GAP_F:
+            logging.info(
+                "Morning gate: suppressed %s YES forecast — observed %.1f°F"
+                " is %.1f°F below strike %.1f°F (gap > %.0f°F threshold)",
+                opp.market_ticker, obs_val,
+                opp.strike - obs_val, opp.strike, MORNING_OBS_GAP_F,
+            )
+            return False
+
+    # HRRR spread gate: suppress when hourly and daily forecasts disagree on outcome.
+    is_future_day = (
+        opp.source.startswith("noaa_day")
+        or (
+            opp.source in ("open_meteo", "nws_hourly", "weatherapi")
+            and opp.metadata.get("forecast_offset", 0) > 0
+        )
+    )
+    if hrrr_hourly_highs and not is_future_day:
+        hourly_high = hrrr_hourly_highs.get(opp.metric)
+        if hourly_high is not None:
+            spread = abs(opp.data_value - hourly_high)
+            if spread >= HRRR_MAX_SPREAD_F:
+                outcome_flips = True
+                if opp.strike is not None:
+                    if opp.direction == "over":
+                        daily_yes = opp.data_value >= opp.strike
+                        hourly_yes = hourly_high >= opp.strike
+                    else:
+                        daily_yes = opp.data_value <= opp.strike
+                        hourly_yes = hourly_high <= opp.strike
+                    outcome_flips = (daily_yes != hourly_yes)
+                if outcome_flips:
+                    logging.info(
+                        "HRRR gate: suppressed %s — daily %.1f°F vs hourly %.1f°F"
+                        " (spread %.1f°F flips outcome across strike %.1f°F)",
+                        opp.market_ticker, opp.data_value, hourly_high,
+                        spread, opp.strike or 0.0,
+                    )
+                    if opp_log is not None:
+                        opp_log.log_suppression(
+                            ticker=opp.market_ticker,
+                            source=opp.source,
+                            gate="hrrr_spread",
+                            metric=opp.metric,
+                            edge_f=opp.edge,
+                            value=opp.data_value,
+                            strike=opp.strike,
+                            yes_bid=int(opp.current_market_price) if isinstance(opp.current_market_price, (int, float)) else None,
+                            note=f"hrrr_hourly={hourly_high:.1f} spread={spread:.1f}",
+                        )
+                    return False
+                else:
+                    logging.info(
+                        "HRRR spread %.1f°F on %s — daily %.1f°F and"
+                        " hourly %.1f°F agree on outcome; allowing through",
+                        spread, opp.market_ticker,
+                        opp.data_value, hourly_high,
+                    )
+    return True
+
+
 def _filter_weather_opportunities(
     opps: list[NumericOpportunity],
     markets: list[dict],
     hrrr_hourly_highs: dict[str, float] | None = None,
     observed_values: dict[str, float] | None = None,
     fc_low_by_metric: dict[str, float] | None = None,
+    opp_log=None,
 ) -> list[NumericOpportunity]:
     """Apply source-specific quality gates to temperature (KXHIGH) opportunities.
 
@@ -1247,7 +1241,7 @@ def _filter_weather_opportunities(
         its own ensemble is highly confident.  Treated identically to
         noaa_observed: lower edge threshold, never gated by HRRR spread.
 
-    noaa / owm / open_meteo  (raw model forecast)
+    noaa / open_meteo  (raw model forecast)
         Require edge >= TEMP_FORECAST_MIN_EDGE (7°F ≈ 2σ of day-1 MAE).
         Additionally gated by HRRR spread for same-day forecasts: if
         |daily_forecast − hourly_hrrr| >= HRRR_MAX_SPREAD_F the atmosphere
@@ -1283,7 +1277,6 @@ def _filter_weather_opportunities(
     # Obs-consensus pre-pass: for each (metric, strike), count how many
     # confirmed-observation sources (noaa_observed, nws_climo) already show
     # YES *and* pass the afternoon hour gate.  Used below to gate YES trades.
-    _OBS_CONFIRMED = frozenset({"noaa_observed", "nws_climo", "metar"})
     obs_yes_sources: dict[tuple[str, float | None], set[str]] = {}
     if OBS_CONSENSUS_MIN > 1:
         for _o in opps:
@@ -1306,43 +1299,9 @@ def _filter_weather_opportunities(
             result.append(opp)
             continue
 
-        # Date guard: NOAA DataPoints carry an `as_of` timestamp in UTC.
-        # After midnight UTC (~7 PM ET), the UTC date is already the next
-        # calendar day while the ET date is still "today".  Without this
-        # check, today's observed temperature would match tomorrow's Kalshi
-        # market, producing spurious near-certain signals on the wrong day.
-        #
-        # Rule: the market's date (parsed from the ticker, e.g. 26MAR10 →
-        # 2026-03-10) must equal the ET date of the DataPoint's as_of
-        # timestamp.  Opportunities that span a date boundary are dropped.
-        if opp.as_of:
-            try:
-                as_of_utc = datetime.fromisoformat(opp.as_of.replace("Z", "+00:00"))
-                as_of_et_date = as_of_utc.astimezone(_ET).date()
-                market_date = _ticker_date(opp.market_ticker)
-                if market_date is not None and market_date != as_of_et_date:
-                    logging.debug(
-                        "NOAA date guard: dropped %s — market date %s ≠ data ET date %s",
-                        opp.market_ticker, market_date, as_of_et_date,
-                    )
-                    continue
-            except (ValueError, AttributeError):
-                pass  # malformed as_of: allow through, worse case is a bad signal
-        elif opp.source in ("noaa_observed", "metar", "nws_climo"):
-            # as_of is absent — fall back to a wall-clock city-local date check so
-            # observed DataPoints with missing timestamps still get date-guarded.
-            # Without this, a None as_of bypasses the crossover-bug guard entirely.
-            _city_tz_dg = _CITY_TZ.get(opp.metric)
-            if _city_tz_dg is not None:
-                _local_date_dg = now.astimezone(_city_tz_dg).date()
-                _mkt_date_dg = _ticker_date(opp.market_ticker)
-                if _mkt_date_dg is not None and _mkt_date_dg != _local_date_dg:
-                    logging.debug(
-                        "NOAA date guard (no as_of): dropped %s — market %s ≠ local %s",
-                        opp.market_ticker, _mkt_date_dg, _local_date_dg,
-                    )
-                    continue
-
+        # Date guard: market date must match the data's local ET date.
+        if not _gate_date_alignment(opp, now):
+            continue
 
         if opp.source in ("noaa_observed", "metar", "nws_climo", "nws_alert"):
             # High-confidence signals: ground truth (observed/climo) or NWS
@@ -1350,7 +1309,17 @@ def _filter_weather_opportunities(
             if opp.direction == "over":
                 min_edge = TEMP_OBSERVED_MIN_EDGE_OVER
             elif opp.direction == "between":
-                min_edge = TEMP_OBSERVED_MIN_EDGE_BETWEEN
+                # KXLOWT between YES needs a stricter edge: the observed running
+                # minimum is a ceiling, not the confirmed daily low.  Overnight
+                # cooling can push the temp below the band floor before settlement.
+                if (
+                    KXLOWT_OBS_BETWEEN_YES_MIN_EDGE > 0
+                    and opp.implied_outcome == "YES"
+                    and opp.metric.startswith("temp_low_")
+                ):
+                    min_edge = KXLOWT_OBS_BETWEEN_YES_MIN_EDGE
+                else:
+                    min_edge = TEMP_OBSERVED_MIN_EDGE_BETWEEN
             else:
                 min_edge = TEMP_OBSERVED_MIN_EDGE_UNDER
             if opp.edge < min_edge:
@@ -1507,6 +1476,18 @@ def _filter_weather_opportunities(
                                 local_dt.hour, local_dt.minute,
                                 min_mins // 60, min_mins % 60,
                             )
+                            if opp_log is not None:
+                                opp_log.log_suppression(
+                                    ticker=opp.market_ticker,
+                                    source=opp.source,
+                                    gate="obs_afternoon_gate",
+                                    metric=opp.metric,
+                                    edge_f=opp.edge,
+                                    value=opp.data_value,
+                                    strike=opp.strike,
+                                    yes_bid=int(opp.current_market_price) if isinstance(opp.current_market_price, (int, float)) else None,
+                                    note=f"local={local_dt.hour:02d}:{local_dt.minute:02d} need={min_mins//60:02d}:{min_mins%60:02d}",
+                                )
                             continue
 
                         # After 4:30 PM the daily max is established — the upper
@@ -1535,6 +1516,62 @@ def _filter_weather_opportunities(
                             continue
 
                     if opp.direction == "between" and getattr(opp, "peak_past", False):
+                        # Forecast contradiction gate: even after the afternoon
+                        # peak-past cutoff, check whether HRRR or NOAA's day-1
+                        # forecast predicts the daily high will meet or exceed
+                        # strike_hi.  If so, the temperature is expected to exit
+                        # the band from above — suppress the YES.
+                        #
+                        # Uses two independent sources:
+                        #   1. HRRR hourly max (most real-time, updates ~hourly)
+                        #   2. opp.metadata["forecast_high"] (NOAA day-1 attached
+                        #      to the noaa_observed DataPoint at fetch time)
+                        #
+                        # Why HRRR can still be wrong here: HRRR runs hourly and
+                        # different model initializations can revise the predicted
+                        # daily max up or down.  Using BOTH sources guards against
+                        # a single-model revision that lowballs the peak.  If
+                        # either source's prediction ≥ strike_hi, suppress.
+                        if opp.strike_hi is not None:
+                            _fc_ceiling_hits: dict[str, float] = {}
+                            _hrrr_hi = (hrrr_hourly_highs or {}).get(opp.metric)
+                            _noaa_meta_hi = (opp.metadata or {}).get("forecast_high")
+                            # Kalshi resolves on the official NWS whole-degree
+                            # high, so the effective band ceiling is strike_hi+0.5:
+                            # any actual temp ≥ strike_hi+0.5 rounds to
+                            # strike_hi+1 = outside the band.  HRRR and NOAA
+                            # both report in whole degrees (from NWS grids), so
+                            # the comparison ≥ strike_hi+0.5 is equivalent to
+                            # "forecast rounds to a value above the band ceiling".
+                            _ceil = opp.strike_hi + 0.5
+                            if _hrrr_hi is not None and _hrrr_hi >= _ceil:
+                                _fc_ceiling_hits["hrrr"] = _hrrr_hi
+                            if _noaa_meta_hi is not None and _noaa_meta_hi >= _ceil:
+                                _fc_ceiling_hits["noaa"] = _noaa_meta_hi
+                            if _fc_ceiling_hits:
+                                logging.info(
+                                    "Between-band YES fc-contradiction gate:"
+                                    " suppressing %s %s — forecast(s) %s"
+                                    " predict high ≥ strike_hi %.1f°F"
+                                    " (observed=%.1f°F)",
+                                    opp.source, opp.market_ticker,
+                                    {k: f"{v:.1f}°F" for k, v in _fc_ceiling_hits.items()},
+                                    opp.strike_hi, opp.data_value,
+                                )
+                                if opp_log is not None:
+                                    opp_log.log_suppression(
+                                        ticker=opp.market_ticker,
+                                        source=opp.source,
+                                        gate="between_yes_fc_contradict",
+                                        metric=opp.metric,
+                                        edge_f=opp.edge,
+                                        value=opp.data_value,
+                                        strike=opp.strike_hi,
+                                        yes_bid=int(opp.current_market_price) if isinstance(opp.current_market_price, (int, float)) else None,
+                                        note=f"fc={_fc_ceiling_hits} strike_hi={opp.strike_hi:.1f}",
+                                    )
+                                continue
+
                         logging.info(
                             "%s LOCKED-BETWEEN-YES: %s  observed %.1f°F inside"
                             " [%.1f, %.1f], peak confirmed past %02d:%02d"
@@ -1597,82 +1634,608 @@ def _filter_weather_opportunities(
                         result.append(opp)
 
         else:
-            # Raw forecast sources. Edge gate is per-source + direction calibrated
-            # via _resolve_min_edge() (falls back to TEMP_DAY2_MIN_EDGE /
-            # TEMP_FORECAST_MIN_EDGE for sources not in the override dicts).
-            if opp.edge < _resolve_min_edge(opp.source, opp.direction):
+            # Raw forecast sources: edge gate + morning gap gate + HRRR spread gate.
+            if not _gate_forecast_source(opp, hrrr_hourly_highs, observed_values, opp_log):
                 continue
-
-            # Morning observation gate: block forecast YES signals when the
-            # current observed max is too far below the strike to be credible.
-            # Extended forecasts (noaa_day2 … noaa_day7) are exempt — today's
-            # observed max is irrelevant to a future day's expected high.
-            if (
-                opp.implied_outcome == "YES"
-                and not opp.source.startswith("noaa_day")
-                and MORNING_OBS_GAP_F > 0
-                and observed_values is not None
-                and opp.strike is not None
-            ):
-                obs_val = observed_values.get(opp.metric)
-                if obs_val is not None and (opp.strike - obs_val) > MORNING_OBS_GAP_F:
-                    logging.info(
-                        "Morning gate: suppressed %s YES forecast — observed %.1f°F"
-                        " is %.1f°F below strike %.1f°F (gap > %.0f°F threshold)",
-                        opp.market_ticker, obs_val,
-                        opp.strike - obs_val, opp.strike, MORNING_OBS_GAP_F,
-                    )
-                    continue
-
-            # HRRR spread gate: suppress when hourly and daily forecasts disagree.
-            # Only applies to same-day forecasts — extended-day sources
-            # (noaa_day2 … noaa_day7, open_meteo day1+) target a future date,
-            # so today's HRRR hourly peak is not a valid quality signal for them.
-            is_future_day = (
-                opp.source.startswith("noaa_day")
-                or (
-                    opp.source in ("open_meteo", "nws_hourly", "weatherapi")
-                    and opp.metadata.get("forecast_offset", 0) > 0
-                )
-            )
-            if hrrr_hourly_highs and not is_future_day:
-                hourly_high = hrrr_hourly_highs.get(opp.metric)
-                if hourly_high is not None:
-                    spread = abs(opp.data_value - hourly_high)
-                    if spread >= HRRR_MAX_SPREAD_F:
-                        # Only block if the spread puts daily and hourly on
-                        # opposite sides of the strike — if both forecasts still
-                        # predict the same outcome, spread uncertainty in magnitude
-                        # does not change the trade direction.
-                        outcome_flips = True  # default: block when no strike info
-                        if opp.strike is not None:
-                            if opp.direction == "over":
-                                daily_yes = opp.data_value >= opp.strike
-                                hourly_yes = hourly_high >= opp.strike
-                            else:  # "under"
-                                daily_yes = opp.data_value <= opp.strike
-                                hourly_yes = hourly_high <= opp.strike
-                            outcome_flips = (daily_yes != hourly_yes)
-
-                        if outcome_flips:
-                            logging.info(
-                                "HRRR gate: suppressed %s — daily %.1f°F vs hourly %.1f°F"
-                                " (spread %.1f°F flips outcome across strike %.1f°F)",
-                                opp.market_ticker, opp.data_value, hourly_high,
-                                spread, opp.strike or 0.0,
-                            )
-                            continue
-                        else:
-                            logging.info(
-                                "HRRR spread %.1f°F on %s — daily %.1f°F and"
-                                " hourly %.1f°F agree on outcome; allowing through",
-                                spread, opp.market_ticker,
-                                opp.data_value, hourly_high,
-                            )
-
             result.append(opp)
 
     return result
+
+
+def _apply_forecast_consensus(
+    numeric_opps: list[NumericOpportunity],
+    data_points: list[DataPoint],
+    opp_log: OpportunityLog,
+) -> tuple[list[NumericOpportunity], dict[str, float], dict[str, float]]:
+    """Tiered forecast-source consensus filter for temperature markets.
+
+    Returns (filtered_opps, obs_value, fc_low_by_metric).
+    """
+    # Build a direct lookup of noaa_observed values from raw data_points
+    # so we can detect conflicts even when the observed opp was filtered out.
+    _obs_value: dict[str, float] = {}
+    for _dp in data_points:
+        if _dp.source in ("noaa_observed", "metar") and _dp.metric.startswith(("temp_high", "temp_low")):
+            # metar updates faster — prefer it over noaa_observed when both present
+            if _dp.source == "metar" or _dp.metric not in _obs_value:
+                _obs_value[_dp.metric] = _dp.value
+
+    # Forecast low per temp_low metric from all model sources.
+    # Keeps the most conservative (lowest) value across noaa, hrrr,
+    # nws_hourly, and open_meteo so the KXLOWT contradiction gate has
+    # the broadest possible coverage.  Used by _filter_weather_opportunities
+    # and the inline KXLOWT gate below.
+    _fc_low_by_metric: dict[str, float] = {}
+    _FC_LOW_SOURCES = {"noaa", "hrrr", "nws_hourly", "open_meteo"}
+    for _dp in data_points:
+        if _dp.source in _FC_LOW_SOURCES and _dp.metric.startswith("temp_low_"):
+            _existing = _fc_low_by_metric.get(_dp.metric)
+            if _existing is None or _dp.value < _existing:
+                _fc_low_by_metric[_dp.metric] = _dp.value
+
+    by_key: dict[tuple[str, str], list[NumericOpportunity]] = collections.defaultdict(list)
+    for opp in numeric_opps:
+        by_key[(opp.metric, opp.market_ticker)].append(opp)
+
+    consensus_opps: list[NumericOpportunity] = []
+    for (metric, ticker), group in by_key.items():
+        if not metric.startswith(("temp_high", "temp_low")):
+            consensus_opps.extend(group)
+            continue
+        # noaa_observed, nws_climo, nws_alert are ground-truth / high-confidence
+        # — always pass through the consensus check unchanged.
+        # open_meteo is excluded from the unanimity check: it uses raw GFS output which
+        # systematically underestimates cold-front timing/intensity and lags
+        # NWS human-adjusted forecasts by 6-18 hours.  NOAA day-2+ is already
+        # a multi-model blend (NBM) superior to raw GFS, so GFS should not
+        # veto it.  Open-Meteo still runs and its DataPoints still count toward
+        # corroboration when it agrees with NOAA, but it cannot block a NOAA
+        # signal by disagreeing.
+        _PASS_THROUGH = ("noaa_observed", "metar", "nws_climo", "nws_alert")
+
+        # Compute market date and same-day flag before building _EXCLUDE so
+        # we can tune which sources participate in the vote.
+        mkt_date = _ticker_date(ticker)
+        today_et = datetime.now(_ET).date()
+        is_same_day_mkt = (mkt_date is not None and mkt_date == today_et)
+
+        # noaa_day2–7 draw from the same NWS forecast grid as nws_hourly
+        # day+1/2, so counting both creates correlated double-counting.
+        # Exception: for future-day markets (tomorrow+), only nws_hourly and
+        # weatherapi vote, which makes a 1-1 tie structurally unbreakable.
+        # Allowing noaa_day2 to join the vote gives 3 genuinely independent
+        # data points (NWS hourly, WeatherAPI, NOAA NBM blend) so a majority
+        # always emerges.  noaa_day2 on same-day markets fails date alignment
+        # below anyway (as_of = tomorrow ≠ today's market), so this only
+        # changes behaviour for tomorrow-closing markets.
+        # open_meteo is excluded for same-day markets (HRRR hourly is better
+        # and avoids GFS model noise intra-day), but included for future-day
+        # markets where it is a genuinely independent source that can
+        # corroborate NWS extended forecasts.  open_meteo is NOT derived from
+        # the NWS NBM blending pipeline, making it genuinely independent.
+        _EXCLUDE_BASE = ("noaa_day3", "noaa_day4",
+                         "noaa_day5", "noaa_day6", "noaa_day7")
+        _EXCLUDE = _EXCLUDE_BASE + (("noaa_day2", "open_meteo") if is_same_day_mkt else ())
+        observed = [o for o in group if o.source in _PASS_THROUGH]
+        forecasts = [o for o in group if o.source not in _PASS_THROUGH and o.source not in _EXCLUDE]
+
+        # ---- KXLOWT observed-YES contradiction gate ----------------------------
+        # For daily-low markets, a morning running-minimum above the strike does
+        # NOT lock in a YES outcome — temperatures can still fall later in the day
+        # (e.g. cold-front passage in Chicago in April).  Suppress noaa_observed /
+        # metar YES signals when any forecast model predicts the daily low will be
+        # within LOWT_FORECAST_GATE_BUFFER_F degrees of (or below) the strike.
+        # The buffer (default 3°F ≈ NWS day-1 MAE) catches "dangerously close"
+        # forecasts like 54°F vs 53°F strike where model uncertainty is material.
+        if (
+            NUMERIC_LOWT_FORECAST_GATE
+            and metric.startswith("temp_low_")
+            and "KXLOWT" in ticker
+        ):
+            _obs_yes = [
+                o for o in observed
+                if o.implied_outcome == "YES"
+                and o.source in ("noaa_observed", "metar")
+            ]
+            if _obs_yes:
+                _strike = min(
+                    (o.strike for o in _obs_yes if o.strike is not None),
+                    default=None,
+                )
+                _fc_low = _fc_low_by_metric.get(metric)
+                if (
+                    _strike is not None
+                    and _fc_low is not None
+                    and _fc_low < _strike + LOWT_FORECAST_GATE_BUFFER_F
+                ):
+                    logging.warning(
+                        "KXLOWT forecast-contradiction gate: suppressing %s "
+                        "observed YES for %s — forecast low %.1f°F < strike "
+                        "%.1f°F + buffer %.1f°F",
+                        ", ".join(o.source for o in _obs_yes),
+                        ticker, _fc_low, _strike, LOWT_FORECAST_GATE_BUFFER_F,
+                    )
+                    for _suppressed_obs in _obs_yes:
+                        opp_log.log_suppression(
+                            ticker=ticker,
+                            source=_suppressed_obs.source,
+                            gate="kxlowt_fc_contra",
+                            metric=metric,
+                            edge_f=_suppressed_obs.edge,
+                            value=_suppressed_obs.data_value,
+                            strike=_strike,
+                            yes_bid=int(_suppressed_obs.current_market_price) if isinstance(_suppressed_obs.current_market_price, (int, float)) else None,
+                            note=f"fc_low={_fc_low:.1f} buf={LOWT_FORECAST_GATE_BUFFER_F:.1f}",
+                        )
+                    observed = [o for o in observed if o not in _obs_yes]
+
+        # ---- KXLOWT obs-YES positive confirmation gate --------------------
+        # After the contradiction gate, if any noaa_observed/metar YES
+        # signals survived, require at least KXLOWT_OBS_YES_FC_CONFIRM_MIN
+        # forecast sources to actively predict fc_low > strike (not just
+        # "not contradicting" — at least one model must clearly confirm YES).
+        if (
+            KXLOWT_OBS_YES_FC_CONFIRM_MIN > 0
+            and metric.startswith("temp_low_")
+            and "KXLOWT" in ticker
+        ):
+            _surviving_obs_yes = [
+                o for o in observed
+                if o.implied_outcome == "YES"
+                and o.source in ("noaa_observed", "metar")
+            ]
+            if _surviving_obs_yes:
+                _confirm_strike = min(
+                    (o.strike for o in _surviving_obs_yes if o.strike is not None),
+                    default=None,
+                )
+                if _confirm_strike is not None:
+                    # Count distinct forecast sources predicting fc_low > strike
+                    _fc_confirming_sources = {
+                        _dp.source for _dp in data_points
+                        if _dp.source in _FC_LOW_SOURCES
+                        and _dp.metric == metric
+                        and _dp.value > _confirm_strike
+                    }
+                    _fc_confirming = len(_fc_confirming_sources)
+                    _suppress = False
+                    _suppress_reason = ""
+
+                    if _fc_confirming < KXLOWT_OBS_YES_FC_CONFIRM_MIN:
+                        _suppress = True
+                        _suppress_reason = (
+                            f"only {_fc_confirming} forecast source(s) confirm"
+                            f" fc_low > {_confirm_strike:.1f}°F (need"
+                            f" {KXLOWT_OBS_YES_FC_CONFIRM_MIN})"
+                        )
+                    elif (
+                        KXLOWT_OBS_YES_NEAR_TERM_REQUIRED
+                        and not (_fc_confirming_sources & _KXLOWT_NEAR_TERM_SOURCES)
+                    ):
+                        # Total count is sufficient but no near-term model
+                        # (hrrr/nws_hourly) is among the confirmers.  Near-term
+                        # models have 2–3°F MAE vs 3–5°F for global day-ahead
+                        # models and are essential for overnight cold-front timing.
+                        _suppress = True
+                        _suppress_reason = (
+                            f"no near-term model (hrrr/nws_hourly) confirms"
+                            f" fc_low > {_confirm_strike:.1f}°F —"
+                            f" confirming sources: {_fc_confirming_sources or 'none'}"
+                        )
+
+                    if _suppress:
+                        logging.info(
+                            "KXLOWT obs-YES confirmation gate: suppressing %s YES %s"
+                            " — %s",
+                            ", ".join(o.source for o in _surviving_obs_yes),
+                            ticker, _suppress_reason,
+                        )
+                        observed = [o for o in observed if o not in _surviving_obs_yes]
+
+        # Date-alignment pre-filter: remove forecast DataPoints whose as_of
+        # date does not match the market's resolution date.  Without this,
+        # NOAA day-1 (as_of = today) and NOAA day-2 (as_of = tomorrow) both
+        # appear in the same (metric, ticker) group for a tomorrow-closing
+        # market and disagree with each other, triggering a false "disagree"
+        # block.  Pass-through (observed) signals are exempt — they reflect
+        # the current day's running maximum and are always relevant.
+        if mkt_date is not None:
+            aligned: list[NumericOpportunity] = []
+            for _fc in forecasts:
+                if not _fc.as_of:
+                    aligned.append(_fc)
+                    continue
+                try:
+                    _fc_date = (
+                        datetime.fromisoformat(_fc.as_of.replace("Z", "+00:00"))
+                        .astimezone(_ET)
+                        .date()
+                    )
+                    if _fc_date == mkt_date:
+                        aligned.append(_fc)
+                except (ValueError, AttributeError):
+                    aligned.append(_fc)
+            forecasts = aligned
+
+        # Multiple observed sources (noaa_observed, nws_observed) can fire on
+        # the same (metric, ticker) in the same poll cycle.  Keep only the
+        # highest-edge signal so downstream trade_executor sees one clean
+        # opportunity rather than duplicate orders for the same market.
+        seen_obs: dict[str, NumericOpportunity] = {}
+        for _obs in observed:
+            key = f"{_obs.metric}|{_obs.market_ticker}"
+            if key not in seen_obs or abs(_obs.edge) > abs(seen_obs[key].edge):
+                seen_obs[key] = _obs
+        consensus_opps.extend(seen_obs.values())
+
+        if not forecasts:
+            continue
+
+        # Tiered consensus — replaces strict unanimity which became
+        # intractable once 4 sources were in the blocking pool.
+        #
+        # Same-day markets: nws_hourly and hrrr update every hour and
+        # track cold fronts in real-time.  NOAA updates only 4×/day and
+        # can be 10-20°F stale.  When same-day real-time sources agree,
+        # use their direction.  Only override if ALL slower daily sources
+        # also oppose (i.e., unanimous disagreement across 2+ daily sources).
+        #
+        # Future-day markets: NOAA multi-model blend is most reliable at
+        # longer horizons.  Use majority vote among all forecasts; a tie
+        # is too uncertain to trade.
+        _REALTIME_SRCS = frozenset(("nws_hourly", "hrrr"))
+        # mkt_date, today_et, is_same_day_mkt already computed above.
+
+        realtime_fc = [o for o in forecasts if o.source in _REALTIME_SRCS]
+        daily_fc = [o for o in forecasts if o.source not in _REALTIME_SRCS]
+
+        if is_same_day_mkt and realtime_fc:
+            # Real-time sources must agree with each other first.
+            rt_outcomes = {o.implied_outcome for o in realtime_fc}
+            if len(rt_outcomes) > 1:
+                logging.info(
+                    "Consensus filter: real-time sources split on %s %s"
+                    " — skipping (sources: %s)",
+                    metric, ticker, {o.source for o in realtime_fc},
+                )
+                continue
+            forecast_outcome = next(iter(rt_outcomes))
+            # Only block when ALL daily-update sources (e.g. NOAA + WeatherAPI)
+            # oppose the real-time direction.  A lone NOAA disagreement (stale
+            # zone forecast) should not override nws_hourly+hrrr consensus.
+            daily_oppose = [o for o in daily_fc if o.implied_outcome != forecast_outcome]
+            if len(daily_oppose) == len(daily_fc) and len(daily_fc) >= 2:
+                logging.info(
+                    "Consensus filter: all daily sources %s oppose"
+                    " real-time (%s) on %s %s — skipping",
+                    {o.source for o in daily_oppose},
+                    forecast_outcome, metric, ticker,
+                )
+                continue
+        else:
+            # Future-day (or no real-time source present): NWS-primary logic.
+            #
+            # nws_hourly and noaa_day2 are both NWS products (hourly zone
+            # forecast and NBM extended blend respectively) and are the most
+            # reliable multi-day forecast sources.  open_meteo (raw ECMWF/GFS)
+            # and weatherapi (third-party model) act as independent validators.
+            #
+            # If NWS sources agree with each other, treat their direction as
+            # primary and only block if ALL external validators unanimously
+            # oppose — the same asymmetric rule used on same-day markets where
+            # nws_hourly+hrrr are primary.  A 2-2 tie (NWS vs external) is
+            # resolved in favour of NWS rather than leaving the market untraded.
+            #
+            # If NWS sources disagree or are absent, fall back to majority vote.
+            _NWS_SRCS = frozenset(("nws_hourly", "noaa_day2"))
+            _EXT_SRCS = frozenset(("open_meteo", "weatherapi"))
+            nws_fc = [o for o in forecasts if o.source in _NWS_SRCS]
+            ext_fc = [o for o in forecasts if o.source in _EXT_SRCS]
+            nws_outcomes = {o.implied_outcome for o in nws_fc}
+
+            if len(nws_fc) >= 2 and len(nws_outcomes) == 1:
+                # Both NWS sources agree → use NWS direction.
+                forecast_outcome = next(iter(nws_outcomes))
+                ext_oppose = [o for o in ext_fc if o.implied_outcome != forecast_outcome]
+                if ext_oppose and len(ext_oppose) == len(ext_fc) and len(ext_fc) >= 2:
+                    # ALL external models unanimously oppose NWS → too uncertain.
+                    logging.info(
+                        "Consensus filter: all external models %s oppose"
+                        " NWS primary (%s) on %s %s — skipping",
+                        {o.source for o in ext_oppose},
+                        forecast_outcome, metric, ticker,
+                    )
+                    continue
+                logging.info(
+                    "Consensus filter: NWS primary (%s) on %s %s"
+                    " — %d external validator(s) oppose but not unanimous; allowing",
+                    forecast_outcome, metric, ticker, len(ext_oppose),
+                )
+            else:
+                # NWS sources disagree or absent: plain majority vote.
+                yes_count = sum(1 for o in forecasts if o.implied_outcome == "YES")
+                no_count = sum(1 for o in forecasts if o.implied_outcome == "NO")
+                if yes_count == no_count:
+                    logging.info(
+                        "Consensus filter: forecasts tied on %s %s — skipping"
+                        " (sources: %s yes=%d no=%d)",
+                        metric, ticker,
+                        {o.source for o in forecasts}, yes_count, no_count,
+                    )
+                    continue
+                forecast_outcome = "YES" if yes_count > no_count else "NO"
+        # Cross-check against raw noaa_observed data even when that
+        # observation is too expensive to trade (not in numeric_opps).
+        #
+        # IMPORTANT: only valid for same-day markets.  For future-day markets
+        # (tomorrow or later), today's observed temperature has no bearing on
+        # tomorrow's forecast — of course today's high is below tomorrow's
+        # warm-day strike.  Applying this check to future-day markets silently
+        # suppressed ALL future-day YES forecasts where today's temp hadn't
+        # yet reached tomorrow's strike (e.g. Austin T86: today 72°F → "NO"
+        # conflicts with noaa_day2+weatherapi "YES" for tomorrow → suppressed).
+        obs_val = _obs_value.get(metric)
+        if obs_val is not None and not observed and is_same_day_mkt:
+            ref = forecasts[0]
+            if ref.direction == "over" and ref.strike is not None:
+                obs_outcome = "YES" if obs_val >= ref.strike else "NO"
+            elif ref.direction == "under" and ref.strike is not None:
+                obs_outcome = "YES" if obs_val <= ref.strike else "NO"
+            else:
+                obs_outcome = None
+            if obs_outcome is not None and obs_outcome != forecast_outcome:
+                logging.info(
+                    "Consensus filter: noaa_observed (%.1f°F → %s) conflicts"
+                    " with forecast (%s) on %s %s — suppressing forecast",
+                    obs_val, obs_outcome, forecast_outcome, metric, ticker,
+                )
+                continue
+        # Cross-source corroboration gate: for YES forecast signals,
+        # require at least FORECAST_CORROBORATION_MIN distinct sources to
+        # agree.  Lone signals (only one model sees it) are model noise.
+        #
+        # Special rule: open_meteo (raw GFS) may never trade solo —
+        # it systematically underestimates cold-front timing/intensity and
+        # is already embedded in NOAA's blended forecast.  A lone
+        # open_meteo YES is suppressed regardless of FORECAST_CORROBORATION_MIN.
+        # NOAA-family sources (noaa, noaa_day2 … noaa_day7) may trade solo
+        # when FORECAST_CORROBORATION_MIN=1 since they are already a
+        # multi-model blend with human forecaster adjustments.
+        if forecast_outcome == "YES":
+            yes_sources = {o.source for o in forecasts if o.implied_outcome == "YES"}
+            # obs_trajectory is an observed-trend signal (derived from real METAR
+            # readings) — treated alongside noaa/hrrr as a trusted source.
+            noaa_yes = {
+                s for s in yes_sources
+                if s.startswith("noaa") or s in ("hrrr", "obs_trajectory")
+            }
+            # Sources that may never trade solo (unreliable standalone forecasts):
+            # - open_meteo: raw GFS, systematically underestimates cold-front timing
+            # - weatherapi: commercial aggregator with demonstrated day+0/+1 errors
+            #   (7°F+ same-day, >16°F next-day). Can still vote in consensus.
+            _SOLO_BLOCKED = {"open_meteo", "weatherapi"}
+            gfs_only = not noaa_yes  # True when no NOAA/HRRR/obs_trajectory source is in YES set
+            solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
+            if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
+                logging.info(
+                    "Corroboration gate: lone %s YES on %s %s — "
+                    "unreliable source may not trade solo; suppressed",
+                    ", ".join(yes_sources), metric, ticker,
+                )
+                _rep = next((o for o in forecasts if o.implied_outcome == "YES"), forecasts[0])
+                opp_log.log_suppression(
+                    ticker=ticker, source=",".join(sorted(yes_sources)), gate="corr_solo_yes",
+                    metric=metric, edge_f=_rep.edge, value=_rep.data_value, strike=_rep.strike,
+                    yes_bid=int(_rep.current_market_price) if isinstance(_rep.current_market_price, (int, float)) else None,
+                    note=f"yes_sources={sorted(yes_sources)}",
+                )
+                continue
+            # obs_trajectory is self-corroborating: it derives from real observed
+            # METAR readings so a lone signal is accepted without requiring an
+            # additional model source.  All other trusted sources (noaa, hrrr)
+            # still require FORECAST_CORROBORATION_MIN when trading solo.
+            obs_traj_solo = yes_sources == {"obs_trajectory"}
+            # Use a stricter threshold for KXLOWT — daily lows are harder
+            # to forecast and we now have enough sources to require stronger
+            # consensus (hrrr, nws_hourly, open_meteo all emit temp_low_*).
+            _corr_min = (
+                KXLOWT_FORECAST_CORROBORATION_MIN
+                if metric.startswith("temp_low_") and "KXLOWT" in ticker
+                else FORECAST_CORROBORATION_MIN
+            )
+            if not gfs_only and not obs_traj_solo and _corr_min > 1:
+                if len(yes_sources) < _corr_min:
+                    logging.info(
+                        "Corroboration gate: %s YES on %s %s"
+                        " (need %d sources%s, have %d) — suppressed",
+                        next(iter(yes_sources)), metric, ticker,
+                        _corr_min,
+                        " for KXLOWT" if _corr_min != FORECAST_CORROBORATION_MIN else "",
+                        len(yes_sources),
+                    )
+                    _rep = next((o for o in forecasts if o.implied_outcome == "YES"), forecasts[0])
+                    opp_log.log_suppression(
+                        ticker=ticker, source=",".join(sorted(yes_sources)), gate="corr_lone_rt_no" if is_same_day_mkt else "corr_lone_daily_no",
+                        metric=metric, edge_f=_rep.edge, value=_rep.data_value, strike=_rep.strike,
+                        yes_bid=int(_rep.current_market_price) if isinstance(_rep.current_market_price, (int, float)) else None,
+                        note=f"yes_sources={sorted(yes_sources)} need={_corr_min}",
+                    )
+                    continue
+            # Hard gate: noaa_day2…day7 are all from the same NWS extended
+            # product and are NOT independent of each other.  Even with
+            # FORECAST_CORROBORATION_MIN=1, require at least one genuinely
+            # independent source (noaa same-day, hrrr, open_meteo)
+            # before acting on a day-ahead NWS forecast signal.
+            # These forecasts update infrequently and can be 12+ hours stale
+            # by the time the market moves — a single stale model run is not
+            # enough justification to trade.
+            _NOAA_FUTURE_PREFIXES = (
+                "noaa_day2", "noaa_day3", "noaa_day4",
+                "noaa_day5", "noaa_day6", "noaa_day7",
+            )
+            _noaa_future = {
+                s for s in yes_sources
+                if any(s == p or s.startswith(p + "_") for p in _NOAA_FUTURE_PREFIXES)
+            }
+            if _noaa_future and not (yes_sources - _noaa_future):
+                logging.info(
+                    "Corroboration gate: day-ahead NOAA-only YES on %s %s"
+                    " (%s) — no independent model confirms; suppressed",
+                    metric, ticker, ", ".join(sorted(_noaa_future)),
+                )
+                continue
+
+        # NO-side corroboration gate (future-day markets).
+        # YES signals require FORECAST_CORROBORATION_MIN sources; NO had no
+        # equivalent, which is why all 3 noaa_day2 NO trades were disasters —
+        # a lone NWS extended-forecast saying "temp won't reach the strike"
+        # was allowed through with zero independent confirmation.
+        # Canonical failures: trades #185 (-135¢), #188 (-69¢), #189 (-4¢).
+        # Now require the same count as YES.  With open_meteo now in the
+        # forecast pool for future-day markets, noaa_day2 + open_meteo
+        # provides a genuinely independent NWS+ECMWF two-source signal.
+        if forecast_outcome == "NO" and not is_same_day_mkt:
+            no_forecasts_fday = [o for o in forecasts if o.implied_outcome == "NO"]
+            no_sources_fday = {o.source for o in no_forecasts_fday}
+            # weatherapi is demoted to corroboration-only (same as open_meteo).
+            # A weatherapi-only NO on a future-day market is suppressed regardless
+            # of FORECAST_CORROBORATION_MIN.
+            if len(no_sources_fday) == 1 and no_sources_fday <= {"open_meteo", "weatherapi"}:
+                logging.info(
+                    "Corroboration gate: lone %s NO on future-day %s %s — "
+                    "unreliable source may not trade solo; suppressed",
+                    ", ".join(no_sources_fday), metric, ticker,
+                )
+                _rep = next((o for o in no_forecasts_fday), forecasts[0])
+                opp_log.log_suppression(
+                    ticker=ticker, source=",".join(sorted(no_sources_fday)), gate="corr_future_lone",
+                    metric=metric, edge_f=_rep.edge, value=_rep.data_value, strike=_rep.strike,
+                    yes_bid=int(_rep.current_market_price) if isinstance(_rep.current_market_price, (int, float)) else None,
+                    note=f"no_sources={sorted(no_sources_fday)} unreliable_solo",
+                )
+                continue
+            if len(no_sources_fday) < FORECAST_CORROBORATION_MIN:
+                logging.info(
+                    "Corroboration gate: lone %s NO on future-day %s %s"
+                    " (need %d sources, have %d) — suppressed",
+                    ", ".join(sorted(no_sources_fday)), metric, ticker,
+                    FORECAST_CORROBORATION_MIN, len(no_sources_fday),
+                )
+                _rep = next((o for o in no_forecasts_fday), forecasts[0])
+                opp_log.log_suppression(
+                    ticker=ticker, source=",".join(sorted(no_sources_fday)), gate="corr_lone_daily_no",
+                    metric=metric, edge_f=_rep.edge, value=_rep.data_value, strike=_rep.strike,
+                    yes_bid=int(_rep.current_market_price) if isinstance(_rep.current_market_price, (int, float)) else None,
+                    note=f"no_sources={sorted(no_sources_fday)} need={FORECAST_CORROBORATION_MIN}",
+                )
+                continue
+            # For "between" band NO signals, sources can agree on NO for
+            # opposite reasons: one says too hot (above band), another says
+            # too cold (below band).  This is contradictory, not corroboration.
+            # Require all NO sources to agree on which side of the band the
+            # forecast falls (all above strike_hi, or all below strike_lo).
+            ref_opp = next((o for o in no_forecasts_fday), None)
+            if (
+                ref_opp is not None
+                and ref_opp.direction == "between"
+                and ref_opp.strike_lo is not None
+                and ref_opp.strike_hi is not None
+            ):
+                above = [o for o in no_forecasts_fday if o.data_value > ref_opp.strike_hi]
+                below = [o for o in no_forecasts_fday if o.data_value < ref_opp.strike_lo]
+                if above and below:
+                    logging.info(
+                        "Corroboration gate: contradictory NO on between %s %s"
+                        " — sources disagree on which side of band"
+                        " (above=%s, below=%s); suppressed",
+                        metric, ticker,
+                        [o.source for o in above],
+                        [o.source for o in below],
+                    )
+                    continue
+
+        # NO-side corroboration gate (same-day markets).
+        # A lone real-time source (nws_hourly only, no HRRR) calling NO
+        # on a same-day market carries substantial late-afternoon risk:
+        # hourly forecast grids lag reality by 1–3 hours and the daily
+        # high may already be locked in.  Require at least one daily
+        # source (noaa) to corroborate the NO direction. weatherapi is demoted
+        # to corroboration-only and cannot act as a qualifying daily source here.
+        # Trade #200 is the canonical failure: nws_hourly alone fired NO
+        # at 4:11 PM ET; market resolved YES 7 minutes later.
+        # HRRR is exempt: it runs hourly with data assimilation (no lag),
+        # has scored 0.92 on overnight NO calls, and the comment above
+        # explicitly describes the gate as covering nws_hourly only.
+        if forecast_outcome == "NO" and is_same_day_mkt:
+            no_sources = {o.source for o in forecasts if o.implied_outcome == "NO"}
+            rt_no    = {s for s in no_sources if s in _REALTIME_SRCS}
+            daily_no = {s for s in no_sources if s not in _REALTIME_SRCS}
+            # Block lone real-time (nws_hourly without HRRR): hourly grids
+            # lag reality by 1–3h; daily high may already be locked.
+            if (
+                rt_no and not daily_no and len(rt_no) < 2
+                and rt_no != frozenset({"hrrr"})  # HRRR alone is high-quality; exempt
+            ):
+                logging.info(
+                    "Corroboration gate: lone real-time NO (%s) on same-day"
+                    " %s %s with no daily-source agreement — suppressed",
+                    rt_no, metric, ticker,
+                )
+                continue
+            # Block lone unreliable daily-model sources (weatherapi, open_meteo)
+            # on same-day markets.  These sources resolve at daily model cadence
+            # (not intraday) and carry no intraday observation — they cannot
+            # reliably call NO on a same-day market without real-time support.
+            # Trade #12 (Boston KXHIGHT NO) was driven solely by weatherapi and
+            # stopped out prematurely at −$0.44; the market resolved NO 10 min later.
+            _DAILY_UNRELIABLE = frozenset({"open_meteo", "weatherapi"})
+            if (
+                not rt_no
+                and daily_no <= _DAILY_UNRELIABLE
+                and len(daily_no) == 1
+            ):
+                logging.info(
+                    "Corroboration gate: lone unreliable daily-model NO (%s)"
+                    " on same-day %s %s — suppressed (no real-time corroboration)",
+                    ", ".join(daily_no), metric, ticker,
+                )
+                continue
+
+        # Forecast consensus reached — select the most authoritative source
+        # as the primary, rather than max-edge (which would elevate
+        # weatherapi/open_meteo above NOAA/HRRR when their edge is higher).
+        # weatherapi and open_meteo are corroboration-only; they should never
+        # be the logged "source" that drove the trade.
+        _SRC_PRIORITY: dict[str, int] = {
+            "hrrr":       0,
+            "noaa":       1,
+            "nws_hourly": 2,
+            "noaa_day2":  3,
+            "noaa_day3":  4,
+            "noaa_day4":  5,
+            "noaa_day5":  6,
+            "noaa_day6":  7,
+            "noaa_day7":  8,
+            "open_meteo": 9,
+            "weatherapi": 10,
+        }
+        agreeing = [o for o in forecasts if o.implied_outcome == forecast_outcome]
+        best = min(agreeing, key=lambda o: _SRC_PRIORITY.get(o.source, 99))
+        best.corroborating_sources = [
+            o.source for o in agreeing if o.source != best.source
+        ]
+        if len(agreeing) > 1:
+            _edges = [o.edge for o in agreeing]
+            _vals  = [o.data_value for o in agreeing]
+            best.consensus_meta = {
+                "source_count":   len(agreeing),
+                "min_edge_f":     min(_edges),
+                "max_edge_f":     max(_edges),
+                "model_spread_f": (max(_vals) - min(_vals)) if len(_vals) > 1 else 0.0,
+                "corroborators":  best.corroborating_sources,
+            }
+        consensus_opps.append(best)
+    return consensus_opps, _obs_value, _fc_low_by_metric
 
 
 async def _poll(
@@ -1739,7 +2302,6 @@ async def _poll(
         ("noaa",         noaa.fetch_city_forecasts(session)),
         ("nws_climo",    nws_climo.fetch_city_climo(session)),
         ("metar",        metar.fetch_city_forecasts(session)),
-        ("owm",          owm.fetch_city_forecasts(session)),
         ("nws_hourly",   nws_hourly.fetch_city_forecasts(session)),
         ("weatherapi",   weatherapi.fetch_city_forecasts(session)),
         ("open_meteo",    open_meteo.fetch_city_forecasts(session)),
@@ -1777,7 +2339,6 @@ async def _poll(
     noaa_result        = R["noaa"]
     nws_climo_result   = R["nws_climo"]
     metar_result       = R["metar"]
-    owm_result         = R["owm"]
     nws_hourly_result  = R["nws_hourly"]
     weatherapi_result  = R["weatherapi"]
     open_meteo_result    = R["open_meteo"]
@@ -1945,7 +2506,7 @@ async def _poll(
         _last_hrrr_highs = hrrr_hourly_highs
         _last_hrrr_highs_time = time.monotonic()
 
-    # ---- numeric matching (NOAA, OWM, Binance, Frankfurter, BLS, FRED, EIA) -
+    # ---- numeric matching (NOAA, Binance, Frankfurter, BLS, FRED, EIA) ------
     # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
     # is older than NWS_HOURLY_MAX_AGE_HOURS.  nws_hourly updates every hour so
     # a 3-hour-old reading has missed ≥2 cycles and may be badly wrong on a
@@ -1980,7 +2541,6 @@ async def _poll(
         ("NOAA",        noaa_result),
         ("NWS Climo",   nws_climo_result),
         ("METAR",       metar_result),
-        ("OWM",         owm_result),
         ("NWS Hourly",  nws_hourly_result),
         ("WeatherAPI",  weatherapi_result),
         ("Open-Meteo",  open_meteo_result),
@@ -2040,17 +2600,64 @@ async def _poll(
     # ---- HRRR DataPoints for forecast corroboration -------------------------
     # Convert the HRRR hourly-high dict to DataPoints so source="hrrr" counts
     # toward FORECAST_CORROBORATION_MIN.  A lone NOAA signal confirmed by HRRR
-    # satisfies the 2-source gate without requiring OWM or Open-Meteo.
+    # satisfies the 2-source gate without requiring Open-Meteo.
     # The HRRR spread gate in _filter_weather_opportunities still applies to
     # all other forecast sources; HRRR opps self-consistently pass (spread=0).
-    if hrrr_hourly_highs:
-        data_points.extend(
-            hrrr.to_data_points(
-                hrrr_hourly_highs,
-                datetime.now(timezone.utc).isoformat(),
-                hourly_lows=hrrr_hourly_lows or None,
+    #
+    # Observed-exceeds-HRRR gate: if the noaa_observed or metar running max for
+    # a city already exceeds the HRRR forecast value, the HRRR prediction is
+    # provably wrong (or reflects only remaining evening cooling, not the day's
+    # true peak).  Suppress that city's HRRR data point so it cannot trigger
+    # new trades or count as corroboration.
+    # Root cause: trade 152 (KXHIGHTBOS-26APR23-B64.5) — HRRR said 57°F while
+    # observed was already 60°F and climbing to 65°F; the stale forecast drove
+    # a NO trade that was stopped out mid-afternoon by market noise.
+    if hrrr_hourly_highs or hrrr_hourly_lows:
+        # Build observed-max lookup from data points already in the list.
+        _obs_high: dict[str, float] = {}
+        _obs_low:  dict[str, float] = {}
+        for _dp in data_points:
+            if _dp.source not in ("noaa_observed", "metar"):
+                continue
+            if _dp.metric.startswith("temp_high_"):
+                if _dp.metric not in _obs_high or _dp.value > _obs_high[_dp.metric]:
+                    _obs_high[_dp.metric] = _dp.value
+            elif _dp.metric.startswith("temp_low_"):
+                if _dp.metric not in _obs_low or _dp.value < _obs_low[_dp.metric]:
+                    _obs_low[_dp.metric] = _dp.value
+
+        _filtered_highs: dict[str, float] = {}
+        for _metric, _hval in (hrrr_hourly_highs or {}).items():
+            _obs = _obs_high.get(_metric)
+            if _obs is not None and _obs > _hval:
+                logging.info(
+                    "HRRR observed-exceeds gate: suppressing hrrr %s=%.1f°F"
+                    " — noaa_observed/metar running max=%.1f°F already exceeds it",
+                    _metric, _hval, _obs,
+                )
+            else:
+                _filtered_highs[_metric] = _hval
+
+        _filtered_lows: dict[str, float] = {}
+        for _metric, _lval in (hrrr_hourly_lows or {}).items():
+            _obs = _obs_low.get(_metric)
+            if _obs is not None and _obs < _lval:
+                logging.info(
+                    "HRRR observed-exceeds gate: suppressing hrrr %s=%.1f°F"
+                    " — noaa_observed/metar running min=%.1f°F already below it",
+                    _metric, _lval, _obs,
+                )
+            else:
+                _filtered_lows[_metric] = _lval
+
+        if _filtered_highs or _filtered_lows:
+            data_points.extend(
+                hrrr.to_data_points(
+                    _filtered_highs,
+                    datetime.now(timezone.utc).isoformat(),
+                    hourly_lows=_filtered_lows or None,
+                )
             )
-        )
 
     # ---- EIA staleness filter -----------------------------------------------
     # EIA daily spot prices carry a period_str equal to the data date (e.g.
@@ -2249,467 +2856,14 @@ async def _poll(
         if wh_opps:
             numeric_opps.extend(wh_opps)
 
-    # ---- OWM consensus filter (temp markets only) --------------------------
-    # For each (metric, ticker) pair with multiple forecast sources, drop all
-    # forecast-based opportunities if NOAA and OWM disagree on direction.
-    # noaa_observed is always exempt — station readings are ground truth.
-    #
-    # Extended check: also suppress forecasts that conflict with any concurrent
-    # noaa_observed data point, even if that observation is no longer tradeable
-    # (e.g. contrarian cap already filled or market price moved past threshold).
-    # This prevents the bot from trading a forecast against a station reading
-    # that tells the opposite story — the observed station is ground truth.
+    # ---- Forecast consensus filter (temp markets only) ---------------------
     if numeric_opps:
-        # Build a direct lookup of noaa_observed values from raw data_points
-        # so we can detect conflicts even when the observed opp was filtered out.
-        _obs_value: dict[str, float] = {}
-        for _dp in data_points:
-            if _dp.source in ("noaa_observed", "metar") and _dp.metric.startswith(("temp_high", "temp_low")):
-                # metar updates faster — prefer it over noaa_observed when both present
-                if _dp.source == "metar" or _dp.metric not in _obs_value:
-                    _obs_value[_dp.metric] = _dp.value
-
-        # Forecast low per temp_low metric from all model sources.
-        # Keeps the most conservative (lowest) value across noaa, hrrr,
-        # nws_hourly, and open_meteo so the KXLOWT contradiction gate has
-        # the broadest possible coverage.  Used by _filter_weather_opportunities
-        # and the inline KXLOWT gate below.
-        _fc_low_by_metric: dict[str, float] = {}
-        _FC_LOW_SOURCES = {"noaa", "hrrr", "nws_hourly", "open_meteo"}
-        for _dp in data_points:
-            if _dp.source in _FC_LOW_SOURCES and _dp.metric.startswith("temp_low_"):
-                _existing = _fc_low_by_metric.get(_dp.metric)
-                if _existing is None or _dp.value < _existing:
-                    _fc_low_by_metric[_dp.metric] = _dp.value
-
-        by_key: dict[tuple[str, str], list[NumericOpportunity]] = collections.defaultdict(list)
-        for opp in numeric_opps:
-            by_key[(opp.metric, opp.market_ticker)].append(opp)
-
-        consensus_opps: list[NumericOpportunity] = []
-        for (metric, ticker), group in by_key.items():
-            if not metric.startswith(("temp_high", "temp_low")):
-                consensus_opps.extend(group)
-                continue
-            # noaa_observed, nws_climo, nws_alert are ground-truth / high-confidence
-            # — always pass through the consensus check unchanged.
-            # owm is excluded from the unanimity check entirely: the OWM free-tier
-            # "Current Weather" API returns the *current* temperature, not the
-            # forecast day-high, so it will systematically disagree with NWS
-            # forecast-high sources during morning hours.
-            # open_meteo is also excluded: it uses raw GFS output which
-            # systematically underestimates cold-front timing/intensity and lags
-            # NWS human-adjusted forecasts by 6-18 hours.  NOAA day-2+ is already
-            # a multi-model blend (NBM) superior to raw GFS, so GFS should not
-            # veto it.  Open-Meteo still runs and its DataPoints still count toward
-            # corroboration when it agrees with NOAA, but it cannot block a NOAA
-            # signal by disagreeing.
-            _PASS_THROUGH = ("noaa_observed", "metar", "nws_climo", "nws_alert")
-
-            # Compute market date and same-day flag before building _EXCLUDE so
-            # we can tune which sources participate in the vote.
-            mkt_date = _ticker_date(ticker)
-            today_et = datetime.now(_ET).date()
-            is_same_day_mkt = (mkt_date is not None and mkt_date == today_et)
-
-            # noaa_day2–7 draw from the same NWS forecast grid as nws_hourly
-            # day+1/2, so counting both creates correlated double-counting.
-            # Exception: for future-day markets (tomorrow+), only nws_hourly and
-            # weatherapi vote, which makes a 1-1 tie structurally unbreakable.
-            # Allowing noaa_day2 to join the vote gives 3 genuinely independent
-            # data points (NWS hourly, WeatherAPI, NOAA NBM blend) so a majority
-            # always emerges.  noaa_day2 on same-day markets fails date alignment
-            # below anyway (as_of = tomorrow ≠ today's market), so this only
-            # changes behaviour for tomorrow-closing markets.
-            # owm stays excluded — its 3-hour slot aggregation is ±1-2°F less
-            # precise than a daily forecast endpoint and it rarely adds signal.
-            #
-            # open_meteo is excluded for same-day markets (HRRR hourly is better
-            # and avoids GFS model noise intra-day), but included for future-day
-            # markets where it is a genuinely independent European-model (ECMWF)
-            # source that can corroborate NWS extended forecasts.  Unlike owm/noaa,
-            # open_meteo is NOT derived from the same NWS NBM blending pipeline.
-            _EXCLUDE_BASE = ("owm",
-                             "noaa_day3", "noaa_day4",
-                             "noaa_day5", "noaa_day6", "noaa_day7")
-            _EXCLUDE = _EXCLUDE_BASE + (("noaa_day2", "open_meteo") if is_same_day_mkt else ())
-            observed = [o for o in group if o.source in _PASS_THROUGH]
-            forecasts = [o for o in group if o.source not in _PASS_THROUGH and o.source not in _EXCLUDE]
-
-            # ---- KXLOWT observed-YES contradiction gate ----------------------------
-            # For daily-low markets, a morning running-minimum above the strike does
-            # NOT lock in a YES outcome — temperatures can still fall later in the day
-            # (e.g. cold-front passage in Chicago in April).  Suppress noaa_observed /
-            # metar YES signals when any forecast model predicts the daily low will be
-            # within LOWT_FORECAST_GATE_BUFFER_F degrees of (or below) the strike.
-            # The buffer (default 3°F ≈ NWS day-1 MAE) catches "dangerously close"
-            # forecasts like 54°F vs 53°F strike where model uncertainty is material.
-            if (
-                NUMERIC_LOWT_FORECAST_GATE
-                and metric.startswith("temp_low_")
-                and "KXLOWT" in ticker
-            ):
-                _obs_yes = [
-                    o for o in observed
-                    if o.implied_outcome == "YES"
-                    and o.source in ("noaa_observed", "metar")
-                ]
-                if _obs_yes:
-                    _strike = min(
-                        (o.strike for o in _obs_yes if o.strike is not None),
-                        default=None,
-                    )
-                    _fc_low = _fc_low_by_metric.get(metric)
-                    if (
-                        _strike is not None
-                        and _fc_low is not None
-                        and _fc_low < _strike + LOWT_FORECAST_GATE_BUFFER_F
-                    ):
-                        logging.warning(
-                            "KXLOWT forecast-contradiction gate: suppressing %s "
-                            "observed YES for %s — forecast low %.1f°F < strike "
-                            "%.1f°F + buffer %.1f°F",
-                            ", ".join(o.source for o in _obs_yes),
-                            ticker, _fc_low, _strike, LOWT_FORECAST_GATE_BUFFER_F,
-                        )
-                        observed = [o for o in observed if o not in _obs_yes]
-
-            # Date-alignment pre-filter: remove forecast DataPoints whose as_of
-            # date does not match the market's resolution date.  Without this,
-            # NOAA day-1 (as_of = today) and NOAA day-2 (as_of = tomorrow) both
-            # appear in the same (metric, ticker) group for a tomorrow-closing
-            # market and disagree with each other, triggering a false "disagree"
-            # block.  Pass-through (observed) signals are exempt — they reflect
-            # the current day's running maximum and are always relevant.
-            if mkt_date is not None:
-                aligned: list[NumericOpportunity] = []
-                for _fc in forecasts:
-                    if not _fc.as_of:
-                        aligned.append(_fc)
-                        continue
-                    try:
-                        _fc_date = (
-                            datetime.fromisoformat(_fc.as_of.replace("Z", "+00:00"))
-                            .astimezone(_ET)
-                            .date()
-                        )
-                        if _fc_date == mkt_date:
-                            aligned.append(_fc)
-                    except (ValueError, AttributeError):
-                        aligned.append(_fc)
-                forecasts = aligned
-
-            # Multiple observed sources (noaa_observed, nws_observed) can fire on
-            # the same (metric, ticker) in the same poll cycle.  Keep only the
-            # highest-edge signal so downstream trade_executor sees one clean
-            # opportunity rather than duplicate orders for the same market.
-            seen_obs: dict[str, NumericOpportunity] = {}
-            for _obs in observed:
-                key = f"{_obs.metric}|{_obs.market_ticker}"
-                if key not in seen_obs or abs(_obs.edge) > abs(seen_obs[key].edge):
-                    seen_obs[key] = _obs
-            consensus_opps.extend(seen_obs.values())
-
-            if not forecasts:
-                continue
-
-            # Tiered consensus — replaces strict unanimity which became
-            # intractable once 4 sources were in the blocking pool.
-            #
-            # Same-day markets: nws_hourly and hrrr update every hour and
-            # track cold fronts in real-time.  NOAA updates only 4×/day and
-            # can be 10-20°F stale.  When same-day real-time sources agree,
-            # use their direction.  Only override if ALL slower daily sources
-            # also oppose (i.e., unanimous disagreement across 2+ daily sources).
-            #
-            # Future-day markets: NOAA multi-model blend is most reliable at
-            # longer horizons.  Use majority vote among all forecasts; a tie
-            # is too uncertain to trade.
-            _REALTIME_SRCS = frozenset(("nws_hourly", "hrrr"))
-            # mkt_date, today_et, is_same_day_mkt already computed above.
-
-            realtime_fc = [o for o in forecasts if o.source in _REALTIME_SRCS]
-            daily_fc = [o for o in forecasts if o.source not in _REALTIME_SRCS]
-
-            if is_same_day_mkt and realtime_fc:
-                # Real-time sources must agree with each other first.
-                rt_outcomes = {o.implied_outcome for o in realtime_fc}
-                if len(rt_outcomes) > 1:
-                    logging.info(
-                        "Consensus filter: real-time sources split on %s %s"
-                        " — skipping (sources: %s)",
-                        metric, ticker, {o.source for o in realtime_fc},
-                    )
-                    continue
-                forecast_outcome = next(iter(rt_outcomes))
-                # Only block when ALL daily-update sources (e.g. NOAA + WeatherAPI)
-                # oppose the real-time direction.  A lone NOAA disagreement (stale
-                # zone forecast) should not override nws_hourly+hrrr consensus.
-                daily_oppose = [o for o in daily_fc if o.implied_outcome != forecast_outcome]
-                if len(daily_oppose) == len(daily_fc) and len(daily_fc) >= 2:
-                    logging.info(
-                        "Consensus filter: all daily sources %s oppose"
-                        " real-time (%s) on %s %s — skipping",
-                        {o.source for o in daily_oppose},
-                        forecast_outcome, metric, ticker,
-                    )
-                    continue
-            else:
-                # Future-day (or no real-time source present): NWS-primary logic.
-                #
-                # nws_hourly and noaa_day2 are both NWS products (hourly zone
-                # forecast and NBM extended blend respectively) and are the most
-                # reliable multi-day forecast sources.  open_meteo (raw ECMWF/GFS)
-                # and weatherapi (third-party model) act as independent validators.
-                #
-                # If NWS sources agree with each other, treat their direction as
-                # primary and only block if ALL external validators unanimously
-                # oppose — the same asymmetric rule used on same-day markets where
-                # nws_hourly+hrrr are primary.  A 2-2 tie (NWS vs external) is
-                # resolved in favour of NWS rather than leaving the market untraded.
-                #
-                # If NWS sources disagree or are absent, fall back to majority vote.
-                _NWS_SRCS = frozenset(("nws_hourly", "noaa_day2"))
-                _EXT_SRCS = frozenset(("open_meteo", "weatherapi"))
-                nws_fc = [o for o in forecasts if o.source in _NWS_SRCS]
-                ext_fc = [o for o in forecasts if o.source in _EXT_SRCS]
-                nws_outcomes = {o.implied_outcome for o in nws_fc}
-
-                if len(nws_fc) >= 2 and len(nws_outcomes) == 1:
-                    # Both NWS sources agree → use NWS direction.
-                    forecast_outcome = next(iter(nws_outcomes))
-                    ext_oppose = [o for o in ext_fc if o.implied_outcome != forecast_outcome]
-                    if ext_oppose and len(ext_oppose) == len(ext_fc) and len(ext_fc) >= 2:
-                        # ALL external models unanimously oppose NWS → too uncertain.
-                        logging.info(
-                            "Consensus filter: all external models %s oppose"
-                            " NWS primary (%s) on %s %s — skipping",
-                            {o.source for o in ext_oppose},
-                            forecast_outcome, metric, ticker,
-                        )
-                        continue
-                    logging.info(
-                        "Consensus filter: NWS primary (%s) on %s %s"
-                        " — %d external validator(s) oppose but not unanimous; allowing",
-                        forecast_outcome, metric, ticker, len(ext_oppose),
-                    )
-                else:
-                    # NWS sources disagree or absent: plain majority vote.
-                    yes_count = sum(1 for o in forecasts if o.implied_outcome == "YES")
-                    no_count = sum(1 for o in forecasts if o.implied_outcome == "NO")
-                    if yes_count == no_count:
-                        logging.info(
-                            "Consensus filter: forecasts tied on %s %s — skipping"
-                            " (sources: %s yes=%d no=%d)",
-                            metric, ticker,
-                            {o.source for o in forecasts}, yes_count, no_count,
-                        )
-                        continue
-                    forecast_outcome = "YES" if yes_count > no_count else "NO"
-            # Cross-check against raw noaa_observed data even when that
-            # observation is too expensive to trade (not in numeric_opps).
-            #
-            # IMPORTANT: only valid for same-day markets.  For future-day markets
-            # (tomorrow or later), today's observed temperature has no bearing on
-            # tomorrow's forecast — of course today's high is below tomorrow's
-            # warm-day strike.  Applying this check to future-day markets silently
-            # suppressed ALL future-day YES forecasts where today's temp hadn't
-            # yet reached tomorrow's strike (e.g. Austin T86: today 72°F → "NO"
-            # conflicts with noaa_day2+weatherapi "YES" for tomorrow → suppressed).
-            obs_val = _obs_value.get(metric)
-            if obs_val is not None and not observed and is_same_day_mkt:
-                ref = forecasts[0]
-                if ref.direction == "over" and ref.strike is not None:
-                    obs_outcome = "YES" if obs_val >= ref.strike else "NO"
-                elif ref.direction == "under" and ref.strike is not None:
-                    obs_outcome = "YES" if obs_val <= ref.strike else "NO"
-                else:
-                    obs_outcome = None
-                if obs_outcome is not None and obs_outcome != forecast_outcome:
-                    logging.info(
-                        "Consensus filter: noaa_observed (%.1f°F → %s) conflicts"
-                        " with forecast (%s) on %s %s — suppressing forecast",
-                        obs_val, obs_outcome, forecast_outcome, metric, ticker,
-                    )
-                    continue
-            # Cross-source corroboration gate: for YES forecast signals,
-            # require at least FORECAST_CORROBORATION_MIN distinct sources to
-            # agree.  Lone signals (only one model sees it) are model noise.
-            #
-            # Special rule: open_meteo (raw GFS) may never trade solo —
-            # it systematically underestimates cold-front timing/intensity and
-            # is already embedded in NOAA's blended forecast.  A lone
-            # open_meteo YES is suppressed regardless of FORECAST_CORROBORATION_MIN.
-            # NOAA-family sources (noaa, noaa_day2 … noaa_day7) may trade solo
-            # when FORECAST_CORROBORATION_MIN=1 since they are already a
-            # multi-model blend with human forecaster adjustments.
-            if forecast_outcome == "YES":
-                yes_sources = {o.source for o in forecasts if o.implied_outcome == "YES"}
-                # obs_trajectory is an observed-trend signal (derived from real METAR
-                # readings) — treated alongside noaa/hrrr as a trusted source.
-                noaa_yes = {
-                    s for s in yes_sources
-                    if s.startswith("noaa") or s in ("hrrr", "obs_trajectory")
-                }
-                # Sources that may never trade solo (unreliable standalone forecasts):
-                # - open_meteo: raw GFS, systematically underestimates cold-front timing
-                # - weatherapi: commercial aggregator with demonstrated day+0/+1 errors
-                #   (7°F+ same-day, >16°F next-day). Can still vote in consensus.
-                _SOLO_BLOCKED = {"open_meteo", "weatherapi"}
-                gfs_only = not noaa_yes  # True when no NOAA/HRRR/obs_trajectory source is in YES set
-                solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
-                if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
-                    logging.info(
-                        "Corroboration gate: lone %s YES on %s %s — "
-                        "unreliable source may not trade solo; suppressed",
-                        ", ".join(yes_sources), metric, ticker,
-                    )
-                    continue
-                # obs_trajectory is self-corroborating: it derives from real observed
-                # METAR readings so a lone signal is accepted without requiring an
-                # additional model source.  All other trusted sources (noaa, hrrr)
-                # still require FORECAST_CORROBORATION_MIN when trading solo.
-                obs_traj_solo = yes_sources == {"obs_trajectory"}
-                if not gfs_only and not obs_traj_solo and FORECAST_CORROBORATION_MIN > 1:
-                    if len(yes_sources) < FORECAST_CORROBORATION_MIN:
-                        logging.info(
-                            "Corroboration gate: lone %s YES on %s %s"
-                            " (need %d sources, have %d) — suppressed",
-                            next(iter(yes_sources)), metric, ticker,
-                            FORECAST_CORROBORATION_MIN, len(yes_sources),
-                        )
-                        continue
-                # Hard gate: noaa_day2…day7 are all from the same NWS extended
-                # product and are NOT independent of each other.  Even with
-                # FORECAST_CORROBORATION_MIN=1, require at least one genuinely
-                # independent source (noaa same-day, hrrr, owm, open_meteo)
-                # before acting on a day-ahead NWS forecast signal.
-                # These forecasts update infrequently and can be 12+ hours stale
-                # by the time the market moves — a single stale model run is not
-                # enough justification to trade.
-                _NOAA_FUTURE_PREFIXES = (
-                    "noaa_day2", "noaa_day3", "noaa_day4",
-                    "noaa_day5", "noaa_day6", "noaa_day7",
-                )
-                _noaa_future = {
-                    s for s in yes_sources
-                    if any(s == p or s.startswith(p + "_") for p in _NOAA_FUTURE_PREFIXES)
-                }
-                if _noaa_future and not (yes_sources - _noaa_future):
-                    logging.info(
-                        "Corroboration gate: day-ahead NOAA-only YES on %s %s"
-                        " (%s) — no independent model confirms; suppressed",
-                        metric, ticker, ", ".join(sorted(_noaa_future)),
-                    )
-                    continue
-
-            # NO-side corroboration gate (future-day markets).
-            # YES signals require FORECAST_CORROBORATION_MIN sources; NO had no
-            # equivalent, which is why all 3 noaa_day2 NO trades were disasters —
-            # a lone NWS extended-forecast saying "temp won't reach the strike"
-            # was allowed through with zero independent confirmation.
-            # Canonical failures: trades #185 (-135¢), #188 (-69¢), #189 (-4¢).
-            # Now require the same count as YES.  With open_meteo now in the
-            # forecast pool for future-day markets, noaa_day2 + open_meteo
-            # provides a genuinely independent NWS+ECMWF two-source signal.
-            if forecast_outcome == "NO" and not is_same_day_mkt:
-                no_forecasts_fday = [o for o in forecasts if o.implied_outcome == "NO"]
-                no_sources_fday = {o.source for o in no_forecasts_fday}
-                # weatherapi is demoted to corroboration-only (same as open_meteo).
-                # A weatherapi-only NO on a future-day market is suppressed regardless
-                # of FORECAST_CORROBORATION_MIN.
-                if len(no_sources_fday) == 1 and no_sources_fday <= {"open_meteo", "weatherapi"}:
-                    logging.info(
-                        "Corroboration gate: lone %s NO on future-day %s %s — "
-                        "unreliable source may not trade solo; suppressed",
-                        ", ".join(no_sources_fday), metric, ticker,
-                    )
-                    continue
-                if len(no_sources_fday) < FORECAST_CORROBORATION_MIN:
-                    logging.info(
-                        "Corroboration gate: lone %s NO on future-day %s %s"
-                        " (need %d sources, have %d) — suppressed",
-                        ", ".join(sorted(no_sources_fday)), metric, ticker,
-                        FORECAST_CORROBORATION_MIN, len(no_sources_fday),
-                    )
-                    continue
-                # For "between" band NO signals, sources can agree on NO for
-                # opposite reasons: one says too hot (above band), another says
-                # too cold (below band).  This is contradictory, not corroboration.
-                # Require all NO sources to agree on which side of the band the
-                # forecast falls (all above strike_hi, or all below strike_lo).
-                ref_opp = next((o for o in no_forecasts_fday), None)
-                if (
-                    ref_opp is not None
-                    and ref_opp.direction == "between"
-                    and ref_opp.strike_lo is not None
-                    and ref_opp.strike_hi is not None
-                ):
-                    above = [o for o in no_forecasts_fday if o.data_value > ref_opp.strike_hi]
-                    below = [o for o in no_forecasts_fday if o.data_value < ref_opp.strike_lo]
-                    if above and below:
-                        logging.info(
-                            "Corroboration gate: contradictory NO on between %s %s"
-                            " — sources disagree on which side of band"
-                            " (above=%s, below=%s); suppressed",
-                            metric, ticker,
-                            [o.source for o in above],
-                            [o.source for o in below],
-                        )
-                        continue
-
-            # NO-side corroboration gate (same-day markets).
-            # A lone real-time source (nws_hourly only, no HRRR) calling NO
-            # on a same-day market carries substantial late-afternoon risk:
-            # hourly forecast grids lag reality by 1–3 hours and the daily
-            # high may already be locked in.  Require at least one daily
-            # source (noaa) to corroborate the NO direction. weatherapi is demoted
-            # to corroboration-only and cannot act as a qualifying daily source here.
-            # Trade #200 is the canonical failure: nws_hourly alone fired NO
-            # at 4:11 PM ET; market resolved YES 7 minutes later.
-            # HRRR is exempt: it runs hourly with data assimilation (no lag),
-            # has scored 0.92 on overnight NO calls, and the comment above
-            # explicitly describes the gate as covering nws_hourly only.
-            if forecast_outcome == "NO" and is_same_day_mkt:
-                no_sources = {o.source for o in forecasts if o.implied_outcome == "NO"}
-                rt_no   = {s for s in no_sources if s in _REALTIME_SRCS}
-                daily_no = {s for s in no_sources if s not in _REALTIME_SRCS}
-                if (
-                    rt_no and not daily_no and len(rt_no) < 2
-                    and rt_no != frozenset({"hrrr"})  # HRRR alone is high-quality; exempt from gate
-                ):
-                    logging.info(
-                        "Corroboration gate: lone real-time NO (%s) on same-day"
-                        " %s %s with no daily-source agreement — suppressed",
-                        rt_no, metric, ticker,
-                    )
-                    continue
-
-            # Forecast consensus reached — select the most authoritative source
-            # as the primary, rather than max-edge (which would elevate
-            # weatherapi/open_meteo above NOAA/HRRR when their edge is higher).
-            # weatherapi and open_meteo are corroboration-only; they should never
-            # be the logged "source" that drove the trade.
-            _SRC_PRIORITY: dict[str, int] = {
-                "hrrr":       0,
-                "noaa":       1,
-                "nws_hourly": 2,
-                "noaa_day2":  3,
-                "noaa_day3":  4,
-                "noaa_day4":  5,
-                "noaa_day5":  6,
-                "noaa_day6":  7,
-                "noaa_day7":  8,
-                "open_meteo": 9,
-                "weatherapi": 10,
-            }
-            agreeing = [o for o in forecasts if o.implied_outcome == forecast_outcome]
-            best = min(agreeing, key=lambda o: _SRC_PRIORITY.get(o.source, 99))
-            best.corroborating_sources = [
-                o.source for o in agreeing if o.source != best.source
-            ]
-            consensus_opps.append(best)
-        numeric_opps = consensus_opps
+        numeric_opps, _obs_value, _fc_low_by_metric = _apply_forecast_consensus(
+            numeric_opps, data_points, opp_log
+        )
+    else:
+        _obs_value = {}
+        _fc_low_by_metric = {}
 
     # ---- Log all pre-gate weather forecasts for calibration data -----------
     # Must happen BEFORE _filter_weather_opportunities so that opportunities
@@ -2720,7 +2874,7 @@ async def _poll(
         opp_log.log_raw_forecasts(numeric_opps)
 
     # ---- Weather-specific edge and time-to-close gates ---------------------
-    # Applied after OWM consensus so both NOAA and OWM sources are already
+    # Applied after forecast consensus so all sources are already
     # merged / deduplicated before the per-source quality gates fire.
     if numeric_opps:
         before = len(numeric_opps)
@@ -2728,6 +2882,7 @@ async def _poll(
             numeric_opps, markets, hrrr_hourly_highs,
             observed_values=_obs_value if numeric_opps else None,
             fc_low_by_metric=_fc_low_by_metric if numeric_opps else None,
+            opp_log=opp_log,
         )
         dropped = before - len(numeric_opps)
         if dropped:
@@ -2823,6 +2978,17 @@ async def _poll(
                             "Crypto close gate: dropped %s — %.1fh until close"
                             " (gate=%.1fh)",
                             opp.market_ticker, hours_to_close, CRYPTO_DAILY_CLOSE_HOURS,
+                        )
+                        opp_log.log_suppression(
+                            ticker=opp.market_ticker,
+                            source=opp.source,
+                            gate="ttc_window",
+                            metric=opp.metric,
+                            edge_f=opp.edge,
+                            value=opp.data_value,
+                            strike=opp.strike,
+                            yes_bid=int(opp.current_market_price) if isinstance(opp.current_market_price, (int, float)) else None,
+                            note=f"hours_to_close={hours_to_close:.1f} gate={CRYPTO_DAILY_CLOSE_HOURS:.1f}",
                         )
                 except (ValueError, AttributeError):
                     passed_cc.append(opp)  # unparseable close_time: allow through
@@ -3071,6 +3237,11 @@ async def _poll(
         if LIQUIDITY_MAX_SPREAD > 0 and bid is not None and ask is not None:
             if (ask - bid) > LIQUIDITY_MAX_SPREAD:
                 return False
+        # Tighter spread gate for KXLOWT numeric signals — newer/thinner markets
+        if KXLOWT_MAX_SPREAD_CENTS > 0 and "KXLOWT" in ticker:
+            if bid is not None and ask is not None:
+                if (ask - bid) > KXLOWT_MAX_SPREAD_CENTS:
+                    return False
         return True
 
     text_opps    = [o for o in text_opps    if _passes_liquidity(o.market_ticker)]
@@ -3347,7 +3518,7 @@ async def _poll(
     # market every poll cycle while a dry-run position is still live.
     dry_run_held: set[str] = set()
     if TRADE_DRY_RUN and ledger is not None:
-        set_drawdown_factor(ledger.current_drawdown_factor())
+        set_drawdown_factors(ledger.current_drawdown_factors())
         for src, stats in ledger.source_performance_summary().items():
             if stats["win_rate"] < 0.25 and stats["net_pnl_cents"] < 0:
                 logging.warning(
@@ -3518,6 +3689,33 @@ async def _poll(
                     logging.info(
                         "BandArb skip: %s in re-entry cooldown / held position.",
                         _barb.ticker,
+                    )
+                    continue
+                # Block band_arb:no on KXLOWT when only METAR corroborates.
+                # METAR (airport spot temp) can diverge from the NWS station used
+                # for KXLOWT settlement.  Require NWS confirmation to avoid
+                # metar-only mismatch losses (trade #11: −$14).
+                if (
+                    BAND_ARB_REQUIRE_NWS_FOR_KXLOWT
+                    and "KXLOWT" in _barb.ticker
+                    and _barb.side == "no"
+                    and _barb.corr_status == "metar_only"
+                ):
+                    logging.info(
+                        "BandArb gate: suppressed metar-only NO on %s"
+                        " — NWS corroboration required for KXLOWT (BAND_ARB_REQUIRE_NWS_FOR_KXLOWT)",
+                        _barb.ticker,
+                    )
+                    opp_log.log_suppression(
+                        ticker=_barb.ticker,
+                        source="band_arb",
+                        gate="band_arb_metar_only",
+                        metric=getattr(_barb, "metric", None),
+                        edge_f=getattr(_barb, "edge_f", None),
+                        value=getattr(_barb, "fc_low", None),
+                        strike=getattr(_barb, "strike_lo", None),
+                        yes_bid=None,
+                        note=f"corr_status={_barb.corr_status}",
                     )
                     continue
                 await executor.maybe_trade_band_arb(session, _barb)
