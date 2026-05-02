@@ -508,15 +508,26 @@ class ExitManager:
     """
 
     _EXIT_COLUMNS: list[tuple[str, str]] = [
-        ("exited_at",        "TEXT"),
-        ("exit_price_cents", "INTEGER"),
-        ("exit_pnl_cents",   "REAL"),
-        ("exit_reason",      "TEXT"),
-        ("exit_order_id",    "TEXT"),
+        ("exited_at",          "TEXT"),
+        ("exit_price_cents",   "INTEGER"),
+        ("exit_pnl_cents",     "REAL"),
+        ("exit_reason",        "TEXT"),
+        ("exit_order_id",      "TEXT"),
         # 1 if trade was entered after the daily peak was confirmed (peak_past=True
         # on the originating NumericOpportunity).  Used by _is_locked_signal to
         # suppress stop-loss on KXHIGH:no positions after 4:30 PM local.
-        ("peak_past",        "INTEGER"),
+        ("peak_past",          "INTEGER"),
+        # Written at exit time by _execute_exit; also in opportunity_log migration
+        # but that migration runs before TradeExecutor creates the trades table on
+        # a fresh DB, so these must live here to be reliably added.
+        ("exit_reason_detail", "TEXT"),
+        ("peak_pct_gain",      "REAL"),
+        ("peak_at",            "TEXT"),
+        ("exit_yes_bid",       "INTEGER"),
+        ("exit_yes_ask",       "INTEGER"),
+        # Set externally by scripts/mark_bug_loss.py; read by DryRunLedger
+        # drawdown calculation — add here so it exists before first resolved trade.
+        ("bug_loss",           "INTEGER"),
     ]
 
     def __init__(self, conn: "sqlite3.Connection", dry_run: bool = True) -> None:
