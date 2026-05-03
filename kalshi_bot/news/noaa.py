@@ -415,8 +415,17 @@ async def _check_station_drift(
 
 async def _fetch_observed_max_today(
     session: aiohttp.ClientSession, city_name: str, obs_url: str, city_tz: ZoneInfo
-) -> float | None:
-    """Return the max temperature (°F) recorded at the station since LST midnight.
+) -> tuple[float | None, int | None]:
+    """Return (precision_max_f, synoptic_max_c) recorded at the station since LST midnight.
+
+    precision_max_f: max °F from METAR-aligned (non-round-5-minute) readings, which
+    report decimal °C (0.1°C precision).  These are the only readings used for the
+    precision running max.
+
+    synoptic_max_c: running max integer °C from 5-minute synoptic readings.  These
+    round to the nearest °C (±0.5°C → ±0.9°F) but update every 5 minutes vs. hourly
+    for METAR.  Returned as a raw integer so callers can apply range math
+    ([N-0.5, N+0.499]°C) to determine band membership without absorbing rounding error.
 
     Queries the NWS observations endpoint with a ``start`` parameter equal to
     midnight in Local Standard Time (LST).  The NWS CLI daily period runs from
@@ -426,9 +435,8 @@ async def _fetch_observed_max_today(
     day and produce a spuriously high running max (e.g. the 71.6°F overnight
     warm reading at 00:55 EDT on April 19 belongs to the NWS April 18 period).
 
-    Converts each reading from °C to °F and returns the maximum.  Returns None
-    if the endpoint is unavailable or returns no readings for the LST day so far
-    (which is correct behaviour before 01:00 local clock during DST).
+    Returns (None, None) if the endpoint is unavailable or returns no readings for
+    the LST day so far (correct behaviour before 01:00 local clock during DST).
     """
     local_now = datetime.now(city_tz)
     # Shift to LST midnight: if DST is active, midnight LST = 01:00 local clock.
@@ -449,31 +457,38 @@ async def _fetch_observed_max_today(
             data = await resp.json()
     except Exception as exc:
         logging.warning("NOAA observed temp fetch failed for %s: %s", city_name, exc)
-        return None
+        return None, None
 
     max_f: float | None = None
+    synoptic_max_c: int | None = None
     for feature in data.get("features", []):
         props = feature.get("properties") or {}
-        # Skip 5-minute synoptic readings: they round temperatures to integer °C
-        # (vs. 0.1°C for METAR), inflating the apparent max by up to 0.9°C = 1.62°F.
-        # METAR reports arrive at non-round-5 minutes (typically :53); synoptic
-        # reports arrive at :00/:05/:10/…/:55.
         ts = props.get("timestamp", "")
         try:
             ts_min = datetime.fromisoformat(ts).minute
         except (ValueError, TypeError):
             ts_min = -1
+
+        temp_c_raw = props.get("temperature", {}).get("value")
+
         if ts_min >= 0 and ts_min % 5 == 0:
+            # 5-minute synoptic reading: integer °C — track running max separately,
+            # do not use for precision max.
+            if temp_c_raw is not None:
+                tc_int = int(round(float(temp_c_raw)))
+                if synoptic_max_c is None or tc_int > synoptic_max_c:
+                    synoptic_max_c = tc_int
             continue
-        temp_c = props.get("temperature", {}).get("value")
-        if temp_c is not None:
-            temp_f = temp_c * 9.0 / 5.0 + 32.0
+
+        # METAR-aligned: decimal °C, use for precision max
+        if temp_c_raw is not None:
+            temp_f = float(temp_c_raw) * 9.0 / 5.0 + 32.0
             if max_f is None or temp_f > max_f:
                 max_f = temp_f
 
     if max_f is not None:
         logging.debug("NOAA [%s]: observed max today = %.1f°F", city_name, max_f)
-    return max_f
+    return max_f, synoptic_max_c
 
 
 async def _fetch_high_temp(
@@ -531,8 +546,9 @@ async def _fetch_high_temp(
 
     # --- Observed max so far today ---
     observed_max: float | None = None
+    synoptic_max_c: int | None = None
     if obs_url:
-        observed_max = await _fetch_observed_max_today(session, city_name, obs_url, city_tz)
+        observed_max, synoptic_max_c = await _fetch_observed_max_today(session, city_name, obs_url, city_tz)
 
     today_noon_local = datetime.now(city_tz).replace(hour=12, minute=0, second=0, microsecond=0)
     as_of = today_noon_local.astimezone(timezone.utc).isoformat()
@@ -647,10 +663,11 @@ async def _fetch_high_temp(
             unit=unit,
             as_of=as_of,
             metadata={
-                "city":          city_name,
-                "forecast_high": forecast_temp,
-                "observed_max":  observed_max,
-                "local_date":    str(today_local),
+                "city":              city_name,
+                "forecast_high":     forecast_temp,
+                "observed_max":      observed_max,
+                "local_date":        str(today_local),
+                "synoptic_celsius":  synoptic_max_c,
             },
         ))
 

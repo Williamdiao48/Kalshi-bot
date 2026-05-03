@@ -136,6 +136,10 @@ _last_noaa_day1: dict[str, float] = {}
 # The CLI preliminary report is published once ~5-8 PM local and cached for the
 # rest of the day, so reusing the previous poll's value in the fast loop is safe.
 _last_nws_climo: dict[str, float] = {}
+# _last_synoptic_celsius: synoptic integer °C running max per metric, cached from
+# the last full cycle.  Used by the fast loop's find_band_arbs call to generate
+# 5-minute NO/YES signals without re-fetching NOAA.  Same age gate as _last_noaa_obs.
+_last_synoptic_celsius: dict[str, int | None] = {}
 # _last_hrrr_highs: HRRR forecast highs cached from the last full cycle.
 # Passed to find_band_arbs in the fast loop to enable the HRRR contradiction
 # veto (catches stale METAR carry when HRRR predicts a cold day but the
@@ -3665,6 +3669,21 @@ async def _poll(
             _ld = (_dp.metadata or {}).get("local_date")
             if _ld:
                 _band_arb_noaa_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+    # Synoptic Celsius running max from noaa_observed metadata (5-minute NWS updates).
+    # Used by find_band_arbs to generate faster NO signals and YES signals for specific
+    # integer °C values where the ±0.9°F uncertainty interval fits within a 2°F band.
+    _synoptic_celsius: dict[str, int | None] = {}
+    for _dp in data_points:
+        if (
+            _dp.source == "noaa_observed"
+            and _dp.metric.startswith("temp_high_")
+            and _dp.as_of
+            and date.fromisoformat(_dp.as_of[:10]) == _noaa_obs_today_utc
+        ):
+            _syn_c = (_dp.metadata or {}).get("synoptic_celsius")
+            if _syn_c is not None:
+                _synoptic_celsius[_dp.metric] = int(_syn_c)
+
     # NOAA day-1 forecast values — used as a veto signal in find_band_arbs
     # when noaa_observed is absent or stale (see BAND_ARB_NOAA_DAY1_VETO).
     # source="noaa" is the NWS day-1 forecast; filtered to today's UTC date
@@ -3695,6 +3714,7 @@ async def _poll(
             noaa_day1_values=_band_arb_noaa_day1 or None,
             hrrr_values=hrrr_hourly_highs or None,
             nws_climo_values=_band_arb_nws_climo or None,
+            synoptic_celsius=_synoptic_celsius or None,
         )
         if _early_band_arb_signals:
             logging.info(
@@ -3908,7 +3928,7 @@ async def _poll(
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
     # inner loop only refreshes series prices for cities that matter.
-    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time, _last_noaa_day1, _last_nws_climo
+    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time, _last_noaa_day1, _last_nws_climo, _last_synoptic_celsius
     _near_threshold_cities = set()
     for _wl_mkt in markets:
         _wl_parsed = parse_market(_wl_mkt)
@@ -3928,6 +3948,7 @@ async def _poll(
     _last_noaa_obs_time = time.monotonic()
     _last_noaa_day1 = _band_arb_noaa_day1.copy()
     _last_nws_climo = _band_arb_nws_climo.copy()
+    _last_synoptic_celsius = _synoptic_celsius.copy()
     if _near_threshold_cities:
         logging.debug(
             "Fast-loop watchlist: %d near-threshold city(ies): %s",
@@ -4072,6 +4093,7 @@ async def _fast_loop(
         noaa_day1_values=_last_noaa_day1 or None,
         hrrr_values=_hrrr_for_arb,
         nws_climo_values=_last_nws_climo or None,
+        synoptic_celsius=_last_synoptic_celsius or None,
     )
     if signals:
         logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))

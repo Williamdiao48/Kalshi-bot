@@ -60,8 +60,23 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 from typing import Any
 
+import importlib.util as _ilu
+from pathlib import Path as _Path
+
 from .market_parser import parse_market
 from .news.noaa import CITIES  # city timezone lookup for date-alignment guard
+
+# Per-city/month p75 peak-time thresholds (minutes since local midnight).
+# Loaded from data/peak_hour_p90.py; used by _is_past_lock() to replace the
+# hardcoded 4:30 PM global gate with city- and season-aware thresholds.
+_BAND_ARB_P75_MINUTES: dict[str, dict[int, int]] = {}
+_p75_path = _Path(__file__).parent.parent / "data" / "peak_hour_p90.py"
+if _p75_path.exists():
+    _spec = _ilu.spec_from_file_location("peak_hour_p90", _p75_path)
+    if _spec and _spec.loader:
+        _p75_mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_p75_mod)  # type: ignore[union-attr]
+        _BAND_ARB_P75_MINUTES = getattr(_p75_mod, "P75_MINUTES", {})
 
 BAND_ARB_EXECUTION_ENABLED: bool = (
     os.environ.get("BAND_ARB_EXECUTION_ENABLED", "true").lower() == "true"
@@ -155,6 +170,9 @@ BAND_ARB_YES_MAX_DIVERGENCE_F: float = float(os.environ.get("BAND_ARB_YES_MAX_DI
 # Local hour + minute at which daily high is considered locked (matches NOAA_OBS_PEAK_PAST)
 BAND_ARB_YES_LOCK_LOCAL_HOUR: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_HOUR", "16"))
 BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_MINUTE", "30"))
+# Synoptic Celsius band arb (5-minute NWS updates via integer-°C range math)
+SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = os.environ.get("SYNOPTIC_BAND_ARB_NO_ENABLED", "true").lower() == "true"
+SYNOPTIC_BAND_ARB_YES_ENABLED: bool = os.environ.get("SYNOPTIC_BAND_ARB_YES_ENABLED", "true").lower() == "true"
 
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = os.environ.get("FORECAST_NO_ENABLED", "true").lower() == "true"
@@ -324,6 +342,37 @@ FORECAST_NO_MODEL_SPREAD_F: float = float(
 )
 
 
+def _synoptic_celsius_band(
+    celsius_c: int,
+    strike_lo: float,
+    strike_hi: float,
+) -> str | None:
+    """Check if integer Celsius reading definitively places the temp in or above a Kalshi band.
+
+    For a 5-minute synoptic reading of N°C, the actual temperature is guaranteed
+    in [F_low, F_high] = [(N−0.5)×1.8+32, (N+0.499)×1.8+32] (width 1.8°F).
+
+    For a Kalshi "between" band [strike_lo, strike_hi] the settlement window is
+    [strike_lo−0.5, strike_hi+0.5) (NWS rounds to nearest integer °F, 2°F wide).
+
+    Returns:
+      'YES'  if the entire 1.8°F interval fits inside the settlement window
+             → temp is definitively inside the band regardless of rounding
+      'NO'   if the lower bound already exceeds the ceiling (strike_hi+0.5)
+             → temp is definitively above the band; market resolves NO
+      None   if the result is ambiguous (interval straddles a boundary)
+    """
+    f_low  = (celsius_c - 0.5)    * 1.8 + 32.0
+    f_high = (celsius_c + 0.4999) * 1.8 + 32.0
+    eff_lo = strike_lo - 0.5
+    eff_hi = strike_hi + 0.5
+    if f_low >= eff_hi:
+        return "NO"
+    if f_low >= eff_lo and f_high < eff_hi:
+        return "YES"
+    return None
+
+
 def _noaa_obs_bounds(temp_f: float) -> tuple[float, float]:
     """Return (lower_f, upper_f) bounding the true temperature given NWS API °C rounding.
 
@@ -445,9 +494,17 @@ def _hours_to_close(close_time_str: str) -> float | None:
         return None
 
 
-def _is_past_lock(city_tz) -> bool:
-    """Return True if local city time has passed the 4:30 PM daily-high lock point."""
+def _is_past_lock(city_tz, metric: str | None = None) -> bool:
+    """Return True if local city time has passed the p75 daily-high lock point for this city/month.
+
+    Uses per-city/month p75 thresholds from data/peak_hour_p90.py when available;
+    falls back to the global BAND_ARB_YES_LOCK_LOCAL_HOUR/MINUTE env-var gate.
+    """
     local_now = datetime.now(city_tz)
+    if metric is not None:
+        p75 = _BAND_ARB_P75_MINUTES.get(metric, {}).get(local_now.month)
+        if p75 is not None:
+            return local_now.hour * 60 + local_now.minute >= p75
     lock_mins = BAND_ARB_YES_LOCK_LOCAL_HOUR * 60 + BAND_ARB_YES_LOCK_LOCAL_MINUTE
     return local_now.hour * 60 + local_now.minute >= lock_mins
 
@@ -461,6 +518,7 @@ def find_band_arbs(
     noaa_day1_values: dict[str, float] | None = None,
     hrrr_values: dict[str, float] | None = None,
     nws_climo_values: dict[str, float] | None = None,
+    synoptic_celsius: dict[str, int | None] | None = None,
 ) -> list[BandArbSignal]:
     """Scan open KXHIGH and KXLOWT markets for bands definitively passed through by METAR.
 
@@ -623,6 +681,21 @@ def find_band_arbs(
                 if parsed.strike_hi is not None and observed_max >= parsed.strike_hi + 0.5:
                     is_definitive_no = True
                     band_ceil = parsed.strike_hi
+                elif (
+                    SYNOPTIC_BAND_ARB_NO_ENABLED
+                    and synoptic_celsius is not None
+                    and parsed.strike_lo is not None
+                    and parsed.strike_hi is not None
+                ):
+                    syn_c = synoptic_celsius.get(parsed.metric)
+                    if syn_c is not None and _synoptic_celsius_band(syn_c, parsed.strike_lo, parsed.strike_hi) == "NO":
+                        is_definitive_no = True
+                        band_ceil = parsed.strike_hi
+                        logging.info(
+                            "BandArb synoptic-NO: %s  syn=%d°C → F_low=%.1f°F > ceiling=%.1f°F",
+                            ticker, syn_c,
+                            (syn_c - 0.5) * 1.8 + 32.0, parsed.strike_hi + 0.5,
+                        )
 
             elif parsed.direction == "under":
                 # NWS rounds to nearest integer. "Under 60°F" resolves NO when the
@@ -694,7 +767,29 @@ def find_band_arbs(
             # Temperature must be strictly inside the band with NWS rounding buffer
             buf = BAND_ARB_YES_BUFFER_F
             in_band = (parsed.strike_lo + buf) <= observed_max <= (parsed.strike_hi - buf)
-            if not in_band:
+
+            # Synoptic YES: specific integer °C values where the entire ±0.9°F
+            # uncertainty interval fits inside the 2°F settlement window.
+            # Fires even when METAR is outside strict band edges but the synoptic
+            # reading guarantees the official rounded temp is in-band.
+            _syn_yes = False
+            if (
+                not in_band
+                and SYNOPTIC_BAND_ARB_YES_ENABLED
+                and synoptic_celsius is not None
+            ):
+                syn_c_yes = synoptic_celsius.get(parsed.metric)
+                if syn_c_yes is not None and _synoptic_celsius_band(syn_c_yes, parsed.strike_lo, parsed.strike_hi) == "YES":
+                    _syn_yes = True
+                    logging.info(
+                        "BandArb synoptic-YES candidate: %s  syn=%d°C"
+                        " → [%.1f, %.1f°F] in band [%.1f, %.1f]",
+                        ticker, syn_c_yes,
+                        (syn_c_yes - 0.5) * 1.8 + 32.0, (syn_c_yes + 0.4999) * 1.8 + 32.0,
+                        parsed.strike_lo, parsed.strike_hi,
+                    )
+
+            if not in_band and not _syn_yes:
                 continue
 
             # Determine if we're past the 4:30 PM daily-high lock point
@@ -703,7 +798,7 @@ def find_band_arbs(
             if _city_info_yes is None:
                 continue
             _city_tz_yes = _city_info_yes[3]
-            locked = _is_past_lock(_city_tz_yes)
+            locked = _is_past_lock(_city_tz_yes, metric=parsed.metric)
 
             # Time gate: before lock, only fire within BAND_ARB_YES_MAX_HOURS_PRELOCK of close
             close_time_str = mkt.get("close_time") or mkt.get("expiration_time", "")
@@ -747,11 +842,12 @@ def find_band_arbs(
             # Use lower bound of noaa_val_yes: "corroborated" only if even the
             # lowest plausible NOAA reading has cleared the band ceiling.
             _yes_lb, _ = _noaa_obs_bounds(noaa_val_yes)
-            _yes_corr_status = (
-                "metar_noaa_corroborated"
-                if _yes_lb >= parsed.strike_hi  # type: ignore[operator]
-                else "metar_noaa_lagging"
-            )
+            if _syn_yes and not in_band:
+                _yes_corr_status = "synoptic"
+            elif _yes_lb >= parsed.strike_hi:  # type: ignore[operator]
+                _yes_corr_status = "metar_noaa_corroborated"
+            else:
+                _yes_corr_status = "metar_noaa_lagging"
             signals.append(BandArbSignal(
                 metric=parsed.metric, ticker=ticker, yes_bid=yes_bid, no_ask=no_ask,
                 observed_max=observed_max, band_ceil=parsed.strike_hi,
