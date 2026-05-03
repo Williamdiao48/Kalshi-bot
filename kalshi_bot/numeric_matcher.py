@@ -75,6 +75,24 @@ METAR_LOW_MIN_GAP_F: float = float(
 )
 
 # ---------------------------------------------------------------------------
+# KXLOWT between-YES gate (backtest-calibrated)
+# ---------------------------------------------------------------------------
+
+# Minimum floor clearance (°F) for METAR KXLOWT between-YES signals when many
+# hours remain.  floor_clearance = running_min - (strike_lo - 0.5).  Only
+# enforced when hours_to_close > KXLOWT_YES_MAX_HOURS_OPEN.
+# Backtest (5yr/20-city spring-summer): c<1.0°F + >10h ≈ 12% P(loss).
+KXLOWT_YES_MIN_FLOOR_CLEARANCE_F: float = float(
+    os.environ.get("KXLOWT_YES_MIN_FLOOR_CLEARANCE_F", "1.0")
+)
+
+# Gate only active when this many hours remain until market close.
+# After ~2 PM LST (10h to midnight), P(loss) drops sharply per backtest.
+KXLOWT_YES_MAX_HOURS_OPEN: float = float(
+    os.environ.get("KXLOWT_YES_MAX_HOURS_OPEN", "10.0")
+)
+
+# ---------------------------------------------------------------------------
 # Cross-exchange confirmation config
 # ---------------------------------------------------------------------------
 
@@ -409,6 +427,21 @@ def find_numeric_opportunities(
                         continue
 
             outcome, raw_edge = _implied_outcome(dp.value, pm, pct_change)
+
+            # METAR KXLOWT between-YES: the running min can only fall, so only
+            # floor clearance matters for risk and sizing.  _implied_outcome
+            # returns min(floor_clearance, ceiling_clearance); for METAR the
+            # ceiling direction is irrelevant.  Forecast sources (hrrr,
+            # open_meteo) have bi-directional error and correctly use the min.
+            if (
+                outcome == "YES"
+                and pm.direction == "between"
+                and dp.metric.startswith("temp_low_")
+                and dp.source == "metar"
+                and pm.strike_lo is not None
+            ):
+                raw_edge = dp.value - (pm.strike_lo - 0.5)
+
             effective_edge = raw_edge * multiplier
             if effective_edge < min_edge:
                 continue
@@ -433,6 +466,57 @@ def find_numeric_opportunities(
                             pm.ticker, _current, _obs_min, _gap, METAR_LOW_MIN_GAP_F,
                         )
                         continue
+
+            # KXLOWT between-YES guards ----------------------------------------
+            if (
+                outcome == "YES"
+                and pm.direction == "between"
+                and dp.metric.startswith("temp_low_")
+                and pm.strike_lo is not None
+            ):
+                # noaa_observed fetch window ends at 05:00 LST — stale for
+                # afternoon signals.  METAR tracks the live running minimum;
+                # forecast sources (hrrr, open_meteo, nws_hourly) are forward-
+                # looking and handled by existing main.py gates.
+                if dp.source == "noaa_observed":
+                    logging.debug(
+                        "LowYesGate skip %s: noaa_observed stale for between-YES",
+                        pm.ticker,
+                    )
+                    continue
+
+                # Clearance+hours gate (METAR only — backtest directly applies).
+                if dp.source == "metar":
+                    _floor_clearance = dp.value - (pm.strike_lo - 0.5)
+                    _htc = close_time_by_ticker.get(pm.ticker)
+                    if (
+                        _htc is not None
+                        and _htc > KXLOWT_YES_MAX_HOURS_OPEN
+                        and _floor_clearance < KXLOWT_YES_MIN_FLOOR_CLEARANCE_F
+                    ):
+                        logging.info(
+                            "LowYesGate block %s: floor_clearance=%.2f°F < %.1f°F"
+                            " with %.1fh remaining",
+                            pm.ticker, _floor_clearance,
+                            KXLOWT_YES_MIN_FLOOR_CLEARANCE_F, _htc,
+                        )
+                        continue
+
+            # KXLOWT between-NO from noaa_observed ---------------------------------
+            # noaa_observed fetch window ends at 05:00 LST; a stale pre-dawn min
+            # showing "above band" can be dangerously wrong by evening.
+            # (Trade #4 HOU: noaa_observed showed 66.2°F, actual temp was ~57°F.)
+            if (
+                outcome == "NO"
+                and pm.direction == "between"
+                and dp.metric.startswith("temp_low_")
+                and dp.source == "noaa_observed"
+            ):
+                logging.debug(
+                    "LowNoGate skip %s: between-NO from noaa_observed (stale)",
+                    pm.ticker,
+                )
+                continue
 
             opportunities.append(
                 NumericOpportunity(
