@@ -342,15 +342,13 @@ FORECAST_NO_HRRR_SPREAD_F: float = float(
 # forecast for a given metric before the signal is blocked.  When models
 # disagree by more than this amount, forecast uncertainty is too high to
 # justify a trade.  Applies to all directions (including band/"between" markets).
-# NOTE: src_values is now filtered to forecast_offset=0 (today only), so this
-# spread is a genuine inter-model comparison.  Typical same-day model spread
-# (HRRR vs NWS vs open_meteo) is 3–10°F on clear days, 10–20°F on convective
-# days.  10°F allows trades when major models agree while blocking high-uncertainty
-# convective events.  The old 5°F default was calibrated on multi-day spreads
-# that included day+1 through day+5 — effectively blocking all signals.
+# Calibration: live log audit (2026-05-04) showed 4°F was too conservative —
+# all 21 markets blocked at 4–10°F spread settled as NO wins; 10°F+ blocks
+# from May 2 split roughly 50/50.  9°F keeps all the winners while still
+# blocking genuinely chaotic convective-day signals (>10°F).
 # Set to 0 to disable.
 FORECAST_NO_MODEL_SPREAD_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "4.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "9.0")
 )
 
 
