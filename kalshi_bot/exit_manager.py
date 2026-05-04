@@ -312,7 +312,7 @@ _pt_raw = os.environ.get(
     ' "noaa_day2:yes": 0.35, "noaa_day2_early:yes": 0.35,'
     ' "noaa": 0.40, "noaa_day2": 0.20, "polymarket": 0.25,'
     ' "obs_trajectory:yes": 0.30,'
-    ' "band_arb:yes": 0.15, "band_arb:no": 2.00,'
+    ' "band_arb:yes": 0.70, "band_arb:no": 2.00,'
     ' "forecast_no": 0.40, "numeric": 0.75,'
     ' "binance": 0.35, "coinbase": 0.35}',
 )
@@ -429,6 +429,17 @@ EXIT_STOP_LOSS_FLOOR_PRICE: int = int(
 # Set to 0 to disable (falls back to the standard EXIT_SOURCE_PROFIT_TAKE logic).
 BAND_ARB_NO_EXIT_PRICE_CENTS: int = int(
     os.environ.get("BAND_ARB_NO_EXIT_PRICE_CENTS", "95")
+)
+
+# Absolute YES-bid threshold for band_arb:yes positions.  When yes_bid reaches
+# this level, exit immediately — capturing near-settlement value while protecting
+# against a last-minute market flip before the official NWS reading.
+# Complements the percentage profit-take (BAND_ARB_YES_PROFIT_TAKE=0.70): locked
+# positions whose entry is above 59¢ will never hit the 70% threshold (59×1.70≈100),
+# so this gate is the primary exit trigger for most band_arb YES trades.
+# Set to 0 to disable.
+BAND_ARB_YES_EXIT_PRICE_CENTS: int = int(
+    os.environ.get("BAND_ARB_YES_EXIT_PRICE_CENTS", "95")
 )
 
 # Sources where intraday price moves are noise — hold to settlement, skip all exits.
@@ -887,6 +898,27 @@ class ExitManager:
                     "[band_arb-PT] trade #%d %s: NO price %.0f¢ ≥ %d¢ threshold — profit_take",
                     trade.trade_id, getattr(trade, "ticker", "?"),
                     _current_exit_price, BAND_ARB_NO_EXIT_PRICE_CENTS,
+                )
+                reason = "profit_take"
+                detail = "profit_take:band_arb_abs_price"
+
+            # Absolute YES-bid profit-take for band_arb:yes.
+            # Locks in near-settlement value and guards against a late market flip
+            # before the official NWS reading.  For entries above ~59¢ the 70%
+            # percentage threshold (59×1.70≈100) never fires, so this is the
+            # primary exit trigger for most locked band_arb YES positions.
+            if (
+                reason is None
+                and BAND_ARB_YES_EXIT_PRICE_CENTS > 0
+                and src == "band_arb"
+                and side == "yes"
+                and trade.current_mid is not None
+                and trade.current_mid >= BAND_ARB_YES_EXIT_PRICE_CENTS
+            ):
+                logging.info(
+                    "[band_arb-PT] trade #%d %s: YES bid %.0f¢ ≥ %d¢ threshold — profit_take",
+                    trade.trade_id, getattr(trade, "ticker", "?"),
+                    trade.current_mid, BAND_ARB_YES_EXIT_PRICE_CENTS,
                 )
                 reason = "profit_take"
                 detail = "profit_take:band_arb_abs_price"
