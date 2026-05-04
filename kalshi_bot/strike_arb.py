@@ -172,13 +172,22 @@ BAND_ARB_YES_LOCK_LOCAL_HOUR: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_
 BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_MINUTE", "30"))
 # Synoptic Celsius band arb (5-minute NWS updates via integer-°C range math)
 SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = os.environ.get("SYNOPTIC_BAND_ARB_NO_ENABLED", "true").lower() == "true"
-SYNOPTIC_BAND_ARB_YES_ENABLED: bool = os.environ.get("SYNOPTIC_BAND_ARB_YES_ENABLED", "true").lower() == "true"
 
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = os.environ.get("FORECAST_NO_ENABLED", "true").lower() == "true"
 # Minimum forecast-to-strike edge (°F) for a source's value to count toward
 # corroboration.  With NOAA day-1 MAE ~3-4°F, 5°F means P(correct) > 85%.
-FORECAST_NO_MIN_EDGE_F: float = float(os.environ.get("FORECAST_NO_MIN_EDGE_F", "6.0"))
+FORECAST_NO_MIN_EDGE_F: float = float(os.environ.get("FORECAST_NO_MIN_EDGE_F", "3.0"))
+# Direction-specific edge overrides for "between" band NO signals.
+# NO_HIGH (forecast above band) is more reliable than NO_LOW (forecast below
+# band) per backtest — lower threshold justified.  Both default to the global
+# FORECAST_NO_MIN_EDGE_F when not set explicitly.
+FORECAST_NO_NO_HIGH_MIN_EDGE_F: float = float(
+    os.environ.get("FORECAST_NO_NO_HIGH_MIN_EDGE_F", "2.5")
+)
+FORECAST_NO_NO_LOW_MIN_EDGE_F: float = float(
+    os.environ.get("FORECAST_NO_NO_LOW_MIN_EDGE_F", "3.5")
+)
 # Number of independent sources required (noaa_observed counts as 2 if edge >= 2°F)
 FORECAST_NO_MIN_SOURCES: int = int(os.environ.get("FORECAST_NO_MIN_SOURCES", "2"))
 # Higher source minimum for KXLOWT forecast_no signals — overnight lows are harder
@@ -215,6 +224,9 @@ FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
 # current temperature rather than the true overnight low in some cities).
 _FORECAST_NO_SOURCES: frozenset[str] = frozenset({
     "hrrr", "nws_hourly", "open_meteo", "noaa",
+    # Model-specific Open-Meteo sources (fetched by open_meteo.fetch_model_forecasts).
+    # Each is an independent signal validated by backtest; GFS/HRRR are the strongest.
+    "open_meteo_gfs", "open_meteo_ecmwf", "open_meteo_icon", "open_meteo_gem",
 })
 # Local hour (city-local) at or after which the overnight low window is considered
 # closed and the observed running minimum is treated as the definitive daily low.
@@ -338,7 +350,7 @@ FORECAST_NO_HRRR_SPREAD_F: float = float(
 # that included day+1 through day+5 — effectively blocking all signals.
 # Set to 0 to disable.
 FORECAST_NO_MODEL_SPREAD_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "10.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "4.0")
 )
 
 
@@ -480,6 +492,10 @@ class ForecastNoSignal:
     yes_ask: int = 0                    # YES ask at signal time (for spread + market_p)
     hours_to_close: float | None = None # Hours until market close at signal time
     model_spread_f: float | None = None # Max − min across forecast models (°F)
+    # For "between" band markets: which side of the band the qualifying sources agree on.
+    # "NO_HIGH" = forecast above strike_hi (too hot); "NO_LOW" = below strike_lo (too cold).
+    # None for "under"/"over" markets where direction is already unambiguous.
+    no_direction: str | None = None
 
 
 def _hours_to_close(close_time_str: str) -> float | None:
@@ -768,28 +784,7 @@ def find_band_arbs(
             buf = BAND_ARB_YES_BUFFER_F
             in_band = (parsed.strike_lo + buf) <= observed_max <= (parsed.strike_hi - buf)
 
-            # Synoptic YES: specific integer °C values where the entire ±0.9°F
-            # uncertainty interval fits inside the 2°F settlement window.
-            # Fires even when METAR is outside strict band edges but the synoptic
-            # reading guarantees the official rounded temp is in-band.
-            _syn_yes = False
-            if (
-                not in_band
-                and SYNOPTIC_BAND_ARB_YES_ENABLED
-                and synoptic_celsius is not None
-            ):
-                syn_c_yes = synoptic_celsius.get(parsed.metric)
-                if syn_c_yes is not None and _synoptic_celsius_band(syn_c_yes, parsed.strike_lo, parsed.strike_hi) == "YES":
-                    _syn_yes = True
-                    logging.info(
-                        "BandArb synoptic-YES candidate: %s  syn=%d°C"
-                        " → [%.1f, %.1f°F] in band [%.1f, %.1f]",
-                        ticker, syn_c_yes,
-                        (syn_c_yes - 0.5) * 1.8 + 32.0, (syn_c_yes + 0.4999) * 1.8 + 32.0,
-                        parsed.strike_lo, parsed.strike_hi,
-                    )
-
-            if not in_band and not _syn_yes:
+            if not in_band:
                 continue
 
             # Determine if we're past the 4:30 PM daily-high lock point
@@ -842,9 +837,7 @@ def find_band_arbs(
             # Use lower bound of noaa_val_yes: "corroborated" only if even the
             # lowest plausible NOAA reading has cleared the band ceiling.
             _yes_lb, _ = _noaa_obs_bounds(noaa_val_yes)
-            if _syn_yes and not in_band:
-                _yes_corr_status = "synoptic"
-            elif _yes_lb >= parsed.strike_hi:  # type: ignore[operator]
+            if _yes_lb >= parsed.strike_hi:  # type: ignore[operator]
                 _yes_corr_status = "metar_noaa_corroborated"
             else:
                 _yes_corr_status = "metar_noaa_lagging"
@@ -1402,6 +1395,18 @@ def find_forecast_nos(
                             ticker, _obs_max, parsed.strike_hi,
                         )
                         continue
+                    # "Too cold" branch: if observed max already at/above the band floor,
+                    # the daily high is proved >= strike_lo — "too cold" NO is impossible.
+                    # The daily maximum never decreases, so any METAR reading >= strike_lo
+                    # guarantees the final official high will be in or above the band.
+                    if _obs_max >= parsed.strike_lo:
+                        logging.debug(
+                            "ForecastNO veto (too-cold disproven): %s —"
+                            " observed_max=%.1f°F >= strike_lo=%.1f°F"
+                            " (daily max proved ≥ band floor, too-cold NO impossible)",
+                            ticker, _obs_max, parsed.strike_lo,
+                        )
+                        continue
 
         # Compute per-source edge for this market's band direction
         sources_map = src_values.get(parsed.metric, [])
@@ -1502,23 +1507,25 @@ def find_forecast_nos(
                     )
                     continue
 
-        qualifying: list[tuple[str, float, float]] = []  # (source, value, edge_F)
+        # qualifying: (source, value, edge_F, no_dir)
+        # no_dir is "NO_HIGH" / "NO_LOW" for "between" bands; None for under/over.
+        qualifying: list[tuple[str, float, float, str | None]] = []
         for source, value in sources_map:
+            no_dir: str | None = None
             if not is_low_market:
                 # HIGH market: NO settles when forecast misses the strike.
-                #   "between" – NO when forecast > strike_hi (too hot for YES band)
-                #               edge = value - strike_hi  (positive = too warm)
-                #   "under"   – NO when forecast >= strike (too warm to stay under)
-                #               edge = value - strike
-                #   "over"    – NO when forecast < strike (too cold to reach it)
-                #               edge = strike - value  (positive = below threshold)
                 if parsed.direction == "between":
-                    # NO when forecast is outside the band on either side.
-                    # Take the larger of the two possible edges so the strongest
-                    # signal direction wins; only a positive result qualifies.
+                    # Track WHICH side the source is on — critical for consensus.
+                    # A source above strike_hi and one below strike_lo disagree on
+                    # the actual temperature and must NOT both count toward consensus.
                     edge_warm = (value - parsed.strike_hi) if parsed.strike_hi is not None else float("-inf")
                     edge_cold = (parsed.strike_lo - value) if parsed.strike_lo is not None else float("-inf")
-                    edge = max(edge_warm, edge_cold)
+                    if edge_warm >= edge_cold:
+                        edge   = edge_warm
+                        no_dir = "NO_HIGH"
+                    else:
+                        edge   = edge_cold
+                        no_dir = "NO_LOW"
                 elif parsed.direction == "under" and parsed.strike is not None:
                     edge = value - parsed.strike
                 elif parsed.direction == "over" and parsed.strike is not None:
@@ -1526,38 +1533,52 @@ def find_forecast_nos(
                 else:
                     continue
             else:
-                # LOW market: NO settles when the daily low stays ABOVE the strike
-                # (i.e., it doesn't get as cold as the market fears).
-                #   "between"  – NO when daily_low > strike_hi (stayed above band)
-                #                OR daily_low < strike_lo (fell below band)
-                #                For forecast_no we only care about the "too warm"
-                #                case: edge = value - strike_hi
-                #   "under"    – YES if daily_low < strike; NO if daily_low >= strike.
-                #                e.g. KXLOWT-B63.5: YES if low<63.5, NO if low≥63.5.
-                #                Forecast signal: model says low will be well above
-                #                strike → edge = value - strike.
-                #   "over"     – top-tier, YES if daily_low > strike; NO if low ≤ strike.
-                #                Forecast: model says low will be well below strike
-                #                → edge = strike - value.
+                # LOW market: NO settles when the daily low stays ABOVE the strike.
                 if parsed.direction == "between" and parsed.strike_hi is not None:
                     edge = value - parsed.strike_hi  # forecast too warm for YES
                 elif parsed.direction == "under" and parsed.strike is not None:
-                    edge = value - parsed.strike  # forecast above strike → NO wins
+                    edge = value - parsed.strike
                 elif parsed.direction == "over" and parsed.strike is not None:
-                    edge = parsed.strike - value  # forecast below strike → NO wins
+                    edge = parsed.strike - value
                 else:
                     continue
 
-            if edge >= FORECAST_NO_MIN_EDGE_F:
-                qualifying.append((source, value, edge))
+            # Direction-specific edge threshold for "between" NO signals.
+            if no_dir == "NO_HIGH":
+                _edge_required = FORECAST_NO_NO_HIGH_MIN_EDGE_F
+            elif no_dir == "NO_LOW":
+                _edge_required = FORECAST_NO_NO_LOW_MIN_EDGE_F
+            else:
+                _edge_required = FORECAST_NO_MIN_EDGE_F
+
+            if edge >= _edge_required:
+                qualifying.append((source, value, edge, no_dir))
 
         if not qualifying:
             continue
 
+        # Directional consistency check for "between" bands.
+        # If any qualifying sources say NO_HIGH and others say NO_LOW, the models
+        # disagree on which side of the band the temperature will land — suppress.
+        if parsed.direction == "between":
+            _dirs = {d for _, _, _, d in qualifying if d is not None}
+            if "NO_HIGH" in _dirs and "NO_LOW" in _dirs:
+                logging.debug(
+                    "ForecastNO skip (directional conflict): %s — "
+                    "sources split NO_HIGH/NO_LOW (models disagree on temperature)",
+                    ticker,
+                )
+                continue
+            # All qualifying sources agree; record which direction
+            _signal_no_direction: str | None = next(
+                (d for _, _, _, d in qualifying if d is not None), None
+            )
+        else:
+            _signal_no_direction = None
+
         # Count unique qualifying sources.  Deduplicate by source name so that
-        # sources emitting multiple hourly forecasts per poll (open_meteo,
-        # nws_hourly) cannot satisfy MIN_SOURCES on their own.
-        source_score = len({src for src, _, _ in qualifying})
+        # sources emitting multiple hourly forecasts per poll cannot inflate count.
+        source_score = len({src for src, _, _, _ in qualifying})
         # KXLOWT uses a higher threshold — overnight lows harder to forecast.
         _fno_min_sources = (
             FORECAST_NO_LOWT_MIN_SOURCES
@@ -1573,35 +1594,31 @@ def find_forecast_nos(
             )
             continue
 
-        # Near-term model anchor: require at least one hrrr or nws_hourly source
-        # in the qualifying set.  Day-ahead global models (open_meteo, noaa) have
-        # MAE ~4-5°F vs 2-3°F for HRRR/NWS.  Without near-term corroboration the
-        # signal confidence is too low to justify the position.
+        # Near-term model anchor: require at least one hrrr or nws_hourly source.
         if FORECAST_NO_REQUIRE_NEAR_TERM:
             _near_term = {"hrrr", "nws_hourly"}
-            if not any(s in _near_term for s, _, _e in qualifying):
+            if not any(s in _near_term for s, _, _, _ in qualifying):
                 logging.debug(
                     "ForecastNO skip: %s — no near-term model in qualifying sources %s"
                     " (day-ahead models only, insufficient confidence)",
-                    ticker, [s for s, _, _e in qualifying],
+                    ticker, [s for s, _, _, _ in qualifying],
                 )
                 continue
 
-        min_edge = min(e for _, _v, e in qualifying)
-        source_names = [s for s, _, _e in qualifying]
+        min_edge = min(e for _, _v, e, _ in qualifying)
+        source_names = [s for s, _, _, _ in qualifying]
 
-        # Score: blend of source count and edge magnitude, capped at 0.95
-        # More sources + larger edge = higher confidence
+        # Score: blend of source count and edge magnitude, capped at 0.95.
         raw_score = min(0.95, 0.60 + 0.05 * source_score + 0.01 * min_edge)
 
-        # p_estimate: starts at FORECAST_NO_MIN_EDGE_F-derived base
-        # 5°F edge with NOAA day-1 MAE ~3.5°F → ~92% P(correct direction)
-        p_estimate = min(0.95, 0.75 + 0.02 * min_edge)
+        # p_estimate: direction-aware base calibrated to live day-ahead MAE (~3-4°F).
+        # NO_HIGH is more reliable than NO_LOW per backtest (95%+ vs 80%+ at 2°F edge).
+        # Source count bonus: each additional independent source raises confidence.
+        _p_base = 0.80 if _signal_no_direction == "NO_HIGH" else 0.72
+        p_estimate = min(0.95, _p_base + 0.015 * min_edge + 0.02 * source_score)
 
         # Compute actual model spread across all forecast sources for logging.
-        # (The gate above may have already blocked high-spread signals, but we
-        # still want to record the spread on signals that pass for analysis.)
-        _spread_sources_fno = {"hrrr", "nws_hourly", "open_meteo", "noaa"}
+        _spread_sources_fno = _FORECAST_NO_SOURCES
         _spread_vals_fno = [v for s, v in sources_map if s in _spread_sources_fno]
         _model_spread_fno: float | None = (
             round(max(_spread_vals_fno) - min(_spread_vals_fno), 1)
@@ -1613,10 +1630,13 @@ def find_forecast_nos(
         _htc_fno = _hours_to_close(_close_time_str_fno)
 
         logging.info(
-            "ForecastNO signal: %s  no_ask=%d¢  edge=%.1f°F  sources=%s  score=%.2f",
-            ticker, no_ask, min_edge, source_names, raw_score,
+            "ForecastNO signal: %s  no_ask=%d¢  edge=%.1f°F  dir=%s  sources=%s  score=%.2f",
+            ticker, no_ask, min_edge,
+            _signal_no_direction or parsed.direction,
+            source_names, raw_score,
         )
 
+        # source_details stores (source, value, edge) for backward compat with executor
         signals.append(ForecastNoSignal(
             ticker=ticker,
             metric=parsed.metric,
@@ -1629,10 +1649,11 @@ def find_forecast_nos(
             sources=source_names,
             score=raw_score,
             p_estimate=p_estimate,
-            source_details=qualifying,
+            source_details=[(s, v, e) for s, v, e, _ in qualifying],
             yes_ask=yes_ask_fno,
             hours_to_close=_htc_fno,
             model_spread_f=_model_spread_fno,
+            no_direction=_signal_no_direction,
         ))
 
     return signals

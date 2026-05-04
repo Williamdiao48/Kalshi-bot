@@ -2325,7 +2325,8 @@ async def _poll(
         ("metar",        metar.fetch_city_forecasts(session)),
         ("nws_hourly",   nws_hourly.fetch_city_forecasts(session)),
         ("weatherapi",   weatherapi.fetch_city_forecasts(session)),
-        ("open_meteo",    open_meteo.fetch_city_forecasts(session)),
+        ("open_meteo",        open_meteo.fetch_city_forecasts(session)),
+        ("open_meteo_models", open_meteo.fetch_model_forecasts(session)),
         ("equity_index",  equity_index.fetch_prices(session)),
         ("binance",      binance.fetch_prices(session)),
         ("coinbase",     coinbase.fetch_prices(session)),
@@ -2362,7 +2363,8 @@ async def _poll(
     metar_result       = R["metar"]
     nws_hourly_result  = R["nws_hourly"]
     weatherapi_result  = R["weatherapi"]
-    open_meteo_result    = R["open_meteo"]
+    open_meteo_result        = R["open_meteo"]
+    open_meteo_models_result = R["open_meteo_models"]
     equity_index_result  = R["equity_index"]
     binance_result     = R["binance"]
     coinbase_result    = R["coinbase"]
@@ -2564,7 +2566,8 @@ async def _poll(
         ("METAR",       metar_result),
         ("NWS Hourly",  nws_hourly_result),
         ("WeatherAPI",  weatherapi_result),
-        ("Open-Meteo",  open_meteo_result),
+        ("Open-Meteo",        open_meteo_result),
+        ("Open-Meteo Models", open_meteo_models_result),
         ("Equity",      equity_index_result),
         ("Binance",     binance_result),
         ("Coinbase",    coinbase_result),

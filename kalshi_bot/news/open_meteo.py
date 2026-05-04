@@ -56,12 +56,14 @@ Response (relevant part)::
 
 Environment variables
 ---------------------
-  OPEN_METEO_FORECAST_DAYS   Number of forecast days to emit (1–16).  Default: 7.
-                             Day 0 = today; days 1–6 provide corroboration for
-                             the NOAA extended-forecast pipeline.
-  OPEN_METEO_CACHE_MINUTES   How long to cache results before re-fetching.
-                             Default: 10.  Forecasts update every 1–6 hours so
-                             a 10-minute cache loses no meaningful signal.
+  OPEN_METEO_FORECAST_DAYS       Number of forecast days to emit (1–16).  Default: 7.
+                                 Day 0 = today; days 1–6 provide corroboration for
+                                 the NOAA extended-forecast pipeline.
+  OPEN_METEO_CACHE_MINUTES       How long to cache blended results.  Default: 10.
+  OPEN_METEO_MODELS_CACHE_MINUTES  How long to cache model-specific results.  Default: 30.
+                                 Model forecasts update every 1–6 hours; 30 min avoids
+                                 excessive API calls (84 requests per cycle) while still
+                                 catching meaningful intra-day model updates.
 """
 
 import asyncio
@@ -85,10 +87,29 @@ OPEN_METEO_FORECAST_DAYS: int = min(16, max(1, int(
     os.environ.get("OPEN_METEO_FORECAST_DAYS", "7")
 )))
 
-# How long to cache results before re-fetching (default: 10 minutes).
+# How long to cache blended results before re-fetching (default: 10 minutes).
 OPEN_METEO_CACHE_MINUTES: int = int(os.environ.get("OPEN_METEO_CACHE_MINUTES", "10"))
 
+# How long to cache model-specific results (default: 30 minutes).
+# Model-specific fetches make 4 × N_cities requests so a longer TTL keeps
+# the daily request count well within the free tier (10k/day).
+OPEN_METEO_MODELS_CACHE_MINUTES: int = int(
+    os.environ.get("OPEN_METEO_MODELS_CACHE_MINUTES", "30")
+)
+
 _BASE_URL = "https://api.open-meteo.com/v1/forecast"
+
+# Model-specific sources: (Open-Meteo model name, DataPoint source name).
+# These correspond to the models validated in the backtest (scripts/backtest_forecast_accuracy.py).
+_FORECAST_MODELS: list[tuple[str, str]] = [
+    ("gfs_seamless",  "open_meteo_gfs"),
+    ("ecmwf_ifs",     "open_meteo_ecmwf"),
+    ("icon_seamless", "open_meteo_icon"),
+    ("gem_seamless",  "open_meteo_gem"),
+]
+
+# Semaphore to limit concurrent model-specific requests (shared across all cities × models).
+_model_sem = asyncio.Semaphore(4)
 
 # _CITY_TZ_STRINGS is imported from noaa (covers both temp_high_* and temp_low_*).
 
@@ -109,10 +130,13 @@ def _warn_tz_fallback(metric: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Module-level cache
+# Module-level caches
 # ---------------------------------------------------------------------------
-_cache_time: float = 0.0           # monotonic timestamp of last successful fetch
-_cache_points: list[DataPoint] = []  # last successful result set
+_cache_time: float = 0.0             # monotonic timestamp of last successful blended fetch
+_cache_points: list[DataPoint] = []  # last successful blended result set
+
+_models_cache_time: float = 0.0
+_models_cache_points: list[DataPoint] = []
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +308,161 @@ async def _fetch_city_forecast(
         logging.info("Open-Meteo [%s]: %s", city_name, "  ".join(summary_parts))
     else:
         logging.warning("Open-Meteo: no forecast data for %s", city_name)
+
+    return points
+
+
+# ---------------------------------------------------------------------------
+# Model-specific forecast fetch (GFS, ECMWF, ICON, GEM)
+# ---------------------------------------------------------------------------
+
+async def _fetch_city_model_high(
+    session:      aiohttp.ClientSession,
+    metric:       str,
+    city_name:    str,
+    lat:          float,
+    lon:          float,
+    city_tz:      ZoneInfo,
+    city_tz_str:  str,
+    om_model:     str,
+    source_name:  str,
+) -> list[DataPoint]:
+    """Fetch today's daily-max forecast for one city from one specific model.
+
+    Returns a single-element list on success, empty list on any failure.
+    Only today (forecast_offset=0) is emitted — model-specific sources are
+    used exclusively for same-day forecast_no signal generation.
+    """
+    params = {
+        "latitude":         f"{lat:.4f}",
+        "longitude":        f"{lon:.4f}",
+        "daily":            "temperature_2m_max",
+        "temperature_unit": "fahrenheit",
+        "timezone":         city_tz_str,
+        "forecast_days":    "3",   # buffer; we only use index 0 (today)
+        "models":           om_model,
+    }
+    async with _model_sem:
+        try:
+            async with session.get(
+                _BASE_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except Exception as exc:
+            logging.debug(
+                "Open-Meteo model fetch failed %s/%s: %s", city_name, om_model, exc
+            )
+            return []
+
+    daily = data.get("daily", {})
+    times: list[str] = daily.get("time", [])
+    temps: list     = daily.get("temperature_2m_max", [])
+
+    if not times or not temps:
+        return []
+
+    today_str = datetime.now(city_tz).strftime("%Y-%m-%d")
+    try:
+        today_idx = times.index(today_str)
+    except ValueError:
+        return []
+
+    temp_val = temps[today_idx] if today_idx < len(temps) else None
+    if temp_val is None:
+        return []
+
+    try:
+        forecast_noon_local = datetime.strptime(today_str, "%Y-%m-%d").replace(
+            hour=12, tzinfo=city_tz
+        )
+        as_of = forecast_noon_local.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return []
+
+    return [DataPoint(
+        source   = source_name,
+        metric   = metric,
+        value    = float(temp_val),
+        unit     = "°F",
+        as_of    = as_of,
+        metadata = {
+            "city":            city_name,
+            "forecast_date":   today_str,
+            "forecast_offset": 0,
+            "om_model":        om_model,
+        },
+    )]
+
+
+async def fetch_model_forecasts(
+    session: aiohttp.ClientSession,
+) -> list[DataPoint]:
+    """Fetch model-specific daily-high forecasts (GFS, ECMWF, ICON, GEM) for all cities.
+
+    Emits DataPoints with source names ``open_meteo_gfs``, ``open_meteo_ecmwf``,
+    ``open_meteo_icon``, ``open_meteo_gem`` — one per city per model for today
+    (forecast_offset=0 only).
+
+    These are used by ``find_forecast_nos()`` in strike_arb.py as additional
+    independent corroboration sources, validated by the backtest in
+    scripts/backtest_forecast_accuracy.py.  Only temp_high_* metrics are fetched
+    because the models provide daily-max temperature; temp_low_* signals are
+    handled by the existing noaa / nws_hourly / hrrr pipeline.
+
+    Cached for OPEN_METEO_MODELS_CACHE_MINUTES (default 30 min) to stay within
+    the free-tier request budget (10k/day).
+    """
+    global _models_cache_time, _models_cache_points
+
+    cache_ttl = OPEN_METEO_MODELS_CACHE_MINUTES * 60
+    now = time.monotonic()
+    if _models_cache_points and (now - _models_cache_time) < cache_ttl:
+        logging.debug(
+            "Open-Meteo models: serving cached results (%ds old, TTL=%ds)",
+            int(now - _models_cache_time), cache_ttl,
+        )
+        return _models_cache_points
+
+    tasks = [
+        _fetch_city_model_high(
+            session, metric, city_name, lat, lon,
+            city_tz=city_tz,
+            city_tz_str=_CITY_TZ_STRINGS.get(metric) or _warn_tz_fallback(metric),
+            om_model=om_model,
+            source_name=source_name,
+        )
+        for metric, (city_name, lat, lon, city_tz) in CITIES.items()
+        if metric.startswith("temp_high_")
+        for om_model, source_name in _FORECAST_MODELS
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    points: list[DataPoint] = []
+    for result in results:
+        if isinstance(result, Exception):
+            logging.debug("Open-Meteo model fetch exception: %s", result)
+        elif result:
+            points.extend(result)
+
+    if points:
+        _models_cache_time = now
+        _models_cache_points = points
+        logging.info(
+            "Open-Meteo model forecasts: %d DataPoints (%d city×model fetches)",
+            len(points), len(tasks),
+        )
+    elif _models_cache_points:
+        stale_age = int(now - _models_cache_time)
+        logging.warning(
+            "Open-Meteo models: all fetches failed; serving stale cache (%ds old)",
+            stale_age,
+        )
+        _models_cache_time = now - cache_ttl // 2
+        return _models_cache_points
 
     return points
 
