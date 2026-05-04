@@ -201,6 +201,15 @@ NOAA_OBSERVED_MIN_SCORE: float = float(os.environ.get("NOAA_OBSERVED_MIN_SCORE",
 # already priced in near-certainty of NO; our p_estimate=1.0 always loses.
 NOAA_OBSERVED_MIN_YES_ASK: int = int(os.environ.get("NOAA_OBSERVED_MIN_YES_ASK", "5"))
 
+# Minimum YES ask for numeric YES trades.  When the market prices YES below this
+# threshold, the crowd is near-certain YES loses — thin signal edges (e.g. 0.5°F
+# above a band boundary from a single Celsius-converted reading) are not enough
+# to overcome that level of market skepticism.  Trade #23 (KXHIGHPHIL B74.5,
+# yes_ask=10¢, edge=0.48°F, synoptic source) illustrates the failure mode: market
+# was right, we lost.  Exempt locked observed YES (noaa_observed/nws_climo/
+# nws_alert) since those have ground-truth confirmation, not forecasts.
+NUMERIC_YES_MIN_ASK: int = int(os.environ.get("NUMERIC_YES_MIN_ASK", "20"))
+
 # POLY_MAX_OPEN_PER_UNDERLYING — Maximum number of concurrent open positions
 # allowed on the same underlying prefix (e.g. KXUSDJPY, KXBTCD).  Prevents
 # the USD/JPY problem: 5 adjacent strikes all fire in one cycle and one bad
@@ -1304,6 +1313,25 @@ class TradeExecutor:
                 logging.debug(
                     "Trade skip (noaa_observed YES ask %d¢ < min %d¢): %s",
                     _yes_ask, NOAA_OBSERVED_MIN_YES_ASK, opp.market_ticker,
+                )
+                self.stats.filtered_score += 1
+                return
+
+        # --- Numeric YES minimum market price gate ---
+        # If the market prices YES below NUMERIC_YES_MIN_ASK, the crowd is near-certain
+        # YES loses.  Thin signal edges from noisy or single-source data are not enough
+        # to overcome that level of market skepticism.  Locked observed YES sources are
+        # exempt (ground-truth confirmation, not forecasts).
+        if (
+            NUMERIC_YES_MIN_ASK > 0
+            and opp.implied_outcome == "YES"
+            and opp.source not in _LOCKED_OBS_SOURCES
+        ):
+            _yes_ask = detail.get("yes_ask", 0) or 0
+            if _yes_ask < NUMERIC_YES_MIN_ASK:
+                logging.info(
+                    "Trade skip (numeric YES ask %d¢ < min %d¢ — market disagrees): %s",
+                    _yes_ask, NUMERIC_YES_MIN_ASK, opp.market_ticker,
                 )
                 self.stats.filtered_score += 1
                 return
