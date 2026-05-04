@@ -355,6 +355,7 @@ class DryRunLedger:
         *,
         numeric_opps: list | None = None,
         poly_opps: list | None = None,
+        data_points: list | None = None,
     ) -> None:
         """Load all trades, enrich with market data, check exits, write overview.
 
@@ -365,6 +366,8 @@ class DryRunLedger:
                           None means counter-signal check is skipped this call.
             poly_opps:    Current cycle's external-forecast opportunities,
                           also used for counter-signal exits.
+            data_points:  Current cycle's DataPoints, passed to ExitManager for
+                          forecast_no signal invalidation checks.  None skips it.
         """
         trades = self._load_trades()
         if not trades:
@@ -393,6 +396,11 @@ class DryRunLedger:
                     trades,
                     numeric_opps=numeric_opps or [],
                     poly_opps=poly_opps or [],
+                )
+
+            if data_points is not None:
+                await self._exit_manager.check_forecast_no_invalidation(
+                    session, trades, data_points,
                 )
 
             self._reload_exit_state(trades)

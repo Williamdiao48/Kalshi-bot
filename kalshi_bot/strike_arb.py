@@ -204,9 +204,9 @@ FORECAST_NO_LOWT_MAX_SPREAD_CENTS: int = int(
     os.environ.get("FORECAST_NO_LOWT_MAX_SPREAD_CENTS", "15")
 )
 # Maximum NO ask to enter — market hasn't yet priced in the outcome.
-# Backtest: NO-settling bands open ~55-65¢ avg on the trading day; 70¢ cap
-# captures most early-entry opportunities while leaving meaningful upside.
-FORECAST_NO_MAX_ASK: int = int(os.environ.get("FORECAST_NO_MAX_ASK", "70"))
+# Raised from 70 to 80: at 75-80¢ NO ask, Kelly still recommends 1-2 contracts
+# for high-confidence signals (p≥0.90) and the market hasn't fully repriced.
+FORECAST_NO_MAX_ASK: int = int(os.environ.get("FORECAST_NO_MAX_ASK", "80"))
 # Minimum NO ask — skip markets where YES is near-certain (market priced it in).
 # A 2¢ NO ask means the market is 98% confident YES wins; the forecast edge
 # would need to be enormous to justify buying NO.  15¢ floor (85¢ YES bid cap)
@@ -496,6 +496,11 @@ class ForecastNoSignal:
     # "NO_HIGH" = forecast above strike_hi (too hot); "NO_LOW" = below strike_lo (too cold).
     # None for "under"/"over" markets where direction is already unambiguous.
     no_direction: str | None = None
+    # Strike values from ParsedMarket — stored here so trade_executor can persist
+    # them in the note for later use by exit_manager signal invalidation checks.
+    strike:    float | None = None    # "under" / "over" markets
+    strike_lo: float | None = None    # "between" lower bound
+    strike_hi: float | None = None    # "between" upper bound
 
 
 def _hours_to_close(close_time_str: str) -> float | None:
@@ -1493,7 +1498,7 @@ def find_forecast_nos(
         # This catches band/"between" markets that the HRRR-specific spread veto
         # (which only runs for direction=="under") would otherwise miss.
         if FORECAST_NO_MODEL_SPREAD_F > 0:
-            _spread_sources = {"hrrr", "nws_hourly", "open_meteo", "noaa"}
+            _spread_sources = _FORECAST_NO_SOURCES
             _spread_vals = [v for s, v in sources_map if s in _spread_sources]
             if len(_spread_vals) >= 2:
                 _model_spread = max(_spread_vals) - min(_spread_vals)
@@ -1594,13 +1599,15 @@ def find_forecast_nos(
             )
             continue
 
-        # Near-term model anchor: require at least one hrrr or nws_hourly source.
+        # Anchor model gate: require at least one high-confidence source.
+        # open_meteo_gfs is included because backtest shows 95.6% NO_HIGH win rate —
+        # comparable to HRRR and sufficient to anchor a global-model consensus signal.
         if FORECAST_NO_REQUIRE_NEAR_TERM:
-            _near_term = {"hrrr", "nws_hourly"}
-            if not any(s in _near_term for s, _, _, _ in qualifying):
+            _anchor_sources = {"hrrr", "nws_hourly", "open_meteo_gfs"}
+            if not any(s in _anchor_sources for s, _, _, _ in qualifying):
                 logging.debug(
-                    "ForecastNO skip: %s — no near-term model in qualifying sources %s"
-                    " (day-ahead models only, insufficient confidence)",
+                    "ForecastNO skip: %s — no anchor model in qualifying sources %s"
+                    " (need hrrr, nws_hourly, or open_meteo_gfs)",
                     ticker, [s for s, _, _, _ in qualifying],
                 )
                 continue
@@ -1654,6 +1661,9 @@ def find_forecast_nos(
             hours_to_close=_htc_fno,
             model_spread_f=_model_spread_fno,
             no_direction=_signal_no_direction,
+            strike=parsed.strike,
+            strike_lo=parsed.strike_lo,
+            strike_hi=parsed.strike_hi,
         ))
 
     return signals

@@ -3189,6 +3189,7 @@ async def _poll(
                 session,
                 numeric_opps=_exit_numeric_opps,
                 poly_opps=_exit_poly_opps,
+                data_points=data_points,
             )
         return
 
@@ -3814,6 +3815,7 @@ async def _poll(
                 session,
                 numeric_opps=_exit_numeric_opps,
                 poly_opps=_exit_poly_opps,
+                data_points=data_points,
             )
             logging.info("DryRunLedger: overview write complete.")
         return

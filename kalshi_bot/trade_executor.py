@@ -2855,12 +2855,20 @@ class TradeExecutor:
                     self.stats.filtered_exposure += 1
                     return
 
-        # Build note JSON for future analysis
+        # Build note JSON for future analysis and signal invalidation checks
         _fno_note: dict = {
             "min_edge_f":    round(signal.min_edge_f, 1),
             "max_edge_f":    round(max(e for _, _v, e in signal.source_details), 1) if signal.source_details else None,
             "source_count":  signal.source_count,
             "sources_detail": [[s, round(v, 1), round(e, 1)] for s, v, e in signal.source_details],
+            # Direction/strike fields used by exit_manager.check_forecast_no_invalidation()
+            # to re-evaluate signal validity each poll cycle without re-parsing the ticker.
+            "direction":    signal.direction,
+            "no_direction": signal.no_direction,
+            "metric":       signal.metric,
+            "strike":       signal.strike,
+            "strike_lo":    signal.strike_lo,
+            "strike_hi":    signal.strike_hi,
         }
         if signal.model_spread_f is not None:
             _fno_note["model_spread_f"] = signal.model_spread_f

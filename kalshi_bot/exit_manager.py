@@ -173,6 +173,19 @@ CAPITAL_RECYCLE_MIN_NO_VALUE: int = int(os.environ.get("CAPITAL_RECYCLE_MIN_NO_V
 CONTRA_SIGNAL_MIN_SOURCES: int   = int(os.environ.get("CONTRA_SIGNAL_MIN_SOURCES", "2"))
 CONTRA_SIGNAL_MIN_EDGE_F:  float = float(os.environ.get("CONTRA_SIGNAL_MIN_EDGE_F",  "3.0"))
 
+# Forecast NO signal invalidation: exit open forecast_no positions when the
+# anchor models that originally qualified the signal now predict the wrong outcome.
+# Anchor sources mirror FORECAST_NO_REQUIRE_NEAR_TERM — the high-reliability models.
+FORECAST_NO_INVALIDATION_ENABLED: bool = (
+    os.environ.get("FORECAST_NO_INVALIDATION_ENABLED", "true").lower() != "false"
+)
+FORECAST_NO_INVALIDATION_MIN_ANCHORS: int = int(
+    os.environ.get("FORECAST_NO_INVALIDATION_MIN_ANCHORS", "1")
+)
+_FNO_INVALIDATION_ANCHORS: frozenset[str] = frozenset(
+    {"hrrr", "nws_hourly", "open_meteo_gfs"}
+)
+
 # KXLOWT between YES contra-signal exit.
 # While holding a KXLOWT between YES position, if KXLOWT_CONTRA_MIN_SOURCES
 # independent forecast models update to predict fc_low < strike_lo (the daily
@@ -1324,6 +1337,130 @@ class ExitManager:
                 ev = await self.force_exit(session, trade, reason="data_contra", detail="data_contra")
                 if ev is not None:
                     events.append(ev)
+        return events
+
+    async def check_forecast_no_invalidation(
+        self,
+        session:     aiohttp.ClientSession,
+        trades:      "list[_Trade]",
+        data_points: list,
+    ) -> "list[ExitEvent]":
+        """Exit open forecast_no positions when anchor models flip to the YES side.
+
+        Each poll cycle, re-evaluates whether the anchor forecast sources (hrrr,
+        nws_hourly, open_meteo_gfs) that were in the original qualifying set still
+        predict the NO outcome.  If any anchor now computes a negative edge — meaning
+        it predicts the temperature is on the YES side of the band threshold — the
+        original signal is invalidated and the position is exited immediately.
+
+        Edge formula (mirrors find_forecast_nos in strike_arb.py):
+          HIGH "between": edge = max(value − strike_hi, strike_lo − value)  >0 outside band
+          HIGH "under":   edge = value − strike
+          HIGH "over":    edge = strike − value
+          LOW  "between": edge = value − strike_hi
+          LOW  "under":   edge = value − strike
+          LOW  "over":    edge = strike − value
+        edge < 0 means the anchor now predicts the YES outcome — signal is stale.
+        """
+        if not FORECAST_NO_INVALIDATION_ENABLED:
+            return []
+
+        # Build current (source, metric) → value lookup from this poll cycle's data.
+        # Keep only the first value per key (most recent DataPoint wins).
+        dp_lookup: dict[tuple[str, str], float] = {}
+        for dp in data_points:
+            key = (getattr(dp, "source", None), getattr(dp, "metric", None))
+            if key[0] and key[1] and key not in dp_lookup:
+                dp_lookup[key] = float(dp.value)
+
+        exited_ids: set[int] = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT id FROM trades WHERE exited_at IS NOT NULL"
+            ).fetchall()
+        }
+
+        events: list[ExitEvent] = []
+        for trade in trades:
+            if trade.settled or trade.current_mid is None:
+                continue
+            if trade.trade_id in exited_ids:
+                continue
+            if getattr(trade, "opportunity_kind", "") != "forecast_no":
+                continue
+            if getattr(trade, "side", "") != "no":
+                continue
+
+            try:
+                note = json.loads(trade.note) if trade.note else {}
+            except (ValueError, TypeError):
+                note = {}
+
+            sources_detail = note.get("sources_detail") or []
+            direction      = note.get("direction")
+            metric         = note.get("metric")
+            strike         = note.get("strike")
+            strike_lo      = note.get("strike_lo")
+            strike_hi      = note.get("strike_hi")
+
+            # Older trades won't have direction/metric/strike in note — skip them.
+            if not direction or not metric:
+                continue
+
+            is_low = metric.startswith("temp_low_")
+
+            orig_anchors = [
+                s for s, _, _ in sources_detail
+                if s in _FNO_INVALIDATION_ANCHORS
+            ]
+            if not orig_anchors:
+                continue
+
+            invalidating: list[str] = []
+            for anchor in orig_anchors:
+                curr_val = dp_lookup.get((anchor, metric))
+                if curr_val is None:
+                    continue  # anchor missing this cycle — don't invalidate on missing data
+
+                # Compute directional edge (positive = NO side, negative = YES side).
+                if not is_low:
+                    if direction == "between":
+                        e_warm = (curr_val - strike_hi) if strike_hi is not None else float("-inf")
+                        e_cold = (strike_lo - curr_val) if strike_lo is not None else float("-inf")
+                        edge = max(e_warm, e_cold)
+                    elif direction == "under" and strike is not None:
+                        edge = curr_val - strike
+                    elif direction == "over" and strike is not None:
+                        edge = strike - curr_val
+                    else:
+                        continue
+                else:
+                    if direction == "between" and strike_hi is not None:
+                        edge = curr_val - strike_hi
+                    elif direction == "under" and strike is not None:
+                        edge = curr_val - strike
+                    elif direction == "over" and strike is not None:
+                        edge = strike - curr_val
+                    else:
+                        continue
+
+                if edge < 0:
+                    invalidating.append(anchor)
+
+            if len(invalidating) >= FORECAST_NO_INVALIDATION_MIN_ANCHORS:
+                logging.info(
+                    "ForecastNO invalidated: %s — anchor(s) now predict YES: %s",
+                    trade.ticker, ", ".join(sorted(invalidating)),
+                )
+                ev = await self.force_exit(
+                    session, trade,
+                    reason="signal_invalidated",
+                    detail=f"anchors_flipped:{','.join(sorted(invalidating))}",
+                )
+                if ev is not None:
+                    events.append(ev)
+                    exited_ids.add(trade.trade_id)
+
         return events
 
     async def force_exit(
