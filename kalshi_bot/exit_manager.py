@@ -419,6 +419,19 @@ EXIT_STOP_LOSS_FLOOR_PRICE: int = int(
     os.environ.get("EXIT_STOP_LOSS_FLOOR_PRICE", "2")
 )
 
+# Spread gate: when yes_ask − yes_bid exceeds this threshold, the book is
+# too illiquid to trust stop-loss evaluation.  For NO positions,
+# current_mid = 100 − yes_ask, so an overnight ask spike (e.g. 46→62¢)
+# drops current_mid even when yes_bid (fair probability) is unchanged —
+# producing false stop triggers.  Suppressing the stop when spread > this
+# limit prevents thin-book noise from stopping winning positions.
+# Confirmed on trades #10 (KXLOWTMIN) and #18 (KXLOWTDEN): yes_bid held
+# at 44¢ all night, yes_ask jumped to 62¢ → spread 18¢ → false stop.
+# Set to 0 to disable.
+EXIT_STOP_LOSS_MAX_SPREAD: int = int(
+    os.environ.get("EXIT_STOP_LOSS_MAX_SPREAD", "15")
+)
+
 # Absolute NO-price profit-take for band_arb:no positions.
 # band_arb:no trades buy NO when YES is priced above a physical ceiling (e.g. the
 # temperature strip can never reach the strike).  The ideal exit is when the market
@@ -631,6 +644,8 @@ class ExitManager:
              (near-zero, allowing the position to ride to settlement).
           4. Floor-price suppression — if current exit price ≤ ``EXIT_STOP_LOSS_FLOOR_PRICE``¢,
              stop-loss is disabled (position is at rock bottom; only upside remains).
+          4b. Spread gate — if yes_ask − yes_bid > ``EXIT_STOP_LOSS_MAX_SPREAD``¢,
+              stop-loss is suppressed (thin book; ask spike is not a genuine price move).
           5. Locked-signal suppression — if ``_is_locked_signal()`` returns True
              (daily temperature peak confirmed past), stop-loss is suppressed.
           6. Source-specific profit-take — ``EXIT_SOURCE_PROFIT_TAKE`` per-source overrides.
@@ -878,6 +893,29 @@ class ExitManager:
                     trade.trade_id, side.upper(),
                     getattr(trade, "ticker", "?"),
                     _current_exit_price, EXIT_STOP_LOSS_FLOOR_PRICE,
+                )
+                stop_loss_thresh = 0.0
+
+            # Spread gate: wide bid-ask spread signals thin book — suppress stop.
+            # For NO positions current_mid = 100 - yes_ask, so an overnight ask
+            # spike drops current_mid even when yes_bid (fair value) is flat,
+            # triggering spurious stops on correctly-called trades.
+            _yes_bid_now = getattr(trade, "yes_bid", None)
+            _yes_ask_now = getattr(trade, "yes_ask", None)
+            if (
+                EXIT_STOP_LOSS_MAX_SPREAD > 0
+                and _yes_bid_now is not None
+                and _yes_ask_now is not None
+                and _yes_ask_now - _yes_bid_now > EXIT_STOP_LOSS_MAX_SPREAD
+                and stop_loss_thresh > 0
+            ):
+                logging.debug(
+                    "[spread-SL] trade #%d %s %s: spread=%d¢ (bid=%d ask=%d) > max=%d¢"
+                    " — suppressing stop-loss (thin book)",
+                    trade.trade_id, side.upper(),
+                    getattr(trade, "ticker", "?"),
+                    _yes_ask_now - _yes_bid_now, _yes_bid_now, _yes_ask_now,
+                    EXIT_STOP_LOSS_MAX_SPREAD,
                 )
                 stop_loss_thresh = 0.0
 
