@@ -442,6 +442,14 @@ BAND_ARB_YES_EXIT_PRICE_CENTS: int = int(
     os.environ.get("BAND_ARB_YES_EXIT_PRICE_CENTS", "95")
 )
 
+# Hours past market close_time before a still-pending trade is treated as stale.
+# Post-close markets show bid=0/ask=100 (pre-settlement), so normal exits can't
+# fire.  If the bot was shut down before settlement was detected, this sweep uses
+# the last known price snapshot to infer and record the outcome.
+STALE_TRADE_HOURS: float = float(os.environ.get("STALE_TRADE_HOURS", "2.0"))
+_STALE_NO_WIN_BID:  int = 5   # last yes_bid ≤ this → infer NO win
+_STALE_YES_WIN_BID: int = 95  # last yes_bid ≥ this → infer YES win
+
 # Sources where intraday price moves are noise — hold to settlement, skip all exits.
 # EIA/BLS/Fed/crypto: single data-release resolution; thin books before release
 # don't reflect new information.
@@ -1492,6 +1500,89 @@ class ExitManager:
                 if ev is not None:
                     events.append(ev)
                     exited_ids.add(trade.trade_id)
+
+        return events
+
+    async def check_stale_trades(
+        self,
+        session: aiohttp.ClientSession,
+        trades:  "list[_Trade]",
+    ) -> "list[ExitEvent]":
+        """Close trades that are past their market close_time but have no recorded exit.
+
+        Fires when the bot was shut down between market close and settlement.  The
+        post-close market state (bid=0, ask=100) prevents normal exit checks from
+        firing, so these positions accumulate as permanent 'pending' in the ledger.
+
+        Uses the last price_snapshots row to infer the settlement outcome:
+          - yes_bid ≤ _STALE_NO_WIN_BID  → NO win
+          - yes_bid ≥ _STALE_YES_WIN_BID → YES win
+          - otherwise                    → ambiguous, log warning and skip
+        """
+        if STALE_TRADE_HOURS <= 0:
+            return []
+
+        events: list[ExitEvent] = []
+        now_utc = datetime.now(timezone.utc)
+
+        for trade in trades:
+            if getattr(trade, "exited_at", None) is not None:
+                continue
+            if getattr(trade, "settled", False):
+                continue
+            if getattr(trade, "current_mid", None) is not None:
+                continue  # market still live — normal exits handle it
+
+            ct_str = getattr(trade, "close_time", None)
+            if not ct_str:
+                continue
+            try:
+                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                hours_past = (now_utc - ct).total_seconds() / 3600
+            except (ValueError, TypeError):
+                continue
+            if hours_past < STALE_TRADE_HOURS:
+                continue
+
+            row = self._conn.execute(
+                "SELECT yes_bid, yes_ask FROM price_snapshots"
+                " WHERE trade_id=? ORDER BY snapshot_at DESC LIMIT 1",
+                (trade.trade_id,),
+            ).fetchone()
+            if not row:
+                logging.warning(
+                    "[stale] trade #%d %s: %.1fh past close, no snapshots — skipping",
+                    trade.trade_id, trade.ticker, hours_past,
+                )
+                continue
+
+            last_bid, last_ask = row
+
+            if last_bid <= _STALE_NO_WIN_BID:
+                outcome_mid = 99 if trade.side == "no" else 1
+                detail = "settled_stale:no_win"
+            elif last_bid >= _STALE_YES_WIN_BID:
+                outcome_mid = 99 if trade.side == "yes" else 1
+                detail = "settled_stale:yes_win"
+            else:
+                logging.warning(
+                    "[stale] trade #%d %s: %.1fh past close, last yes_bid=%d — ambiguous,"
+                    " skipping (between %d and %d)",
+                    trade.trade_id, trade.ticker, hours_past,
+                    last_bid, _STALE_NO_WIN_BID, _STALE_YES_WIN_BID,
+                )
+                continue
+
+            logging.info(
+                "[stale] trade #%d %s: %.1fh past close, last yes_bid=%d → %s",
+                trade.trade_id, trade.ticker, hours_past, last_bid, detail,
+            )
+            trade.current_mid = outcome_mid
+            trade.yes_bid     = last_bid
+            trade.yes_ask     = last_ask
+            pnl = trade._unrealized_cents()
+            ev = await self._execute_exit(session, trade, pnl, "settled_stale", detail)
+            events.append(ev)
 
         return events
 

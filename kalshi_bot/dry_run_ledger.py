@@ -382,6 +382,7 @@ class DryRunLedger:
         try:
             await self._enrich(session, trades)
             await self._exit_manager.check_exits(session, trades)
+            await self._exit_manager.check_stale_trades(session, trades)
 
             # Contra-signal exit: check noaa_day2:yes between positions before
             # the general counter-signal sweep, using a targeted source filter.

@@ -1432,15 +1432,11 @@ class TradeExecutor:
                 return
 
         # --- Same-day expiry cutoff (forecast only) ---
-        # Temperature NO signals are exempt: by evening the daily high is already
-        # established, so a NO forecast at 10 PM is effectively ground truth — the
-        # observed temperature can't drop back below the strike overnight.
-        # noaa_observed is always exempt (it IS the observation).
-        _temp_no_exempt = (
-            opp.metric.startswith(("temp_high", "temp_low"))
-            and opp.implied_outcome == "NO"
-        )
-        if SAME_DAY_CUTOFF_HOURS > 0 and opp.source != "noaa_observed" and not _temp_no_exempt:
+        # Locked observational sources (noaa_observed, metar, nws_climo, nws_alert)
+        # are always exempt — the observation IS the ground truth.  Forecast/model
+        # sources (hrrr, open_meteo, nws_hourly, noaa…) are gated even for temp-NO:
+        # a model prediction within the last few hours can still be wrong.
+        if SAME_DAY_CUTOFF_HOURS > 0 and opp.source not in _LOCKED_OBS_SOURCES:
             close_time_str = detail.get("close_time") or detail.get("expiration_time")
             if close_time_str:
                 try:
