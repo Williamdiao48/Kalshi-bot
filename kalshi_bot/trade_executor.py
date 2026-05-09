@@ -111,6 +111,7 @@ import aiohttp
 from .auth import generate_headers
 from .matcher import Opportunity
 from .market_parser import TICKER_TO_METRIC as _TICKER_TO_METRIC
+from .markets import KALSHI_API_BASE
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 from .news import cme_fedwatch
@@ -3450,16 +3451,11 @@ class TradeExecutor:
         order_id: str,
     ) -> dict | None:
         """Return the Kalshi order dict for *order_id*, or None on error."""
-        base = (
-            "https://api.elections.kalshi.com"
-            if os.environ.get("KALSHI_ENVIRONMENT", "demo") == "production"
-            else "https://demo-api.kalshi.co"
-        )
         path = f"{_ORDERS_PATH}/{order_id}"
         headers = generate_headers("GET", path)
         try:
             async with session.get(
-                f"{base}{path}",
+                f"{KALSHI_API_BASE}/orders/{order_id}",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
@@ -3480,16 +3476,11 @@ class TradeExecutor:
         order_id: str,
     ) -> None:
         """Send a DELETE request to cancel a resting order on Kalshi."""
-        base = (
-            "https://api.elections.kalshi.com"
-            if os.environ.get("KALSHI_ENVIRONMENT", "demo") == "production"
-            else "https://demo-api.kalshi.co"
-        )
         path = f"{_ORDERS_PATH}/{order_id}"
         headers = generate_headers("DELETE", path)
         try:
             async with session.delete(
-                f"{base}{path}",
+                f"{KALSHI_API_BASE}/orders/{order_id}",
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
@@ -3583,11 +3574,6 @@ class TradeExecutor:
             (order_id, status, error_msg) where status is one of
             'filled', 'resting', 'rejected', or 'error'.
         """
-        base = (
-            "https://api.elections.kalshi.com"
-            if os.environ.get("KALSHI_ENVIRONMENT", "demo") == "production"
-            else "https://demo-api.kalshi.co"
-        )
         headers = generate_headers("POST", _ORDERS_PATH)
         body = {
             "ticker": ticker,
@@ -3601,7 +3587,7 @@ class TradeExecutor:
 
         try:
             async with session.post(
-                f"{base}{_ORDERS_PATH}",
+                f"{KALSHI_API_BASE}/orders",
                 json=body,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),

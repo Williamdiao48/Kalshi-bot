@@ -42,6 +42,7 @@ from typing import Any
 import aiohttp
 
 from .auth import generate_headers
+from .markets import KALSHI_API_BASE
 
 _POSITIONS_PATH = "/trade-api/v2/portfolio/positions"
 
@@ -73,9 +74,7 @@ async def fetch_positions(
 
         try:
             async with session.get(
-                f"https://api.elections.kalshi.com{_POSITIONS_PATH}"
-                if _is_production()
-                else f"https://demo-api.kalshi.co{_POSITIONS_PATH}",
+                f"{KALSHI_API_BASE}/portfolio/positions",
                 params=params,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
@@ -151,7 +150,3 @@ def summarise_portfolio(positions: list[dict[str, Any]]) -> str:
 # Internal helper
 # ---------------------------------------------------------------------------
 
-def _is_production() -> bool:
-    """Return True if KALSHI_ENVIRONMENT is set to 'production'."""
-    import os
-    return os.environ.get("KALSHI_ENVIRONMENT", "demo") == "production"
