@@ -106,14 +106,6 @@ CROSS_EXCHANGE_EDGE_PENALTY: float = float(
 # Sources that participate in cross-exchange confirmation.
 _CROSS_EXCHANGE_SOURCES: frozenset[str] = frozenset({"binance", "coinbase"})
 
-# Edge multiplier applied to CoinGecko DataPoints when neither Binance nor
-# Coinbase has data for that metric (i.e. CoinGecko is the sole crypto source).
-# CoinGecko is a single-source, third-party aggregator with no cross-exchange
-# validation — apply a conservative penalty to discount unconfirmed signals.
-# Set to 1.0 to disable.  Default: 0.70 (30% discount on unvalidated edges).
-COINGECKO_FALLBACK_PENALTY: float = float(
-    os.environ.get("COINGECKO_FALLBACK_PENALTY", "0.70")
-)
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +192,6 @@ def _divergence_penalty(
                              one exchange price is available.
     """
     if source not in _CROSS_EXCHANGE_SOURCES:
-        # CoinGecko fallback: when neither Binance nor Coinbase has data for
-        # this metric, CoinGecko is unvalidated single-source.  Apply penalty.
-        if source == "coingecko" and COINGECKO_FALLBACK_PENALTY < 1.0:
-            by_source = exchange_prices.get(metric, {})
-            if not by_source:  # no Binance or Coinbase data for this metric
-                logging.debug(
-                    "CoinGecko fallback penalty %.2f applied to %s"
-                    " (no Binance/Coinbase data available)",
-                    COINGECKO_FALLBACK_PENALTY, metric,
-                )
-                return COINGECKO_FALLBACK_PENALTY, None
         return 1.0, None
 
     by_source = exchange_prices.get(metric, {})

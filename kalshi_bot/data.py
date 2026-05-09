@@ -8,7 +8,7 @@ class DataPoint:
     """A single numeric observation from a news/data source.
 
     Attributes:
-        source:   Which module produced this (e.g. "noaa", "coingecko").
+        source:   Which module produced this (e.g. "noaa", "binance").
         metric:   Canonical key used to match against Kalshi market tickers
                   (e.g. "temp_high_lax", "price_btc_usd", "rate_eur_usd").
         value:    The numeric value of the observation.

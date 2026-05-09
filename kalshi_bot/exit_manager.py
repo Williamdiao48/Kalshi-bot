@@ -103,6 +103,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 
 from .auth import generate_headers
+from .markets import KALSHI_API_BASE
 
 if TYPE_CHECKING:
     import sqlite3
@@ -469,7 +470,7 @@ _STALE_YES_WIN_BID: int = 95  # last yes_bid ≥ this → infer YES win
 _HOLD_TO_SETTLEMENT_SOURCES: frozenset[str] = frozenset({
     "eia", "eia_inventory",
     "bls", "fred", "cme_fedwatch", "adp", "chicago_pmi",
-    "binance", "coinbase", "coingecko",
+    "binance", "coinbase",
     "frankfurter", "yahoo_forex",
     "polymarket", "metaculus", "manifold", "predictit",
 })
@@ -1749,11 +1750,6 @@ class ExitManager:
         is still the yes_price field (Kalshi always uses yes_price in the
         order body regardless of which side you're on).
         """
-        base = (
-            "https://api.elections.kalshi.com"
-            if os.environ.get("KALSHI_ENVIRONMENT", "demo") == "production"
-            else "https://demo-api.kalshi.co"
-        )
         headers = generate_headers("POST", _ORDERS_PATH)
         body = {
             "ticker":           ticker,
@@ -1767,7 +1763,7 @@ class ExitManager:
 
         try:
             async with session.post(
-                f"{base}{_ORDERS_PATH}",
+                f"{KALSHI_API_BASE}/orders",
                 json=body,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
