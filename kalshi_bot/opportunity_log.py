@@ -370,6 +370,39 @@ class OpportunityLog:
                 rows,
             )
 
+    def log_metar_6hr_obs(self, metar_points: "list") -> None:
+        """Log METAR 6-hour period max/min to raw_forecasts as source 'metar_6hr'.
+
+        Reads six_hr_max_f / six_hr_min_f from DataPoint.metadata (populated by
+        metar.fetch_city_forecasts when the ADDS API returns maxT/minT synoptic
+        fields).  These cover intra-hour temperature peaks that hourly polling
+        would otherwise miss, making them more reliable ground-truth values than
+        the running max for post-hoc forecast accuracy measurement (ROADMAP I/B).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for dp in metar_points:
+            meta = dp.metadata or {}
+            if dp.metric.startswith("temp_high"):
+                val = meta.get("six_hr_max_f")
+            elif dp.metric.startswith("temp_low"):
+                val = meta.get("six_hr_min_f")
+            else:
+                continue
+            if val is None:
+                continue
+            rows.append((now, "metar_6hr", dp.metric, dp.metric, float(val),
+                         None, None, None, None))
+        if rows:
+            self._conn.executemany(
+                """
+                INSERT INTO raw_forecasts
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge, yes_bid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
     def log_forecast_no_sources(self, signals: "list") -> None:
         """Log per-source qualifying details for forecast_no signals to raw_forecasts.
 

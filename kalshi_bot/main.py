@@ -2896,6 +2896,8 @@ async def _poll(
     # source forecasts, not just post-gate survivors.
     if numeric_opps:
         opp_log.log_raw_forecasts(numeric_opps)
+    if not isinstance(metar_result, Exception) and metar_result:
+        opp_log.log_metar_6hr_obs(metar_result)
 
     # ---- Weather-specific edge and time-to-close gates ---------------------
     # Applied after forecast consensus so all sources are already

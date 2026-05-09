@@ -215,6 +215,26 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
 
         obs_today.sort(key=lambda x: x[0])  # ascending by time
 
+        # 6-hour period max/min from ADDS API synoptic reports (maxT/minT fields).
+        # These cover temperature extremes between hourly METAR readings — more
+        # accurate than the running max for cases where a peak occurs mid-hour.
+        # Only populated on synoptic-hour observations (00, 06, 12, 18 UTC).
+        six_hr_highs_f = [
+            round(float(obs["maxT"]) * 9 / 5 + 32, 2)
+            for obs in obs_list
+            if obs.get("maxT") is not None
+            and datetime.fromtimestamp(obs["obsTime"], tz=timezone.utc).astimezone(lst).date() == local_today
+        ]
+        six_hr_max_f: float | None = max(six_hr_highs_f) if six_hr_highs_f else None
+
+        six_hr_lows_f = [
+            round(float(obs["minT"]) * 9 / 5 + 32, 2)
+            for obs in obs_list
+            if obs.get("minT") is not None
+            and datetime.fromtimestamp(obs["obsTime"], tz=timezone.utc).astimezone(lst).date() == local_today
+        ]
+        six_hr_min_f: float | None = min(six_hr_lows_f) if six_hr_lows_f else None
+
         # as_of = current UTC time (real-time observation, not a noon anchor)
         as_of = now_utc.isoformat()
         date_str = local_today.strftime("%Y-%m-%d")
@@ -233,6 +253,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
                 "observed_max":  daily_max_f,
                 "local_date":    date_str,
                 "obs_series":    obs_today,  # list of (epoch, temp_f) for trajectory
+                "six_hr_max_f":  six_hr_max_f,  # 6-hr synoptic max (None if not reported)
             },
         ))
 
@@ -253,6 +274,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
                         "current_temp_f": obs_today[-1][1],  # most recent reading
                         "local_date":     date_str,
                         "obs_series":     obs_today,
+                        "six_hr_min_f":   six_hr_min_f,  # 6-hr synoptic min (None if not reported)
                     },
                 ))
 
