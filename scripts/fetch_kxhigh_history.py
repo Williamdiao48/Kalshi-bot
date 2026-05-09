@@ -58,36 +58,48 @@ _TEMP_SERIES: tuple[str, ...] = tuple(
 async def _fetch_series_settled(
     session: aiohttp.ClientSession,
     series: str,
-    limit: int = 200,
+    max_markets: int = 2000,
 ) -> list[dict]:
-    """Fetch all settled markets for one series."""
-    params = {
-        "status": "settled",
-        "limit":  min(limit, 100),
-        "series_ticker": series,
-    }
-    headers = generate_headers("GET", _MARKETS_PATH)
-    async with _SEMAPHORE:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets",
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status == 429:
-                    log.warning("Rate-limited on %s — waiting 3s", series)
-                    await asyncio.sleep(3.0)
-                    return []
-                resp.raise_for_status()
-                data = await resp.json()
-        except Exception as exc:
-            log.warning("Fetch error for series %s: %s", series, exc)
-            return []
+    """Fetch all settled markets for one series, paginating via cursor."""
+    markets: list[dict] = []
+    cursor: str | None = None
 
-    markets = [_normalize_market(m) for m in data.get("markets", [])]
+    while len(markets) < max_markets:
+        params: dict = {
+            "status": "settled",
+            "limit":  100,
+            "series_ticker": series,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        headers = generate_headers("GET", _MARKETS_PATH)
+        async with _SEMAPHORE:
+            try:
+                async with session.get(
+                    f"{KALSHI_API_BASE}/markets",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status == 429:
+                        log.warning("Rate-limited on %s — waiting 5s", series)
+                        await asyncio.sleep(5.0)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except Exception as exc:
+                log.warning("Fetch error for series %s: %s", series, exc)
+                break
+            await asyncio.sleep(0.3)
+
+        page = data.get("markets", [])
+        markets.extend(_normalize_market(m) for m in page)
+        cursor = data.get("cursor") or None
+        if not cursor or not page:
+            break
+
     log.info("  %s: %d settled markets", series, len(markets))
-    await asyncio.sleep(0.25)
     return markets
 
 

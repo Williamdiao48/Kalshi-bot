@@ -49,7 +49,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 _MESONET_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-_SEMAPHORE = asyncio.Semaphore(5)
+_SEMAPHORE = asyncio.Semaphore(1)
+_FETCH_DELAY = 1.5  # seconds between requests — Iowa State Mesonet rate limit
 
 # Only emit hourly snapshots for hours that are useful for the band-arb signal.
 # The bot's pre-lock window is 6 h before close (~5 PM local); earliest
@@ -109,6 +110,7 @@ async def _fetch_city_obs(
         except Exception as exc:
             log.error("Mesonet fetch failed for %s (%s): %s", metric, station, exc)
             return []
+        await asyncio.sleep(_FETCH_DELAY)
 
     # Parse CSV response.
     # Format: station,valid,tmpf
