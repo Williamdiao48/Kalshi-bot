@@ -903,6 +903,13 @@ class DryRunLedger:
             if status in ("settled", "finalized") and result_field in ("yes", "no"):
                 trade.settled = True
                 trade.result  = result_field
+                # Persist outcome to DB immediately so SQL queries and
+                # win_rate_tracker see it without waiting for the hourly pass.
+                outcome_val = "won" if trade.result == trade.side else "lost"
+                self._conn.execute(
+                    "UPDATE trades SET outcome = ? WHERE id = ? AND outcome IS NULL",
+                    (outcome_val, trade.trade_id),
+                )
             else:
                 bid = mkt.get("yes_bid")
                 ask = mkt.get("yes_ask")
