@@ -66,10 +66,11 @@ from pathlib import Path as _Path
 from .market_parser import parse_market
 from .news.noaa import CITIES  # city timezone lookup for date-alignment guard
 
-# Per-city/month p75 peak-time thresholds (minutes since local midnight).
-# Loaded from data/peak_hour_p90.py; used by _is_past_lock() to replace the
-# hardcoded 4:30 PM global gate with city- and season-aware thresholds.
+# Per-city/month p75/p90 peak-time thresholds (minutes since local midnight).
+# Loaded from data/peak_hour_p90.py; p75 is used by band_arb is_locked,
+# p90 is exposed for solo numeric YES observational lock checks.
 _BAND_ARB_P75_MINUTES: dict[str, dict[int, int]] = {}
+_BAND_ARB_P90_MINUTES: dict[str, dict[int, int]] = {}
 _p75_path = _Path(__file__).parent.parent / "data" / "peak_hour_p90.py"
 if _p75_path.exists():
     _spec = _ilu.spec_from_file_location("peak_hour_p90", _p75_path)
@@ -77,6 +78,7 @@ if _p75_path.exists():
         _p75_mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_p75_mod)  # type: ignore[union-attr]
         _BAND_ARB_P75_MINUTES = getattr(_p75_mod, "P75_MINUTES", {})
+        _BAND_ARB_P90_MINUTES = getattr(_p75_mod, "P90_MINUTES", {})
 
 BAND_ARB_EXECUTION_ENABLED: bool = (
     os.environ.get("BAND_ARB_EXECUTION_ENABLED", "true").lower() == "true"
@@ -524,6 +526,25 @@ def _is_past_lock(city_tz, metric: str | None = None) -> bool:
         p75 = _BAND_ARB_P75_MINUTES.get(metric, {}).get(local_now.month)
         if p75 is not None:
             return local_now.hour * 60 + local_now.minute >= p75
+    lock_mins = BAND_ARB_YES_LOCK_LOCAL_HOUR * 60 + BAND_ARB_YES_LOCK_LOCAL_MINUTE
+    return local_now.hour * 60 + local_now.minute >= lock_mins
+
+
+def is_past_p90(metric: str, city_tz) -> bool:
+    """Return True if local city time has passed the p90 daily-high threshold.
+
+    Used by solo numeric YES observational trades (noaa_observed/metar) to gate
+    locked sizing. Band_arb uses p75 (_is_past_lock) since it requires
+    corroboration; solo numeric only gets locked sizing after p90 because without
+    corroboration it needs a tighter time gate (90% of days have already peaked).
+    Falls back to p75 if p90 data is missing for this city/month.
+    """
+    local_now = datetime.now(city_tz)
+    lookup = _BAND_ARB_P90_MINUTES.get(metric, {}).get(local_now.month)
+    if lookup is None:
+        lookup = _BAND_ARB_P75_MINUTES.get(metric, {}).get(local_now.month)
+    if lookup is not None:
+        return local_now.hour * 60 + local_now.minute >= lookup
     lock_mins = BAND_ARB_YES_LOCK_LOCAL_HOUR * 60 + BAND_ARB_YES_LOCK_LOCAL_MINUTE
     return local_now.hour * 60 + local_now.minute >= lock_mins
 

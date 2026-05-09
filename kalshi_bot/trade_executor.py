@@ -114,7 +114,7 @@ from .market_parser import TICKER_TO_METRIC as _TICKER_TO_METRIC
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 from .news import cme_fedwatch
-from .news.noaa import get_forecast_sigma
+from .news.noaa import get_forecast_sigma, CITIES
 from .scoring import METRIC_EDGE_SCALES
 from .spread_matcher import SpreadOpportunity
 from .arb_detector import (
@@ -122,7 +122,7 @@ from .arb_detector import (
     CrossedBookArb, CROSSED_BOOK_ARB_ENABLED,
 )
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
-from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED
+from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
 
 
 # ---------------------------------------------------------------------------
@@ -1562,7 +1562,24 @@ class TradeExecutor:
 
         # Locked-observation YES trades override sizing: outcome is structurally
         # near-certain (observed temp already past strike / NWS alert confirmed).
-        _is_locked_obs = opp.source in _LOCKED_OBS_SOURCES and opp.implied_outcome == "YES"
+        # Between-band markets are NOT locked even with an observational source —
+        # the temperature can still exit through the top of the band.
+        # Solo numeric YES (no band_arb corroboration) also requires p90 time
+        # to have passed — if the signal were strong band_arb would have fired
+        # at p75; without that corroboration we need a tighter time gate.
+        _obs_source_yes = (
+            opp.source in _LOCKED_OBS_SOURCES
+            and opp.implied_outcome == "YES"
+            and getattr(opp, "direction", "between") != "between"
+        )
+        if _obs_source_yes and opp.metric:
+            _lookup = opp.metric.replace("temp_low_", "temp_high_")
+            _city_info = CITIES.get(_lookup)
+            _is_locked_obs = (
+                _city_info is not None and is_past_p90(opp.metric, _city_info[3])
+            ) if _city_info else False
+        else:
+            _is_locked_obs = False
         pos_max_cents  = LOCKED_OBS_MAX_POSITION_CENTS if _is_locked_obs else MAX_POSITION_CENTS
         pos_kelly      = LOCKED_OBS_KELLY_FRACTION     if _is_locked_obs else effective_kelly
         pos_hard_cap   = LOCKED_OBS_MAX_CONTRACTS      if _is_locked_obs else TRADE_MAX_CONTRACTS
