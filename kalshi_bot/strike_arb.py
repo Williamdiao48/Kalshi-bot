@@ -80,6 +80,18 @@ if _p75_path.exists():
         _BAND_ARB_P75_MINUTES = getattr(_p75_mod, "P75_MINUTES", {})
         _BAND_ARB_P90_MINUTES = getattr(_p75_mod, "P90_MINUTES", {})
 
+# Per-source/city/month forecast bias corrections from 10-year Open-Meteo backtest.
+# Key: (source, city_suffix, month)  Value: mean(forecast − actual) °F
+# Apply: corrected_value = raw_value − bias  (cold model → shift up; warm → shift down)
+_OM_BIAS: dict[tuple[str, str, int], float] = {}
+_bias_path = _Path(__file__).parent / "openmeteo_bias_table.py"
+if _bias_path.exists():
+    _bias_spec = _ilu.spec_from_file_location("openmeteo_bias_table", _bias_path)
+    if _bias_spec and _bias_spec.loader:
+        _bias_mod = _ilu.module_from_spec(_bias_spec)
+        _bias_spec.loader.exec_module(_bias_mod)  # type: ignore[union-attr]
+        _OM_BIAS = getattr(_bias_mod, "BIAS_F", {})
+
 BAND_ARB_EXECUTION_ENABLED: bool = (
     os.environ.get("BAND_ARB_EXECUTION_ENABLED", "true").lower() == "true"
 )
@@ -227,8 +239,10 @@ FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
 _FORECAST_NO_SOURCES: frozenset[str] = frozenset({
     "hrrr", "nws_hourly", "open_meteo", "noaa",
     # Model-specific Open-Meteo sources (fetched by open_meteo.fetch_model_forecasts).
-    # Each is an independent signal validated by backtest; GFS/HRRR are the strongest.
-    "open_meteo_gfs", "open_meteo_ecmwf", "open_meteo_icon", "open_meteo_gem",
+    # open_meteo_gfs is intentionally excluded: the blended "open_meteo" source IS the
+    # GFS model — 10-year backtest confirmed identical values to 0.1°F.  Counting both
+    # would double-count the same signal and inflate corroboration scores.
+    "open_meteo_ecmwf", "open_meteo_icon", "open_meteo_gem",
 })
 # Local hour (city-local) at or after which the overnight low window is considered
 # closed and the observed running minimum is treated as the definitive daily low.
@@ -1246,7 +1260,9 @@ def find_forecast_nos(
         # LOW markets use temp_low_* metrics; CITIES keys use temp_high_*, so translate.
         _lh_metric = parsed.metric.replace("temp_low_", "temp_high_")
         _lh_tz_info = CITIES.get(_lh_metric)
-        _local_hour = datetime.now(_lh_tz_info[3]).hour if _lh_tz_info is not None else 12
+        _local_now = datetime.now(_lh_tz_info[3]) if _lh_tz_info is not None else datetime.now()
+        _local_hour = _local_now.hour
+        _local_month = _local_now.month
 
         # LOW "under" afternoon gate: NO wins if overnight low stays above strike.
         # After FORECAST_NO_LOW_UNDER_MAX_HOUR local time, overnight cooling has
@@ -1437,8 +1453,16 @@ def find_forecast_nos(
         if not sources_map:
             continue
 
+        # Apply per-source/city/month bias correction (10-year Open-Meteo backtest).
+        # Sources not in _OM_BIAS (hrrr, nws_hourly, noaa) pass through unchanged.
+        _city_key = parsed.metric.replace("temp_high_", "").replace("temp_low_", "")
+        corr_sources_map = [
+            (s, v - _OM_BIAS.get((s, _city_key, _local_month), 0.0))
+            for s, v in sources_map
+        ]
+
         # Hoist HRRR values so both veto blocks below can share them.
-        hrrr_vals = [v for s, v in sources_map if s == "hrrr"]
+        hrrr_vals = [v for s, v in corr_sources_map if s == "hrrr"]
         hrrr_val: float | None = max(hrrr_vals) if hrrr_vals else None
 
         # --- HRRR dissent veto --------------------------------------------------
@@ -1495,7 +1519,7 @@ def find_forecast_nos(
                 continue
 
             # Condition 2 — global model-spread gate
-            other_vals = [v for s, v in sources_map if s in ("nws_hourly", "open_meteo")]
+            other_vals = [v for s, v in corr_sources_map if s in ("nws_hourly", "open_meteo")]
             if other_vals:
                 spread = max(other_vals) - hrrr_val
                 if (
@@ -1518,7 +1542,7 @@ def find_forecast_nos(
         # (which only runs for direction=="under") would otherwise miss.
         if FORECAST_NO_MODEL_SPREAD_F > 0:
             _spread_sources = _FORECAST_NO_SOURCES
-            _spread_vals = [v for s, v in sources_map if s in _spread_sources]
+            _spread_vals = [v for s, v in corr_sources_map if s in _spread_sources]
             if len(_spread_vals) >= 2:
                 _model_spread = max(_spread_vals) - min(_spread_vals)
                 if _model_spread > FORECAST_NO_MODEL_SPREAD_F:
@@ -1534,7 +1558,7 @@ def find_forecast_nos(
         # qualifying: (source, value, edge_F, no_dir)
         # no_dir is "NO_HIGH" / "NO_LOW" for "between" bands; None for under/over.
         qualifying: list[tuple[str, float, float, str | None]] = []
-        for source, value in sources_map:
+        for source, value in corr_sources_map:
             no_dir: str | None = None
             if not is_low_market:
                 # HIGH market: NO settles when forecast misses the strike.
@@ -1645,7 +1669,7 @@ def find_forecast_nos(
 
         # Compute actual model spread across all forecast sources for logging.
         _spread_sources_fno = _FORECAST_NO_SOURCES
-        _spread_vals_fno = [v for s, v in sources_map if s in _spread_sources_fno]
+        _spread_vals_fno = [v for s, v in corr_sources_map if s in _spread_sources_fno]
         _model_spread_fno: float | None = (
             round(max(_spread_vals_fno) - min(_spread_vals_fno), 1)
             if len(_spread_vals_fno) >= 2 else None
