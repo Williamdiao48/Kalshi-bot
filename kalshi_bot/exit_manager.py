@@ -622,6 +622,24 @@ class ExitManager:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS forecast_accuracy (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                settled_at     TEXT    NOT NULL,
+                trade_id       INTEGER NOT NULL,
+                source         TEXT    NOT NULL,
+                metric         TEXT    NOT NULL,
+                city           TEXT,
+                forecast_f     REAL,
+                actual_f       REAL,
+                actual_src     TEXT,
+                bias_f         REAL,
+                hours_to_close REAL,
+                outcome        TEXT,
+                FOREIGN KEY (trade_id) REFERENCES trades(id)
+            )
+        """)
+
     # -----------------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------------

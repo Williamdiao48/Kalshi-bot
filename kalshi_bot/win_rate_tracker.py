@@ -37,13 +37,16 @@ How many poll cycles between settlement+summary passes.  Default 60
 Set to 1 to report every cycle (useful during initial tuning).
 """
 
+import json
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 
+from .market_parser import TICKER_TO_METRIC
 from .markets import fetch_market_detail
 
 WIN_RATE_REPORT_INTERVAL: int = int(os.environ.get("WIN_RATE_REPORT_INTERVAL", "60"))
@@ -127,11 +130,11 @@ class WinRateTracker:
 
             # Update all unresolved trades for this ticker
             rows_for_ticker = self._conn.execute(
-                "SELECT id, side FROM trades WHERE ticker = ? AND outcome IS NULL",
+                "SELECT id, side, source, logged_at, note FROM trades WHERE ticker = ? AND outcome IS NULL",
                 (ticker,),
             ).fetchall()
 
-            for trade_id, side in rows_for_ticker:
+            for trade_id, side, trade_source, logged_at, trade_note in rows_for_ticker:
                 if result == "void":
                     outcome = "void"
                 elif side == result:
@@ -148,8 +151,95 @@ class WinRateTracker:
                     "Settled trade #%d  ticker=%s  side=%s  result=%s  outcome=%s",
                     trade_id, ticker, side, result, outcome,
                 )
+                self._record_forecast_accuracy(
+                    trade_id, ticker, trade_source, logged_at, trade_note, outcome,
+                )
 
         return settled
+
+    # -----------------------------------------------------------------------
+    # Forecast accuracy recording
+    # -----------------------------------------------------------------------
+
+    def _record_forecast_accuracy(
+        self,
+        trade_id: int,
+        ticker: str,
+        trade_source: str | None,
+        logged_at: str | None,
+        trade_note: str | None,
+        outcome: str,
+    ) -> None:
+        """Insert forecast_accuracy rows for a newly settled temperature trade.
+
+        One row per forecast source (uses sources_detail from trade note for
+        forecast_no multi-source trades, or the primary source otherwise).
+        Ground truth is the METAR 6-hour synoptic max (metar_6hr source in
+        raw_forecasts) with fallback to METAR running max.
+        """
+        prefix = ticker.split("-")[0]
+        metric = TICKER_TO_METRIC.get(prefix)
+        if metric is None or not metric.startswith(("temp_high_", "temp_low_")):
+            return
+        city = metric.split("_")[-1]
+
+        trade_date = (logged_at or "")[:10]
+        if not trade_date:
+            return
+
+        # Prefer 6-hour synoptic max; fall back to hourly running max
+        row = self._conn.execute(
+            "SELECT MAX(data_value) FROM raw_forecasts "
+            "WHERE source = 'metar_6hr' AND metric = ? AND date(logged_at) = ?",
+            (metric, trade_date),
+        ).fetchone()
+        actual_f = row[0] if row else None
+        actual_src = "metar_6hr"
+
+        if actual_f is None:
+            row = self._conn.execute(
+                "SELECT MAX(data_value) FROM raw_forecasts "
+                "WHERE source = 'metar' AND metric = ? AND date(logged_at) = ?",
+                (metric, trade_date),
+            ).fetchone()
+            actual_f = row[0] if row else None
+            actual_src = "metar_running_max"
+
+        if actual_f is None:
+            logging.debug(
+                "forecast_accuracy: no METAR ground truth for %s on %s — skipping",
+                metric, trade_date,
+            )
+            return
+
+        note = json.loads(trade_note or "{}")
+        sources_detail = note.get("sources_detail", [])
+        hours_to_close = note.get("hours_to_close")
+
+        if sources_detail:
+            rows_to_insert = [(src, float(val)) for src, val, *_ in sources_detail]
+        else:
+            forecast_f = note.get("data_value")
+            rows_to_insert = [(trade_source or "unknown", forecast_f)] if forecast_f is not None else []
+
+        if not rows_to_insert:
+            return
+
+        now_str = datetime.now(timezone.utc).isoformat()
+        for src, forecast_f in rows_to_insert:
+            bias_f = round(forecast_f - actual_f, 3) if forecast_f is not None else None
+            self._conn.execute(
+                """INSERT INTO forecast_accuracy
+                   (settled_at, trade_id, source, metric, city,
+                    forecast_f, actual_f, actual_src, bias_f, hours_to_close, outcome)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (now_str, trade_id, src, metric, city,
+                 forecast_f, actual_f, actual_src, bias_f, hours_to_close, outcome),
+            )
+            logging.debug(
+                "forecast_accuracy: trade #%d  source=%s  forecast=%.1f  actual=%.1f  bias=%.1f",
+                trade_id, src, forecast_f or 0, actual_f, bias_f or 0,
+            )
 
     # -----------------------------------------------------------------------
     # Win-rate summary
