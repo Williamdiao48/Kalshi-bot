@@ -181,8 +181,63 @@ def _aggregate(peak_by_date: dict[tuple[int, int], int]) -> dict[int, dict]:
             "p75": _percentile(s, 75),
             "p90": _percentile(s, 90),
             "p95": _percentile(s, 95),
+            "_sorted": s,   # kept for CDF output; not written to CSV
         }
     return result
+
+
+def _print_cdf(
+    all_stats: dict[str, dict[int, dict]],
+    month_filter: list[int] | None,
+    step_minutes: int,
+    out_path: Path | None,
+) -> None:
+    """Print empirical CDF tables: % of days where peak occurred by each time slot."""
+    window_start = 8 * 60   # 08:00 local
+    window_end   = 21 * 60  # 21:00 local
+    slots = list(range(window_start, window_end + 1, step_minutes))
+
+    month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    lines: list[str] = []
+    for metric in sorted(all_stats):
+        city_name = CITIES[metric][0] if metric in CITIES else metric
+        monthly = all_stats[metric]
+        months_to_show = (
+            [m for m in month_filter if m in monthly]
+            if month_filter else sorted(monthly)
+        )
+
+        lines.append("")
+        lines.append(f"{'=' * 72}")
+        lines.append(f"  {city_name}  ({metric})")
+        lines.append(f"{'=' * 72}")
+        lines.append(f"  % of days where daily high had already been observed by each time")
+        lines.append(f"  (empirical CDF; step={step_minutes} min)")
+        lines.append("")
+
+        for month in months_to_show:
+            s = monthly[month]["_sorted"]
+            n = monthly[month]["n"]
+            lines.append(f"  {month_names[month - 1]} (n={n})")
+            lines.append(f"  {'Time':>6}  {'% peaked':>9}  {'days peaked':>12}")
+            lines.append(f"  {'-'*35}")
+            for slot in slots:
+                count = sum(1 for v in s if v <= slot)
+                pct   = 100.0 * count / n if n else 0.0
+                lines.append(
+                    f"  {_minutes_to_hhmm(slot):>6}  {pct:>8.1f}%  {count:>12,d}"
+                )
+            lines.append("")
+
+    output = "\n".join(lines)
+    print(output)
+
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output)
+        log.info("CDF table written to %s", out_path)
 
 
 async def main(
@@ -190,6 +245,10 @@ async def main(
     city_filter: set[str] | None,
     out_path: Path,
     emit_dict: bool,
+    emit_cdf: bool = False,
+    cdf_step: int = 30,
+    cdf_months: list[int] | None = None,
+    cdf_out: Path | None = None,
 ) -> None:
     end_dt = date.today()
     start_dt = date(end_dt.year - years, end_dt.month, end_dt.day)
@@ -302,6 +361,9 @@ async def main(
                         row += "   --"
                 print(row)
 
+    if emit_cdf:
+        _print_cdf(all_stats, cdf_months, cdf_step, cdf_out)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -323,6 +385,22 @@ if __name__ == "__main__":
         "--dict", action="store_true",
         help="Also write data/peak_hour_p90.py and print summary table",
     )
+    parser.add_argument(
+        "--cdf", action="store_true",
+        help="Print empirical CDF table: %% of days peaked by each time slot",
+    )
+    parser.add_argument(
+        "--cdf-step", type=int, default=30, metavar="MINUTES",
+        help="Time step in minutes for CDF output (default: 30)",
+    )
+    parser.add_argument(
+        "--cdf-months", nargs="+", type=int, default=None, metavar="MONTH",
+        help="Months to include in CDF output, e.g. --cdf-months 4 5 6 (default: all)",
+    )
+    parser.add_argument(
+        "--cdf-out", default=None, metavar="PATH",
+        help="Write CDF table to this file in addition to stdout",
+    )
     args = parser.parse_args()
 
     asyncio.run(main(
@@ -330,4 +408,8 @@ if __name__ == "__main__":
         city_filter=set(args.cities) if args.cities else None,
         out_path=Path(args.out),
         emit_dict=args.dict,
+        emit_cdf=args.cdf,
+        cdf_step=args.cdf_step,
+        cdf_months=args.cdf_months,
+        cdf_out=Path(args.cdf_out) if args.cdf_out else None,
     ))
