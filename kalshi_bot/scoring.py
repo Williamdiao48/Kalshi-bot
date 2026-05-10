@@ -514,36 +514,59 @@ TEMP_DAY2_BETWEEN_YES_MIN_EDGE: float = float(
 TEMP_FORECAST_MIN_EDGE_OVER: dict[str, float] = {
     "noaa":        5.0,
     "noaa_day1":   5.0,
-    "nws_hourly":  5.0,
+    "nws_hourly":  3.0,
     "open_meteo":  5.0,
     "weatherapi":  5.0,
+    "hrrr":        2.5,
 }
 
 TEMP_FORECAST_MIN_EDGE_UNDER: dict[str, float] = {
     "noaa":        5.0,
     "noaa_day1":   5.0,
-    "nws_hourly":  5.0,
+    "nws_hourly":  3.0,
     "open_meteo":  7.0,
     "weatherapi":  float("inf"),
+    "hrrr":        2.5,
 }
 
-# Load env-var overrides: TEMP_EDGE_OVER_{SOURCE} / TEMP_EDGE_UNDER_{SOURCE}
-for _src, _over_env, _under_env in [
-    ("noaa",       "TEMP_EDGE_OVER_NOAA",       "TEMP_EDGE_UNDER_NOAA"),
-    ("open_meteo", "TEMP_EDGE_OVER_OPEN_METEO",  "TEMP_EDGE_UNDER_OPEN_METEO"),
-    ("weatherapi", "TEMP_EDGE_OVER_WEATHERAPI",  "TEMP_EDGE_UNDER_WEATHERAPI"),
-    ("noaa_day2",  "TEMP_EDGE_OVER_NOAA_DAY2",   "TEMP_EDGE_UNDER_NOAA_DAY2"),
-    ("hrrr",       "TEMP_EDGE_OVER_HRRR",        "TEMP_EDGE_UNDER_HRRR"),
-    ("nws_hourly", "TEMP_EDGE_OVER_NWS_HOURLY",  "TEMP_EDGE_UNDER_NWS_HOURLY"),
+# Source-specific edge thresholds for "between" direction (band markets).
+# hrrr/nws_hourly are set lower because their MAE is 2-3°F vs 4-5°F for others.
+TEMP_FORECAST_MIN_EDGE_BETWEEN: dict[str, float] = {
+    "hrrr":              2.5,
+    "nws_hourly":        3.0,
+    "open_meteo_ecmwf":  3.5,
+    "open_meteo":        4.0,
+    "open_meteo_icon":   4.0,
+    "open_meteo_gem":    4.0,
+    "noaa":              5.0,
+    "noaa_day1":         5.0,
+}
+
+# Load env-var overrides: TEMP_EDGE_OVER_{SOURCE} / TEMP_EDGE_UNDER_{SOURCE} / TEMP_EDGE_BETWEEN_{SOURCE}
+for _src, _over_env, _under_env, _between_env in [
+    ("noaa",             "TEMP_EDGE_OVER_NOAA",             "TEMP_EDGE_UNDER_NOAA",             "TEMP_EDGE_BETWEEN_NOAA"),
+    ("open_meteo",       "TEMP_EDGE_OVER_OPEN_METEO",       "TEMP_EDGE_UNDER_OPEN_METEO",       "TEMP_EDGE_BETWEEN_OPEN_METEO"),
+    ("weatherapi",       "TEMP_EDGE_OVER_WEATHERAPI",       "TEMP_EDGE_UNDER_WEATHERAPI",       "TEMP_EDGE_BETWEEN_WEATHERAPI"),
+    ("noaa_day2",        "TEMP_EDGE_OVER_NOAA_DAY2",        "TEMP_EDGE_UNDER_NOAA_DAY2",        "TEMP_EDGE_BETWEEN_NOAA_DAY2"),
+    ("hrrr",             "TEMP_EDGE_OVER_HRRR",             "TEMP_EDGE_UNDER_HRRR",             "TEMP_EDGE_BETWEEN_HRRR"),
+    ("nws_hourly",       "TEMP_EDGE_OVER_NWS_HOURLY",       "TEMP_EDGE_UNDER_NWS_HOURLY",       "TEMP_EDGE_BETWEEN_NWS_HOURLY"),
+    ("open_meteo_ecmwf", "TEMP_EDGE_OVER_OPEN_METEO_ECMWF", "TEMP_EDGE_UNDER_OPEN_METEO_ECMWF", "TEMP_EDGE_BETWEEN_OPEN_METEO_ECMWF"),
+    ("open_meteo_icon",  "TEMP_EDGE_OVER_OPEN_METEO_ICON",  "TEMP_EDGE_UNDER_OPEN_METEO_ICON",  "TEMP_EDGE_BETWEEN_OPEN_METEO_ICON"),
+    ("open_meteo_gem",   "TEMP_EDGE_OVER_OPEN_METEO_GEM",   "TEMP_EDGE_UNDER_OPEN_METEO_GEM",   "TEMP_EDGE_BETWEEN_OPEN_METEO_GEM"),
 ]:
-    for _d, _env in [("over", _over_env), ("under", _under_env)]:
+    for _d, _env in [("over", _over_env), ("under", _under_env), ("between", _between_env)]:
         _v = os.environ.get(_env)
         if _v is not None:
             try:
-                (_d == "over" and TEMP_FORECAST_MIN_EDGE_OVER or TEMP_FORECAST_MIN_EDGE_UNDER)[_src] = float(_v)
+                if _d == "over":
+                    TEMP_FORECAST_MIN_EDGE_OVER[_src] = float(_v)
+                elif _d == "under":
+                    TEMP_FORECAST_MIN_EDGE_UNDER[_src] = float(_v)
+                else:
+                    TEMP_FORECAST_MIN_EDGE_BETWEEN[_src] = float(_v)
             except ValueError:
                 pass
-del _src, _over_env, _under_env, _d, _env, _v  # type: ignore[name-defined]
+del _src, _over_env, _under_env, _between_env, _d, _env, _v  # type: ignore[name-defined]
 
 
 def resolve_min_edge(source: str, direction: str, metric: str = "",
@@ -564,6 +587,8 @@ def resolve_min_edge(source: str, direction: str, metric: str = "",
         return TEMP_LOW_FORECAST_MIN_EDGE
     if direction == "between" and implied_outcome == "YES" and _is_day2:
         return TEMP_DAY2_BETWEEN_YES_MIN_EDGE
+    if direction == "between" and source in TEMP_FORECAST_MIN_EDGE_BETWEEN:
+        return TEMP_FORECAST_MIN_EDGE_BETWEEN[source]
     if direction == "over" and source in TEMP_FORECAST_MIN_EDGE_OVER:
         return TEMP_FORECAST_MIN_EDGE_OVER[source]
     if direction == "under" and source in TEMP_FORECAST_MIN_EDGE_UNDER:

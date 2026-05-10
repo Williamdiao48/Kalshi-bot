@@ -231,6 +231,16 @@ FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in
     os.environ.get("FORECAST_NO_BLACKLIST_CITIES", "aus").split(",") if c.strip()
 )
+# Per-source minimum edge overrides for the inner qualifying loop.
+# hrrr/nws_hourly backtest at 84-92% win rate with 2-3°F edge; full global
+# 5°F gate was silently killing all their signals before they reached this loop.
+# Sources not listed here fall back to the direction-based threshold below.
+_FORECAST_NO_SOURCE_MIN_EDGE: dict[str, float] = {
+    "hrrr":              2.5,
+    "nws_hourly":        3.0,
+    "open_meteo_ecmwf":  3.5,
+}
+
 # Qualifying forecast sources.
 # noaa_observed is intentionally excluded: for HIGH markets the running daily
 # max above the strike triggers band_arb (duplicating the signal); for LOW
@@ -1592,7 +1602,10 @@ def find_forecast_nos(
                     continue
 
             # Direction-specific edge threshold for "between" NO signals.
-            if no_dir == "NO_HIGH":
+            # Per-source overrides apply first (hrrr/nws_hourly have lower MAE).
+            if source in _FORECAST_NO_SOURCE_MIN_EDGE:
+                _edge_required = _FORECAST_NO_SOURCE_MIN_EDGE[source]
+            elif no_dir == "NO_HIGH":
                 _edge_required = FORECAST_NO_NO_HIGH_MIN_EDGE_F
             elif no_dir == "NO_LOW":
                 _edge_required = FORECAST_NO_NO_LOW_MIN_EDGE_F
