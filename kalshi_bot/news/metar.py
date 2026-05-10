@@ -55,7 +55,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as _dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -235,8 +235,12 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         ]
         six_hr_min_f: float | None = min(six_hr_lows_f) if six_hr_lows_f else None
 
-        # as_of = current UTC time (real-time observation, not a noon anchor)
-        as_of = now_utc.isoformat()
+        # Anchor as_of to noon LST on the observation date — same convention as
+        # forecast sources — so numeric_matcher's DateGuard agrees on which market
+        # day this belongs to regardless of DST.  Using now_utc caused a 1-hour
+        # window after midnight CDT (but before midnight LST) where May N data
+        # was matched against the May N+1 market.
+        as_of = datetime.combine(local_today, _dtime(12, 0), tzinfo=lst).isoformat()
         date_str = local_today.strftime("%Y-%m-%d")
 
         summary_parts.append(f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo)")
