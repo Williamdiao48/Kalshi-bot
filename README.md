@@ -10,24 +10,30 @@ An async Python bot that implements an **information-alpha** trading strategy on
 Data Sources                        Matching Engine                 Output
 ──────────────────────────────      ───────────────────────────     ──────────────────────
 Federal Register (6 agencies) ──┐
-RSS feeds (AP, Reuters, BBC…) ──┤──► Keyword Matcher     ─────────► TEXT opportunities
-SEC EDGAR 8-K filings         ──┘     (topic × market title)
+RSS feeds (AP, Reuters, BBC…) ──┤
+SEC EDGAR 8-K filings         ──┤──► Keyword Matcher     ─────────► TEXT opportunities
+Congress.gov vote tracker     ──┤     (topic × market title)
+White House actions feed      ──┘
 
 NOAA/NWS forecast + METAR     ──┐
 NWS HRRR hourly forecasts     ──┤
-NWS climatological (CLI)      ──┤──► Numeric Matcher     ─────────► DATA opportunities
+NWS hourly point forecasts    ──┤──► Numeric Matcher     ─────────► DATA opportunities
 Open-Meteo model forecasts    ──┤     (live value vs. strike)
-OpenWeatherMap                ──┤
-Binance crypto prices         ──┤
-Frankfurter forex rates       ──┤
+Binance / Coinbase crypto     ──┤
+Equity indices / WTI futures  ──┤
+Frankfurter / Yahoo forex     ──┤
 BLS / FRED / EIA economics    ──┘
 
 Polymarket (real-money)       ──┐
 Metaculus (reputation)        ──┤──► Divergence Matcher  ─────────► EXT opportunities
-Manifold (play-money)         ──┘     (external p vs. Kalshi mid)
+Manifold (play-money)         ──┤     (external p vs. Kalshi mid)
+PredictIt (real-money US)     ──┘
 
 METAR observed daily max/min  ──────► Band-Pass Arb      ─────────► BAND_ARB signals
 (airport ASOS, 5-8 min ahead)          (definitively-NO bands)
+
+HRRR + NWS hourly (consensus) ──────► Forecast-NO        ─────────► FORECAST_NO signals
+(2+ sources outside band edge)         (NO on bands forecast misses missed early)
 
 Box Office Mojo estimates     ──────► Box Office Matcher ─────────► DATA opportunities
 ```
@@ -39,8 +45,9 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 3. Numeric sources compare live values to market strikes using a calibrated probability model.
 4. External forecast platforms are matched to Kalshi via stemmed Jaccard similarity; material divergences become signals.
 5. METAR observed data triggers **band-pass arbitrage** on temperature partition markets.
-6. Opportunities are **scored**, **filtered** through quality gates, and executed as dry-run or live trades.
-7. A lightweight **fast loop** (default every 10s) runs band-arb checks between full cycles for near-threshold cities.
+6. HRRR + NWS hourly consensus triggers **forecast-driven NO** trades on bands both sources project to miss.
+7. Opportunities are **scored**, **filtered** through quality gates, and executed as dry-run or live trades.
+8. A lightweight **fast loop** (default every 10s) runs band-arb checks between full cycles for near-threshold cities.
 
 ---
 
@@ -65,6 +72,8 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 | Federal Register — Treasury | Fiscal policy, sanctions |
 | Federal Register — HHS | Healthcare, public health |
 | SEC EDGAR 8-K filings | Corporate events |
+| Congress.gov vote tracker | House/Senate roll call votes → legislative market signals |
+| White House Presidential Actions | Executive orders, proclamations → EO market signals |
 | NWS Alerts | Severe weather alerts |
 
 ### Numeric Sources (live value vs. strike price)
@@ -73,17 +82,25 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 | NOAA/NWS day-1 forecast | Daily high/low temp — 20 cities | `KXHIGH*`, `KXLOWT*` |
 | NOAA/NWS day-2+ forecast | Extended forecast, higher edge threshold | `KXHIGH*`, `KXLOWT*` |
 | NOAA observed (ASOS) | Observed daily max/min — running intraday ground truth | `KXHIGH*`, `KXLOWT*` |
-| METAR (airport ASOS) | Real-time airport observations, 5-8 min ahead of NOAA | `KXHIGH*` |
-| NWS HRRR hourly | High-resolution rapid-refresh model forecasts | `KXHIGH*`, `KXLOWT*` |
+| METAR (airport ASOS) | Real-time airport observations, 5-8 min ahead of NOAA | `KXHIGH*`, `KXLOWT*` |
+| NWS HRRR | High-resolution rapid-refresh model forecasts (hourly updates) | `KXHIGH*`, `KXLOWT*` |
+| NWS hourly point forecast | NWS hourly grid forecast (independent of HRRR) | `KXHIGH*`, `KXLOWT*` |
 | NWS climatological (CLI) | Official daily high/low from NWS CLI products | `KXHIGH*`, `KXLOWT*` |
-| Open-Meteo | Independent model forecasts (WMO ensemble) | `KXHIGH*`, `KXLOWT*` |
+| Open-Meteo | Multi-model ensemble: blended, ECMWF IFS, ICON, GEM; per-source/city/month bias-corrected from 2-year historical backtest | `KXHIGH*`, `KXLOWT*` |
 | OpenWeatherMap | Independent high/low temp cross-validation | `KXHIGH*`, `KXLOWT*` |
 | Box Office Mojo | Weekend domestic gross estimates | `KXBO*` |
 | Binance | BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, LINK (USD) | `KXBTCD`, `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXXRP15M`, `KXDOGE*`, `KXADA*`, `KXAVAX*`, `KXLINK*` |
+| Coinbase | BTC, ETH (USD) — cross-validates Binance; divergence > threshold raises confidence | `KXBTCD`, `KXBTC15M`, `KXETH15M` |
 | Frankfurter (ECB) | EUR/USD, USD/JPY, GBP/USD | `KXEURUSD`, `KXUSDJPY`, `KXGBPUSD` |
+| Yahoo Finance (forex) | EUR/USD, USD/JPY, GBP/USD — cross-validates Frankfurter | `KXEURUSD`, `KXUSDJPY`, `KXGBPUSD` |
+| S&P 500 / Nasdaq / Dow | Real-time US equity index levels | `KXSPX*`, `KXNDX*`, `KXDJIA*` |
+| CME NYMEX WTI futures | Front-month WTI crude oil futures price | `KXWTI`, `KXOIL` |
 | BLS | CPI-U, Nonfarm Payrolls, Unemployment Rate, PPI | `KXCPI`, `KXNFP`, `KXUNRATE`, `KXPPI` |
 | FRED (St. Louis Fed) | Fed funds rate, 2Y/10Y Treasury yields, PCE, GDP | `KXFED`, `KXFFR`, `KXDGS2`, `KXDGS10`, `KXPCE`, `KXGDP` |
 | EIA | WTI crude oil, natural gas | `KXWTI`, `KXOIL`, `KXNATGAS`, `KXNG` |
+| EIA Inventory | Weekly petroleum inventory report | `KXEIA*` |
+| ADP Employment Report | Monthly private-sector payrolls (NFP pre-signal) | `KXNFP` |
+| Chicago PMI | Chicago Business Barometer (manufacturing PMI pre-signal) | `KXISM`, `KXISMMFG` |
 | ISM | Manufacturing and Services PMI | `KXISM`, `KXISMMFG`, `KXISMSVC` |
 | CME FedWatch | Probability-weighted next Fed meeting outcome | `KXFED` |
 
@@ -118,18 +135,31 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 | Polymarket | Real-money global prediction market | 20 pp (configurable) |
 | Metaculus | Reputation-tracked crowd forecasting | 20 pp (configurable) |
 | Manifold | Play-money prediction market | 25 pp (configurable) |
+| PredictIt | Real-money US political prediction market | 20 pp (configurable) |
 
 ---
 
 ## Signal Quality & Filters
 
 ### Temperature markets (multi-source consensus)
-- Multiple independent sources (NOAA forecast, Open-Meteo, NWS HRRR, OWM) must agree on direction before a trade is placed.
+- Multiple independent sources must agree on direction before a trade is placed (`FORECAST_CORROBORATION_MIN`, default 2).
 - When observed station readings exceed the forecast, source switches to `noaa_observed` or `metar` with a much tighter uncertainty model (σ ≈ 0.5°F vs 4°F for forecasts), enabling high-confidence late-day trades.
-- Per-source, per-direction minimum edge thresholds (see configuration reference). `open_meteo` under-signals require 12°F raw edge to net ~7°F true edge after cold bias correction; `weatherapi` under-signals are disabled entirely (−8°F cold bias).
+- **Per-source minimum edge thresholds**: HRRR requires 2.5°F edge; NWS hourly requires 3.0°F; Open-Meteo ECMWF requires 3.5°F; Open-Meteo blended/ICON/GEM require 4.0°F; NOAA requires 5.0°F. `open_meteo` under-signals require 7.0°F to account for its systematic warm bias. All thresholds apply across over, under, and between directions with independent per-direction env-var overrides.
+- **Open-Meteo bias correction**: forecasts from `open_meteo`, `open_meteo_ecmwf`, `open_meteo_icon`, `open_meteo_gem` are adjusted by a per-source/city/month correction table (`openmeteo_bias_table.py`) derived from a 2-year historical forecast-vs-METAR backtest. `open_meteo_gfs` is excluded — it duplicates the blended `open_meteo` source.
 - Forecast-only trades are blocked within `SAME_DAY_CUTOFF_HOURS` of market close (default 2h).
-- **Daily high gate**: `noaa_observed` YES signals on high-temp markets are blocked before 13:00 local (afternoon high not yet established).
-- **Daily low gate (morning gate)**: `noaa_observed` YES signals on low-temp markets are blocked before 05:00 local. The running daily minimum resets at local midnight and equals the current temperature — not the overnight trough, which typically occurs at 4–6 AM.
+- **Daily high gate**: `noaa_observed` YES signals on high-temp markets are blocked before 13:00 local (afternoon high not yet established). `MORNING_OBS_GAP_F` (default 20°F) additionally blocks early-morning observed YES signals when the current reading is far below the strike.
+- **Daily low gate**: `noaa_observed` YES signals on low-temp markets are blocked before 05:00 local. The running daily minimum resets at local midnight and equals the current temperature — not the overnight trough, which typically occurs at 4–6 AM.
+
+### Forecast-driven NO signals (forecast_no)
+Separate from direct YES/NO numeric matching, the bot also evaluates **consensus-NO** positions on band markets when multiple high-resolution forecast sources project the temperature will miss a band by a sufficient margin — before METAR observation confirms it.
+
+- Enabled via `FORECAST_NO_ENABLED` (default true).
+- Requires `FORECAST_NO_MIN_SOURCES` (default 2) qualifying sources to agree on the same direction (both projecting above or both below the band).
+- Per-source edge thresholds in the inner qualifying loop: HRRR 2.5°F, NWS hourly 3.0°F, Open-Meteo ECMWF 3.5°F; all others fall back to `FORECAST_NO_MIN_EDGE_F` (default 3.0°F). NO_HIGH direction (forecast above band) uses 2.5°F default; NO_LOW direction (forecast below band) uses 3.5°F default.
+- Entry price gate: NO ask must be 15–80¢ (`FORECAST_NO_MIN_ASK` / `FORECAST_NO_MAX_ASK`). Markets already priced at 80–100¢ NO are skipped (risk:reward too poor).
+- KXLOWT (overnight low) markets require `FORECAST_NO_LOWT_MIN_SOURCES` (default 3) sources and a tighter spread (`FORECAST_NO_LOWT_MAX_SPREAD_CENTS`, default 15¢) — overnight lows have higher forecast uncertainty than daytime highs.
+- At least one of HRRR or NWS hourly must be in the qualifying set (anchor gate).
+- Sources disagreeing on direction (one NO_HIGH, another NO_LOW on the same band) are suppressed.
 
 ### Band-pass / strike arbitrage
 The bot exploits a **5–8 minute information advantage** METAR airport observations have over NOAA's aggregated feed. Every temperature partition market (`KXHIGH*`) forms part of a collectively exhaustive set — when the observed daily maximum definitively passes through a band, that band resolves NO with near-certainty.
@@ -140,7 +170,7 @@ The bot exploits a **5–8 minute information advantage** METAR airport observat
 - When NOAA has no data yet (METAR is ahead), the market price provides soft confirmation: signals are suppressed if NO ask exceeds `BAND_ARB_NOAA_NONE_MAX_NO_ASK` (default 40¢).
 - A fast inner loop (default every 10s) re-checks near-threshold cities between full poll cycles without re-fetching the entire market list.
 
-### Divergence matching (Polymarket / Metaculus / Manifold)
+### Divergence matching (Polymarket / Metaculus / Manifold / PredictIt)
 - Market titles and external questions are compared using **stemmed Jaccard similarity** (suffix-stripped tokens — "elections" → "elect", "confirmed" → "confirm").
 - Entertainment/sports/esports markets (`KXMVE*`, `KXNBA*`, `KXNHL*`, etc.) are excluded from external matching to prevent flooding.
 - Markets with no `last_price` use bid/ask midpoint for divergence calculation.
@@ -193,7 +223,7 @@ High-confidence sources (`noaa_observed`, `metar`, `band_arb`, `nws_climo`, `nws
 When a new trade is blocked by `MAX_TOTAL_EXPOSURE_CENTS`, the bot greedily force-exits the most-settled open positions to free capital. Eligible positions are from high-confidence sources with current NO value ≥ `CAPITAL_RECYCLE_MIN_NO_VALUE` (default 97¢ — essentially at settlement). This ensures capital isn't idle in near-resolved positions when new signals appear.
 
 ### Dry-run ledger
-A live overview file (`dry_run_overview.md`) is updated every cycle showing open positions, unrealized P&L, and cumulative performance — useful for evaluating signal quality before going live. Historical trades with outcomes are stored in `opportunity_log.db`.
+A live overview file (`dry_run_overview.txt`) is updated every cycle showing open positions, unrealized P&L, and cumulative performance — useful for evaluating signal quality before going live. Historical trades with outcomes are stored in `opportunity_log.db`.
 
 ---
 
@@ -242,18 +272,25 @@ kalshi_bot/
 ├── market_parser.py       Ticker/title → ParsedMarket (direction + strike)
 ├── matcher.py             Keyword matching → Opportunity dataclass
 ├── numeric_matcher.py     Numeric matching → NumericOpportunity dataclass
+│                            (Binance+Coinbase cross-validated for crypto)
 ├── polymarket_matcher.py  External forecast divergence matching (Polymarket,
-│                            Metaculus, Manifold) with stemmed Jaccard
+│                            Metaculus, Manifold, PredictIt) with stemmed Jaccard
 ├── box_office_matcher.py  Box office gross estimate vs. Kalshi strike matching
-├── strike_arb.py          Band-pass arbitrage: METAR vs. KXHIGH partition markets
-│                            Emits BandArbSignal for definitively-NO bands
-├── scoring.py             Composite score for all opportunity types
+├── strike_arb.py          Three signal types:
+│                            band_arb — METAR observed vs. KXHIGH partition markets
+│                            forecast_no — HRRR+NWS hourly consensus NO on bands
+│                            strike_arb — multi-source forecast strike disagreement
+├── openmeteo_bias_table.py  Per-source/city/month bias correction table for
+│                            Open-Meteo forecasts (2-year historical backtest)
+├── scoring.py             Composite score + per-source min-edge thresholds
+│                            for all opportunity types
 ├── trade_executor.py      Kelly sizing, quality gates, dry-run/live execution,
 │                            circuit breakers, capital recycling, filter statistics
 ├── exit_manager.py        Profit-take, stop-loss, trailing stop, counter-signal
 │                            exit logic; force-exit for capital recycling
-├── dry_run_ledger.py      Dry-run position tracking, P&L overview file,
-│                            recyclable_trades() for capital recycling
+├── dry_run_ledger.py      Dry-run position tracking, P&L overview file
+│                            (dry_run_overview.txt), recyclable_trades() for
+│                            capital recycling
 ├── opportunity_log.py     SQLite log of surfaced opportunities + raw_forecasts
 │                            table for per-source accuracy backtesting
 ├── win_rate_tracker.py    Per-category win rate analysis
@@ -263,30 +300,51 @@ kalshi_bot/
 └── news/
     ├── federal_register.py  Federal Register fetcher (6 agencies)
     ├── rss.py               Generic RSS/Atom feed fetcher (10+ feeds)
+    ├── congress.py          Congress.gov vote tracker — binary YES/NO signals
+    │                          for House/Senate roll call votes
+    ├── whitehouse.py        White House Presidential Actions RSS — definitive
+    │                          YES signals for executive order markets
     ├── noaa.py              NOAA/NWS forecast + METAR observed fetcher
     │                          (20 cities, high + low; midnight→5 AM window
     │                           for observed min to exclude daytime contamination)
+    ├── metar.py             FAA METAR real-time station observations — running
+    │                          daily max/min, 5-8 min ahead of NOAA aggregate
+    ├── hrrr.py              HRRR high-resolution rapid-refresh model forecast
+    │                          fetcher (hourly updates, ~2-3°F MAE)
+    ├── nws_hourly.py        NWS hourly point forecast grid fetcher
+    │                          (~3°F MAE, independent of HRRR)
     ├── nws_climo.py         NWS climatological (CLI) product parser
     │                          (official daily high/low from NWS CLI text)
-    ├── open_meteo.py        Open-Meteo WMO ensemble forecast fetcher
-    │                          (high + low, all 20 cities)
+    ├── open_meteo.py        Open-Meteo multi-model forecast fetcher:
+    │                          blended best_match, ECMWF IFS, ICON, GEM
+    │                          (high + low, all 20 cities; bias-corrected)
+    ├── weatherapi.py        WeatherAPI.com cross-validation fetcher
     ├── owm.py               OpenWeatherMap cross-validation fetcher
     ├── binance.py           Binance spot price fetcher (8 crypto assets)
+    ├── coinbase.py          Coinbase spot price fetcher (BTC, ETH cross-check)
+    ├── equity_index.py      S&P 500, Nasdaq, Dow Jones index price fetcher
+    ├── wti_futures.py       CME NYMEX WTI front-month futures (Yahoo Finance)
     ├── frankfurter.py       ECB/Frankfurter forex rate fetcher
+    ├── yahoo_forex.py       Yahoo Finance forex rate fetcher (cross-validates
+    │                          Frankfurter for EUR/USD, USD/JPY, GBP/USD)
     ├── bls.py               BLS economic release fetcher
     ├── fred.py              FRED interest rate fetcher
     ├── eia.py               EIA energy price fetcher
+    ├── eia_inventory.py     EIA weekly petroleum inventory report fetcher
+    ├── adp.py               ADP Employment Report fetcher (NFP pre-signal)
+    ├── chicago_pmi.py       Chicago Business Barometer PMI fetcher
     ├── cme_fedwatch.py      CME FedWatch next-meeting probability fetcher
     ├── polymarket.py        Polymarket binary market fetcher
     ├── metaculus.py         Metaculus community forecast fetcher
     ├── manifold.py          Manifold market fetcher
+    ├── predictit.py         PredictIt contract fetcher
     ├── edgar.py             SEC EDGAR 8-K filing fetcher
     └── nws_alerts.py        NWS severe weather alert fetcher
 
 run.py                   Entry point
 state.db                 Text deduplication database (auto-created)
 opportunity_log.db       Trade and opportunity history (auto-created)
-dry_run_overview.md      Live dry-run P&L overview (auto-updated each cycle)
+dry_run_overview.txt     Live dry-run P&L overview (auto-updated each cycle)
 market_discovery.py      Legacy reference file — do not modify
 ```
 
@@ -295,14 +353,14 @@ market_discovery.py      Legacy reference file — do not modify
 ## Setup
 
 ### Prerequisites
-- Python 3.14
+- Python 3.13+
 - A Kalshi account with API credentials (Key ID + RSA private key)
 - Optional: `OWM_API_KEY` for OpenWeatherMap cross-validation (free at openweathermap.org)
 - Optional: `BLS_API_KEY` for higher BLS API rate limits
 
 ### Install
 ```bash
-python3.14 -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install aiohttp cryptography python-dotenv
 ```
@@ -379,16 +437,34 @@ caffeinate -i venv/bin/python run.py
 ### Temperature signal quality
 | Env Var | Default | Description |
 |---|---|---|
-| `TEMP_FORECAST_MIN_EDGE` | `5.0` | Min °F edge for day-1 forecast signals (noaa, nws_hourly, open_meteo) |
-| `TEMP_DAY2_MIN_EDGE` | `9.0` | Min °F edge for day-2+ forecast signals (higher MAE) |
-| `TEMP_EDGE_OVER_{SOURCE}` | varies | Per-source override for "over" edge threshold |
-| `TEMP_EDGE_UNDER_{SOURCE}` | varies | Per-source override for "under" edge threshold |
+| `TEMP_FORECAST_MIN_EDGE` | `5.0` | Global fallback min °F edge for forecast signals (applies to sources without a per-source override) |
+| `TEMP_LOW_FORECAST_MIN_EDGE` | `6.0` | Min °F edge for all temp_low_* (KXLOWT) forecast signals |
+| `TEMP_DAY2_MIN_EDGE` | `5.0` | Min °F edge for day-2+ NOAA forecast signals |
+| `TEMP_EDGE_OVER_{SOURCE}` | varies | Per-source override for "over" direction. Configured: hrrr=2.5, nws_hourly=3.0, noaa/noaa_day1=5.0, open_meteo=5.0 |
+| `TEMP_EDGE_UNDER_{SOURCE}` | varies | Per-source override for "under" direction. Configured: hrrr=2.5, nws_hourly=3.0, open_meteo=7.0 |
+| `TEMP_EDGE_BETWEEN_{SOURCE}` | varies | Per-source override for "between" (band) direction. Configured: hrrr=2.5, nws_hourly=3.0, open_meteo_ecmwf=3.5, open_meteo/icon/gem=4.0, noaa=5.0 |
 | `TEMP_OBSERVED_MIN_EDGE_OVER` | `0.5` | Min °F edge for observed YES (over) signals |
 | `TEMP_OBSERVED_MIN_EDGE_BETWEEN` | `0.2` | Min °F edge for observed YES (between) signals |
 | `TEMP_OBSERVED_MIN_EDGE_UNDER` | `2.0` | Min °F edge for observed YES (under) signals |
 | `NOAA_OBS_YES_MIN_LOCAL_HOUR` | `13` | Earliest local hour to allow high-temp observed YES trades |
 | `NOAA_OBS_LOW_PAST_LOCAL_HOUR` | `5` | Earliest local hour to allow low-temp observed YES trades |
+| `MORNING_OBS_GAP_F` | `20.0` | Block observed YES if current reading is this many °F below strike (early morning guard) |
 | `SAME_DAY_CUTOFF_HOURS` | `2.0` | Block temperature trades within N hours of market close |
+| `FORECAST_CORROBORATION_MIN` | `2` | Min distinct forecast sources required to agree for a YES trade |
+| `KXLOWT_FORECAST_CORROBORATION_MIN` | `3` | Min sources for KXLOWT YES trades (overnight lows need stronger consensus) |
+
+### Forecast-driven NO signals (forecast_no)
+| Env Var | Default | Description |
+|---|---|---|
+| `FORECAST_NO_ENABLED` | `true` | Enable/disable forecast_no signal type entirely |
+| `FORECAST_NO_MIN_SOURCES` | `2` | Min qualifying sources needed to fire a NO trade |
+| `FORECAST_NO_MIN_EDGE_F` | `3.0` | Default inner-loop edge threshold (sources not in per-source dict) |
+| `FORECAST_NO_NO_HIGH_MIN_EDGE_F` | `2.5` | Edge threshold for NO_HIGH direction (forecast above band) |
+| `FORECAST_NO_NO_LOW_MIN_EDGE_F` | `3.5` | Edge threshold for NO_LOW direction (forecast below band) |
+| `FORECAST_NO_MAX_ASK` | `80` | Max NO ask in cents — above this the risk:reward is too poor |
+| `FORECAST_NO_MIN_ASK` | `15` | Min NO ask in cents — below this the market already priced the outcome |
+| `FORECAST_NO_LOWT_MIN_SOURCES` | `3` | Min qualifying sources for KXLOWT overnight low forecast_no trades |
+| `FORECAST_NO_LOWT_MAX_SPREAD_CENTS` | `15` | Max bid-ask spread for KXLOWT forecast_no entries |
 
 ### Band-pass arbitrage
 | Env Var | Default | Description |
@@ -444,7 +520,10 @@ caffeinate -i venv/bin/python run.py
 - **All HTTP is async** via `aiohttp`; a shared `ClientSession` with a 30-connection pool is reused across all cycles.
 - **Deduplication** for text sources is SQLite-backed (`state.db`). Trade and opportunity history are persisted to `opportunity_log.db`, which also stores circuit breaker state, price snapshots for P&L tracking, and a `raw_forecasts` table capturing every weather source's forecast per cycle for post-hoc accuracy analysis.
 - **Temperature matching** uses multiple independent weather sources. Sources are weighted by historical accuracy, with `noaa_observed` and `metar` carrying the highest confidence (direct observation, same ASOS station Kalshi uses for settlement). METAR data arrives 5–8 minutes ahead of NOAA's aggregated feed — the core edge for band-pass arbitrage.
+- **Open-Meteo bias correction**: ECMWF, ICON, GEM, and blended Open-Meteo forecasts carry systematic per-city, per-month biases. A calibration table (`openmeteo_bias_table.py`) derived from 2 years of historical forecast-vs-METAR data corrects each forecast before it enters the qualifying loop. `open_meteo_gfs` is intentionally excluded from signal generation — it is identical to the blended `open_meteo` source (same GFS model underneath).
 - **NWS rounding**: Kalshi temperature markets settle against NWS CLI integer daily highs/lows (rounded to nearest degree). All threshold comparisons include ±0.5°F buffers to guarantee the official rounded value crosses the boundary.
+- **Forecast_no vs. band_arb**: `band_arb` fires once METAR observation *confirms* a band has been crossed (near-certainty, late in the day). `forecast_no` fires earlier based on HRRR + NWS hourly model consensus projecting a miss, while the market still prices a 20–80% chance of the band hitting — capturing the information gap before observation.
+- **METAR date anchoring**: METAR `as_of` timestamps are anchored to noon LST on the observation date (not the fetch time) so `numeric_matcher`'s date guard consistently gates each reading to the correct market day, preventing yesterday's afternoon peak from leaking into today's market around midnight.
 - **Band-pass arb fast loop**: A secondary async loop polls METAR every 10s (configurable) for cities within `WATCH_THRESHOLD_F` of a band ceiling. This allows intraday signals without waiting for the next full poll cycle.
 - **Low-temperature signals**: `noaa_observed` returns the running minimum since local midnight. At midnight this equals the current temperature, not the overnight low. The query window is capped at midnight→5 AM local, and a morning gate blocks trades before 05:00 local when the overnight trough hasn't yet been established.
 - **Capital recycling**: When the aggregate exposure cap would block a new trade, the bot greedily force-exits the most-settled open positions from high-confidence sources (those with NO value ≥ 97¢). This keeps capital deployed in new signals rather than idle in near-resolved positions.
@@ -461,7 +540,7 @@ caffeinate -i venv/bin/python run.py
 - Kalshi's `status=open` pagination returns sports/entertainment markets first; numeric and political markets only appear after 10,000+ entries. The series_ticker targeted fetch works around this, but political market coverage depends on throttled general pagination staying within rate limits.
 - AP News and Reuters RSS feeds may be unreachable depending on network/DNS.
 - Politico's feed returns HTTP 403 in some environments.
-- Binance is used for crypto pricing by default (no key required, no rate limit issues). CoinGecko (legacy) free tier is limited to ~30 requests/minute and is no longer used.
+- Binance is used for primary crypto pricing (no key required, no rate limit issues). Coinbase cross-validates BTC and ETH prices; divergence between exchanges raises signal confidence.
 - BLS free tier: 25 queries/day. Use `BLS_API_KEY` for production.
 - Jaccard matching is keyword-overlap-based and can produce false positives. The stemmer reduces but does not eliminate mismatches between differently phrased questions.
 - `market_discovery.py` in the project root is a legacy reference file — do not modify or import it.
