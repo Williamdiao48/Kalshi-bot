@@ -170,8 +170,10 @@ def find_spread_opportunities(
 
         for yes_leg in yes_legs:
             for no_leg in no_legs:
-                assert yes_leg.strike is not None
-                assert no_leg.strike is not None
+                if yes_leg.strike is None or no_leg.strike is None:
+                    raise ValueError(
+                        f"spread_matcher: strike is None for {yes_leg.market_ticker} / {no_leg.market_ticker}"
+                    )
 
                 if direction == "over":
                     # "above X" YES: data > X (lower strike)

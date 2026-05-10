@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DB_PATH  = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH  = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Sources that count toward forecast_no source_score (mirrors strike_arb.py)
 FORECAST_NO_SOURCES = frozenset({"hrrr", "nws_hourly", "open_meteo", "noaa"})

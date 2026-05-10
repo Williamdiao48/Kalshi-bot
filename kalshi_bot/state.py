@@ -8,9 +8,9 @@ import sqlite3
 import logging
 from pathlib import Path
 
-from .db import open_db
+from .db import open_db, STATE_DB
 
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "state.db"
+_DEFAULT_DB_PATH = STATE_DB
 
 
 class SeenDocuments:

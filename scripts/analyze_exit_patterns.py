@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Current live EXIT_SOURCE_PROFIT_TAKE entries (global default + per-source).
 # These are the thresholds we're evaluating.

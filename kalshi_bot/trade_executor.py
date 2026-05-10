@@ -99,7 +99,7 @@ import math
 import os
 import sqlite3
 
-from .db import open_db
+from .db import open_db, OPPORTUNITY_LOG_DB
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -695,7 +695,7 @@ SPREAD_KELLY_FRACTION: float = float(
 )
 
 _ORDERS_PATH = "/trade-api/v2/orders"
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 
 
 # ---------------------------------------------------------------------------
@@ -1028,10 +1028,14 @@ class TradeExecutor:
         executor.close()
     """
 
-    def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
+    def __init__(
+        self,
+        db_path: Path | str = _DEFAULT_DB_PATH,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         self._dry_run = TRADE_DRY_RUN
         self._db_path = Path(db_path)
-        self._conn = open_db(self._db_path)
+        self._conn = conn if conn is not None else open_db(self._db_path)
         self._init_schema()
         self.stats = FilterStats()
         self._ledger: "Any | None" = None  # DryRunLedger, set via set_ledger()
@@ -1051,12 +1055,13 @@ class TradeExecutor:
             self._migrate_schema()
 
     def _migrate_schema(self) -> None:
-        """Add new columns to an existing trades table if they are missing."""
-        # Widen the opportunity_kind CHECK constraint if the old restrictive
-        # version is present.  The original constraint only allowed 'text' and
-        # 'numeric', which causes every arb/spread/band_arb trade to raise
-        # "CHECK constraint failed" and crash the poll cycle.  SQLite cannot
-        # ALTER a CHECK constraint in place — a full table rebuild is required.
+        """Widen the opportunity_kind CHECK constraint if the old restrictive version is present.
+
+        The original constraint only allowed 'text' and 'numeric', which causes every
+        arb/spread/band_arb trade to raise "CHECK constraint failed".  SQLite cannot
+        ALTER a CHECK constraint — a full table rebuild is required.
+        Column additions are handled centrally by db.run_migrations().
+        """
         tbl_row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='trades'"
         ).fetchone()
@@ -1070,9 +1075,6 @@ class TradeExecutor:
                     "ALTER TABLE trades RENAME TO _trades_old"
                 )
                 self._conn.execute(_CREATE_TRADES_SQL)
-                # Copy all rows; spread_id / market_p_entry / yes_bid_entry /
-                # yes_ask_entry may not exist in the old table — use COALESCE
-                # via the pragma column list to copy only what exists.
                 old_cols = {
                     row[1]
                     for row in self._conn.execute(
@@ -1094,26 +1096,6 @@ class TradeExecutor:
                 )
                 self._conn.execute("DROP TABLE _trades_old")
             logging.info("Schema migration complete: trades table rebuilt.")
-
-        existing = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
-        }
-        for col, defn in [
-            ("kelly_fraction",   "REAL"),
-            ("p_estimate",       "REAL"),
-            ("source",           "TEXT"),
-            ("outcome",          "TEXT"),
-            ("fill_price_cents", "INTEGER"),  # actual fill price from Kalshi (live only)
-            ("spread_id",        "TEXT"),     # UUID shared by both legs of a spread trade
-            ("market_p_entry",   "REAL"),     # (yes_bid + yes_ask) / 200 at entry
-            ("yes_bid_entry",    "INTEGER"),  # yes_bid cents at entry
-            ("yes_ask_entry",    "INTEGER"),  # yes_ask cents at entry
-            ("signal_p_yes",            "REAL"),  # raw _implied_p_yes() before Kelly adjustments
-            ("corroborating_sources",   "TEXT"),  # comma-separated other sources that agreed
-        ]:
-            if col not in existing:
-                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
 
     # -----------------------------------------------------------------------
     # Public entry points

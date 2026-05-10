@@ -419,8 +419,8 @@ if __name__ == "__main__":
                         help="Band-arb trigger threshold in °F (default: 69.5)")
     parser.add_argument("--db-only", action="store_true",
                         help="Only run local DB analysis, skip NWS API fetch")
-    parser.add_argument("--db", default="opportunity_log.db",
-                        help="Path to SQLite DB (default: opportunity_log.db)")
+    parser.add_argument("--db", default=str(Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"),
+                        help="Path to SQLite DB (default: data/db/opportunity_log.db)")
     args = parser.parse_args()
 
     asyncio.run(main(

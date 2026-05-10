@@ -46,12 +46,13 @@ from pathlib import Path
 
 import aiohttp
 
+from .db import open_db, OPPORTUNITY_LOG_DB
 from .market_parser import TICKER_TO_METRIC
 from .markets import fetch_market_detail
 
 WIN_RATE_REPORT_INTERVAL: int = int(os.environ.get("WIN_RATE_REPORT_INTERVAL", "60"))
 
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 
 # Minimum resolved trades for a source to appear in the summary.
 _MIN_SAMPLE = int(os.environ.get("WIN_RATE_MIN_SAMPLE", "3"))
@@ -79,14 +80,13 @@ class WinRateTracker:
         tracker.close()
     """
 
-    def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
+    def __init__(
+        self,
+        db_path: Path | str = _DEFAULT_DB_PATH,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn = conn if conn is not None else open_db(self._db_path)
 
     # -----------------------------------------------------------------------
     # Settlement pass

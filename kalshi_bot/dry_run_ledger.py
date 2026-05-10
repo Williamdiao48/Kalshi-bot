@@ -72,7 +72,7 @@ import math
 import os
 import sqlite3
 
-from .db import open_db
+from .db import open_db, OPPORTUNITY_LOG_DB
 import statistics
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,7 +83,7 @@ import aiohttp
 from .exit_manager import ExitManager, CAPITAL_RECYCLE_SOURCES, CAPITAL_RECYCLE_MIN_NO_VALUE
 from .markets import fetch_market_detail
 
-_DEFAULT_DB_PATH       = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_DB_PATH       = OPPORTUNITY_LOG_DB
 _DEFAULT_OVERVIEW_PATH = Path(__file__).parent.parent / "dry_run_overview.txt"
 
 # Starting paper capital in cents (default $100.00 = 10_000¢).
@@ -305,11 +305,12 @@ class DryRunLedger:
         db_path: Path | str = _DEFAULT_DB_PATH,
         overview_path: Path | str = OVERVIEW_PATH,
         starting_capital_cents: int = STARTING_CAPITAL_CENTS,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._overview_path = Path(overview_path)
         self._starting_capital = starting_capital_cents
-        self._conn = open_db(self._db_path)
+        self._conn = conn if conn is not None else open_db(self._db_path)
         self._conn.execute(_CREATE_SNAPSHOTS_SQL)
         self._conn.execute(_CREATE_SNAPSHOTS_IDX_SQL)
         self._migrate_snapshots()

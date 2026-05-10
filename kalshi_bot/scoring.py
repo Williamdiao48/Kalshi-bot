@@ -47,11 +47,12 @@ Weight comparison (text vs numeric/poly):
 
   Sub-score      Text    Numeric / Poly
   ----------     -----   --------------
-  Spread         0.35    0.30   ← reduced; edge already penalises bad entries
+  Spread         0.35    0.25   ← reduced; edge already penalises bad entries
   Uncertainty    0.25    0.25
   Temporal       0.25    0.20   ← reduced; data edges are less time-sensitive
   Specificity    0.15    —
   Edge           —       0.25   ← raised from 0.15; core signal for data trades
+  Source         —       0.05   ← data-source reliability discount
 
 If orderbook data (bid/ask) is unavailable for a ticker, the spread and
 uncertainty scores default to 0.0 — a hard penalty: we cannot price or
@@ -96,11 +97,6 @@ NUM_WEIGHT_SOURCE:     float = 0.05   # new: data-source reliability
 
 # Spread at which spread_score reaches 0.0 (linear from 0 → SPREAD_MAX_CENTS).
 SPREAD_MAX_CENTS: float = 20.0
-
-# Maximum days-to-close used for temporal normalisation.
-# Should match MARKET_MAX_DAYS_OUT in main.py; imported callers may pass their
-# own value to keep the two in sync.
-DAYS_OUT_MAX_DEFAULT: float = 30.0
 
 # Half-life for the exponential temporal decay (days).
 # Score = e^(-days / TEMPORAL_HALFLIFE), giving:

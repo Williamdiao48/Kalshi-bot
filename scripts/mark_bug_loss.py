@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--ids", nargs="*", type=int, default=[], metavar="ID")
     parser.add_argument("--unmark", action="store_true", help="Remove bug-loss flag")
     parser.add_argument("--list", action="store_true", help="List all bug-loss trades")
-    parser.add_argument("--db", default="opportunity_log.db")
+    parser.add_argument("--db", default=str(Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"))
     args = parser.parse_args()
 
     db = sqlite3.connect(args.db)

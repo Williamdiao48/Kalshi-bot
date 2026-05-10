@@ -41,7 +41,7 @@ from statistics import mean
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Minimum N per bucket before reporting (avoids printing noise for N=1).
 MIN_REPORT_N = 2

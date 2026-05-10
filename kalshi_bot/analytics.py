@@ -45,13 +45,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .db import OPPORTUNITY_LOG_DB
 from .market_parser import TICKER_TO_METRIC
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DB_PATH  = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_DB_PATH  = OPPORTUNITY_LOG_DB
 _DEFAULT_OUT_PATH = Path(__file__).parent.parent / "pnl_attribution.txt"
 
 ANALYTICS_LOOKBACK_DAYS: int = int(os.environ.get("ANALYTICS_LOOKBACK_DAYS", "30"))

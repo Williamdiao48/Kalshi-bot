@@ -26,6 +26,7 @@ import argparse
 import math
 import sqlite3
 import statistics
+from pathlib import Path
 from typing import NamedTuple
 
 # ── current live defaults ──────────────────────────────────────────────────────
@@ -217,7 +218,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Backtest optimal MAX_POSITION_CENTS (proportional scaling)"
     )
-    parser.add_argument("--db", default="opportunity_log.db")
+    parser.add_argument("--db", default=str(Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"))
     args = parser.parse_args()
 
     db     = sqlite3.connect(args.db)

@@ -47,6 +47,7 @@ from .news import polymarket, metaculus, manifold, edgar, predictit
 from .news import box_office
 from .box_office_matcher import match_box_office_to_kalshi
 from .display import print_text_opportunity as _print_text_opportunity, print_numeric_opportunity as _print_numeric_opportunity, print_poly_opportunity as _print_poly_opportunity
+from .db import open_db, OPPORTUNITY_LOG_DB, run_migrations
 from .dry_run_ledger import DryRunLedger
 from .opportunity_log import OpportunityLog
 from .portfolio import fetch_positions, build_position_index, summarise_portfolio
@@ -76,10 +77,15 @@ if _p90_path.exists():
         _spec.loader.exec_module(_p90_mod)
         _PEAK_P75_MINUTES = getattr(_p90_mod, "P75_MINUTES", {})
 
+_LOG_DIR = Path(__file__).parent.parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_log_handler = logging.FileHandler(_LOG_DIR / "bot.log")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(), _log_handler],
 )
 
 # ---------------------------------------------------------------------------
@@ -2873,14 +2879,18 @@ async def _poll(
     # ---- Structured government event matching (binary, bypass numeric matcher)
     # These modules do their own title-based market matching internally and
     # return NumericOpportunity objects with implied_outcome set directly.
+    # Run both concurrently — each makes independent HTTP requests.
     if markets:
-        congress_opps = await congress.find_congress_opportunities(session, markets)
-        if congress_opps:
-            numeric_opps.extend(congress_opps)
-
-        wh_opps = await whitehouse.find_whitehouse_opportunities(session, markets)
-        if wh_opps:
-            numeric_opps.extend(wh_opps)
+        _gov_results = await asyncio.gather(
+            congress.find_congress_opportunities(session, markets),
+            whitehouse.find_whitehouse_opportunities(session, markets),
+            return_exceptions=True,
+        )
+        for _label, _gov_opps in zip(("congress", "whitehouse"), _gov_results):
+            if isinstance(_gov_opps, Exception):
+                logging.warning("%s opportunities fetch error: %s", _label, _gov_opps)
+            elif _gov_opps:
+                numeric_opps.extend(_gov_opps)
 
     # ---- Forecast consensus filter (temp markets only) ---------------------
     if numeric_opps:
@@ -4137,10 +4147,13 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
     )
 
     seen = SeenDocuments()
-    opp_log = OpportunityLog()
-    executor = TradeExecutor()
-    win_tracker = WinRateTracker()
-    ledger = DryRunLedger() if TRADE_DRY_RUN else None
+    _shared_conn = open_db(OPPORTUNITY_LOG_DB)
+    # Constructors run CREATE TABLE IF NOT EXISTS; run_migrations adds columns.
+    opp_log = OpportunityLog(conn=_shared_conn)
+    executor = TradeExecutor(conn=_shared_conn)
+    win_tracker = WinRateTracker(conn=_shared_conn)
+    ledger = DryRunLedger(conn=_shared_conn) if TRADE_DRY_RUN else None
+    run_migrations(_shared_conn)
     if ledger is not None:
         executor.set_ledger(ledger)
     connector = aiohttp.TCPConnector(limit=30)

@@ -47,7 +47,7 @@ import logging
 import os
 import sqlite3
 
-from .db import open_db
+from .db import open_db, OPPORTUNITY_LOG_DB
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -55,7 +55,7 @@ from .matcher import Opportunity
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 
-_DEFAULT_DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+_DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 
 # ---------------------------------------------------------------------------
 # Retention policy — rows older than these thresholds are deleted on startup.
@@ -218,12 +218,17 @@ class OpportunityLog:
         log.close()
     """
 
-    def __init__(self, db_path: Path | str = _DEFAULT_DB_PATH) -> None:
+    def __init__(
+        self,
+        db_path: Path | str = _DEFAULT_DB_PATH,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         self._db_path = Path(db_path)
-        self._conn = open_db(self._db_path)
+        self._conn = conn if conn is not None else open_db(self._db_path)
         self._init_schema()
         self._purge_old_rows()
-        logging.debug("OpportunityLog opened at %s", self._db_path)
+        if conn is None:
+            logging.debug("OpportunityLog opened at %s", self._db_path)
 
     def _purge_old_rows(self) -> None:
         """Delete rows older than configured retention windows.
@@ -273,25 +278,6 @@ class OpportunityLog:
         self._conn.execute(_CREATE_TRADE_CONTEXT_VIEW_SQL)
         self._conn.execute(_CREATE_SIGNAL_SUPPRESSION_SQL)
         self._conn.execute(_CREATE_SUPPRESSION_IDX_SQL)
-        self._migrate_trades_exit_columns()
-
-    def _migrate_trades_exit_columns(self) -> None:
-        """Add analysis columns to trades that didn't exist in older schema versions."""
-        table_exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'"
-        ).fetchone()
-        if not table_exists:
-            return
-        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(trades)")}
-        for col, typedef in [
-            ("exit_reason_detail", "TEXT"),
-            ("peak_pct_gain",      "REAL"),
-            ("peak_at",            "TEXT"),
-            ("exit_yes_bid",       "INTEGER"),
-            ("exit_yes_ask",       "INTEGER"),
-        ]:
-            if col not in existing:
-                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
 
     # -----------------------------------------------------------------------
     # Cross-cycle deduplication

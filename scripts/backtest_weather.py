@@ -20,7 +20,7 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 WEATHER_SOURCES = {
     "noaa", "noaa_day2", "noaa_observed", "owm",

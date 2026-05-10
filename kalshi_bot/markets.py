@@ -97,12 +97,18 @@ def _normalize_market(m: dict[str, Any]) -> dict[str, Any]:
         try:
             m["yes_bid"] = round(float(m["yes_bid_dollars"]) * 100)
         except (TypeError, ValueError):
-            pass
+            logging.warning(
+                "_normalize_market: could not parse yes_bid_dollars=%r for ticker=%s",
+                m.get("yes_bid_dollars"), m.get("ticker", "?"),
+            )
     if m.get("yes_ask") is None and m.get("yes_ask_dollars") is not None:
         try:
             m["yes_ask"] = round(float(m["yes_ask_dollars"]) * 100)
         except (TypeError, ValueError):
-            pass
+            logging.warning(
+                "_normalize_market: could not parse yes_ask_dollars=%r for ticker=%s",
+                m.get("yes_ask_dollars"), m.get("ticker", "?"),
+            )
     return m
 
 

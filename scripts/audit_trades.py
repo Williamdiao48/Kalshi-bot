@@ -54,7 +54,7 @@ from typing import TextIO
 # Config
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Cities with documented terrain-driven forecast difficulty
 TERRAIN_CITIES = frozenset({"den", "okc", "dal", "slc"})

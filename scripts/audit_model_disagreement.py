@@ -15,8 +15,9 @@ Usage:
 import argparse
 import sqlite3
 from collections import defaultdict
+from pathlib import Path
 
-DB_PATH = "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 WEATHER_MODELS = {"hrrr", "nws_hourly", "open_meteo", "noaa", "owm", "metar", "noaa_observed"}
 

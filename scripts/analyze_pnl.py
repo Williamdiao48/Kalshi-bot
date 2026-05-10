@@ -54,7 +54,7 @@ from kalshi_bot.auth import generate_headers  # noqa: E402
 # Paths
 # ---------------------------------------------------------------------------
 
-_DB_PATH        = Path(__file__).parent / "opportunity_log.db"
+_DB_PATH        = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 _DEFAULT_REPORT = Path(__file__).parent / "pnl_report.txt"
 _DEFAULT_CSV    = Path(__file__).parent / "pnl_trades.csv"
 

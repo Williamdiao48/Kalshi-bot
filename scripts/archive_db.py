@@ -33,7 +33,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 ARCHIVES_DIR = PROJECT_ROOT / "archives"
-DB_PATH = PROJECT_ROOT / "opportunity_log.db"
+DB_PATH = PROJECT_ROOT / "data" / "db" / "opportunity_log.db"
 
 if not DB_PATH.exists():
     print(f"ERROR: {DB_PATH} not found — nothing to archive.")
@@ -120,7 +120,8 @@ for ext in ("", "-shm", "-wal"):
         print(f"Deleted {p.name}")
 
 # ---- 8. Delete stale/redundant files ----------------------------------------
-STALE_FILES = [
+DB_DIR = PROJECT_ROOT / "data" / "db"
+STALE_DB_FILES = [
     # Zero-byte legacy DBs from old bot versions
     "bot_state.db",
     "dry_run.db",
@@ -128,9 +129,11 @@ STALE_FILES = [
     "kalshi_bot.db",
     "opportunities.db",
     "trades.db",
-    # Huge raw .bak files superseded by the structured Apr 12 archive
+    # Huge raw .bak files superseded by the structured archive
     "opportunity_log.db.bak_20260414_181851",
     "opportunity_log.db.bak_20260415_bugfix2",
+]
+STALE_ROOT_FILES = [
     # Stale one-off analysis files (regenerate as needed)
     "exit_analysis.txt",
     "exit_analysis_58.txt",
@@ -140,7 +143,15 @@ STALE_FILES = [
 ]
 
 print("\nCleaning up stale files:")
-for name in STALE_FILES:
+for name in STALE_DB_FILES:
+    p = DB_DIR / name
+    if p.exists():
+        size_mb = p.stat().st_size / 1_048_576
+        os.remove(p)
+        print(f"  Deleted data/db/{name}  ({size_mb:.1f} MB)")
+    else:
+        print(f"  Skipped data/db/{name}  (not found)")
+for name in STALE_ROOT_FILES:
     p = PROJECT_ROOT / name
     if p.exists():
         size_mb = p.stat().st_size / 1_048_576

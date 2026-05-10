@@ -579,7 +579,7 @@ def main() -> None:
                              "'db'  = use raw_forecasts table from opportunity_log.db")
     parser.add_argument("--actuals", default=_DEFAULT_ACTUALS,
                         help="Path to nws_cli_actuals.csv (default: data/nws_cli_actuals.csv)")
-    parser.add_argument("--db",      default="opportunity_log.db",
+    parser.add_argument("--db",      default=str(Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"),
                         help="Path to opportunity_log.db (used in --mode db)")
     parser.add_argument("--out",     default="data/source_accuracy_report.csv",
                         help="Output CSV path")

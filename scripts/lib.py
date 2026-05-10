@@ -16,7 +16,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DEFAULT_DB_PATH = PROJECT_ROOT / "opportunity_log.db"
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "db" / "opportunity_log.db"
 
 STARTING_CAPITAL_CENTS: float = 10_000.0   # $100
 DRAWDOWN_WINDOW_HOURS:  int   = 48

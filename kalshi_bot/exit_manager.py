@@ -614,15 +614,10 @@ class ExitManager:
     # -----------------------------------------------------------------------
 
     def _migrate_schema(self) -> None:
-        """Add exit columns to the trades table if they are missing."""
-        existing = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
-        }
-        for col, defn in self._EXIT_COLUMNS:
-            if col not in existing:
-                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
+        """Create ancillary tables owned by ExitManager.
 
+        Column additions to the trades table are handled centrally by db.run_migrations().
+        """
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS forecast_accuracy (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -45,7 +45,7 @@ from pathlib import Path
 from statistics import median, quantiles
 from typing import Optional
 
-_DB_PATH = Path(__file__).parent / "opportunity_log.db"
+_DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 
 # ---------------------------------------------------------------------------

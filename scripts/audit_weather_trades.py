@@ -30,6 +30,7 @@ from typing import IO
 from lib import (
     STARTING_CAPITAL_CENTS, DRAWDOWN_WINDOW_HOURS, DRAWDOWN_FULL_REDUCE,
     DRAWDOWN_MIN_FACTOR, TRADE_MIN_SCORE, SCORE_WEIGHT_MIN, ALL_CATS,
+    DEFAULT_DB_PATH,
     bug_loss_col, bug_loss as _bug_loss, ticker_cat as _ticker_cat,
     note as _note, pnl as _pnl, outcome_label as _outcome_label,
     cost_cents as _cost_cents, win_prob as _win_prob,
@@ -581,7 +582,7 @@ def main() -> None:
     parser.add_argument("--ids",      type=int, nargs="+",   help="Deep-dive: specific trade IDs")
     parser.add_argument("--category", choices=list(_ALL_CATS), help="Filter by drawdown category")
     parser.add_argument("--source",   type=str,              help="Filter by source column")
-    parser.add_argument("--db",       default="opportunity_log.db")
+    parser.add_argument("--db",       default=str(DEFAULT_DB_PATH))
     parser.add_argument("--no-sizing", action="store_true",  help="Skip Kelly breakdown")
     parser.add_argument("--out",      type=str,              help="Write to file instead of stdout")
     args = parser.parse_args()

@@ -476,7 +476,7 @@ def main() -> None:
         "--mode", choices=["live", "synthetic"], default="synthetic",
         help="live = uses raw_forecasts DB; synthetic = Open-Meteo history (default: synthetic)"
     )
-    parser.add_argument("--db", default="opportunity_log.db",
+    parser.add_argument("--db", default=str(Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"),
                         help="Path to opportunity_log.db (live mode only)")
     parser.add_argument("--days", type=int, default=14,
                         help="Days of history for synthetic mode (default: 14)")

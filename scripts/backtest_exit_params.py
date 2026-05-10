@@ -58,7 +58,7 @@ from pathlib import Path
 from statistics import median
 from typing import NamedTuple
 
-_DB_PATH = Path(__file__).parent / "opportunity_log.db"
+_DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # ---------------------------------------------------------------------------
 # Current compiled-in defaults (from exit_manager.py) for comparison

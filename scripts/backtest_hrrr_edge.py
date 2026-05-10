@@ -33,7 +33,7 @@ import aiohttp
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
-DEFAULT_DB   = Path("opportunity_log.db")
+DEFAULT_DB   = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 MESONET_URL  = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 MESONET_DELAY = 0.5  # seconds between requests
 

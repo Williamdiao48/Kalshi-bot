@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kalshi_bot.markets import fetch_market_detail
 
-DB_PATH = Path(__file__).parent.parent / "opportunity_log.db"
+DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Gate thresholds (mirror main.py defaults, overridable via CLI)
 CONTRARIAN_MAX_ENTRY_CENTS = 65
