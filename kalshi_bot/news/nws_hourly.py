@@ -43,6 +43,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_int
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -55,7 +56,7 @@ from .noaa import CITIES
 _HEADERS = {"User-Agent": "kalshi-bot/1.0 (educational; contact: user@example.com)"}
 _POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"
 
-NWS_HOURLY_CACHE_MINUTES: int = int(os.environ.get("NWS_HOURLY_CACHE_MINUTES", "20"))
+NWS_HOURLY_CACHE_MINUTES: int = env_int("NWS_HOURLY_CACHE_MINUTES", 20)
 NWS_HOURLY_FORECAST_DAYS: int = min(7, max(1, int(
     os.environ.get("NWS_HOURLY_FORECAST_DAYS", "3")
 )))

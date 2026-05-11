@@ -69,6 +69,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_int
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -88,7 +89,7 @@ OPEN_METEO_FORECAST_DAYS: int = min(16, max(1, int(
 )))
 
 # How long to cache blended results before re-fetching (default: 10 minutes).
-OPEN_METEO_CACHE_MINUTES: int = int(os.environ.get("OPEN_METEO_CACHE_MINUTES", "10"))
+OPEN_METEO_CACHE_MINUTES: int = env_int("OPEN_METEO_CACHE_MINUTES", 10)
 
 # How long to cache model-specific results (default: 30 minutes).
 # Model-specific fetches make 4 × N_cities requests so a longer TTL keeps

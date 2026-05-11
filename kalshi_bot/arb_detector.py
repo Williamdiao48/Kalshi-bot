@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+from .utils import env_bool, env_int
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,9 +53,9 @@ log = logging.getLogger(__name__)
 
 from .market_parser import parse_market, ParsedMarket
 
-ARB_MIN_PROFIT_CENTS: int = int(os.environ.get("ARB_MIN_PROFIT_CENTS", "2"))
+ARB_MIN_PROFIT_CENTS: int = env_int("ARB_MIN_PROFIT_CENTS", 2)
 ARB_EXECUTION_ENABLED: bool = (
-    os.environ.get("ARB_EXECUTION_ENABLED", "true").lower() != "false"
+    env_bool("ARB_EXECUTION_ENABLED", True)
 )
 
 # ---------------------------------------------------------------------------
@@ -84,9 +85,9 @@ _ARB_SAFE_METRIC_PREFIXES: tuple[str, ...] = (
     "price_sol_usd",
 )
 
-CROSSED_BOOK_MIN_PROFIT: int = int(os.environ.get("CROSSED_BOOK_MIN_PROFIT", "2"))
+CROSSED_BOOK_MIN_PROFIT: int = env_int("CROSSED_BOOK_MIN_PROFIT", 2)
 CROSSED_BOOK_ARB_ENABLED: bool = (
-    os.environ.get("CROSSED_BOOK_ARB_ENABLED", "true").lower() != "false"
+    env_bool("CROSSED_BOOK_ARB_ENABLED", True)
 )
 
 

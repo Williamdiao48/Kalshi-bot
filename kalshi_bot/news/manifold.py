@@ -39,6 +39,7 @@ Thresholds (env-var overridable):
 
 import logging
 import os
+from ..utils import env_float
 from dataclasses import dataclass
 
 import aiohttp
@@ -46,13 +47,13 @@ import aiohttp
 _API_URL = "https://api.manifold.markets/v0/markets"
 _FETCH_LIMIT = 500
 
-MANI_MIN_DIVERGENCE: float  = float(os.environ.get("MANI_MIN_DIVERGENCE",  "0.25"))
+MANI_MIN_DIVERGENCE: float  = env_float("MANI_MIN_DIVERGENCE", 0.25)
 # Raised 1000 → 3000: thin markets have too few active bettors and frequently
 # produce stale prices that look like arbitrage opportunities.
-MANI_MIN_LIQUIDITY:  float  = float(os.environ.get("MANI_MIN_LIQUIDITY",   "3000"))
+MANI_MIN_LIQUIDITY:  float  = env_float("MANI_MIN_LIQUIDITY", 3000.0)
 # Raised 0.20 → 0.35: stricter keyword overlap reduces false topic matches.
-MANI_MIN_MATCH_SCORE: float = float(os.environ.get("MANI_MIN_MATCH_SCORE", "0.35"))
-MANI_MAX_PROB:        float = float(os.environ.get("MANI_MAX_PROB",        "0.95"))
+MANI_MIN_MATCH_SCORE: float = env_float("MANI_MIN_MATCH_SCORE", 0.35)
+MANI_MAX_PROB:        float = env_float("MANI_MAX_PROB", 0.95)
 
 
 @dataclass

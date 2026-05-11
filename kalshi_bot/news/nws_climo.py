@@ -34,6 +34,7 @@ high-confidence observation tier, subject to afternoon gate and obs-consensus ga
 
 import logging
 import os
+from ..utils import env_int, parse_iso_dt
 import re
 import time
 from datetime import datetime, timezone
@@ -102,7 +103,7 @@ LOW_CLIMO_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
 # is not yet published.  The preliminary CLI is typically published 5–8 PM
 # local time, so the bot retries every 30 minutes until it succeeds.
 # Set to 0 to attempt only once per UTC day (old behavior).
-CLIMO_RETRY_INTERVAL_MINUTES: int = int(os.environ.get("CLIMO_RETRY_INTERVAL_MINUTES", "30"))
+CLIMO_RETRY_INTERVAL_MINUTES: int = env_int("CLIMO_RETRY_INTERVAL_MINUTES", 30)
 
 # Earliest local hour at which we attempt to fetch today's CLI product.
 # The NWS preliminary CLI is published 5–8 PM local; the morning final report
@@ -110,7 +111,7 @@ CLIMO_RETRY_INTERVAL_MINUTES: int = int(os.environ.get("CLIMO_RETRY_INTERVAL_MIN
 # A gate of 14:00 (2 PM) eliminates all morning fetches while still giving
 # a 3-hour polling window before the preliminary becomes available.
 # Set via env var NWS_CLIMO_MIN_LOCAL_HOUR. Default: 14.
-CLIMO_MIN_LOCAL_HOUR: int = int(os.environ.get("NWS_CLIMO_MIN_LOCAL_HOUR", "14"))
+CLIMO_MIN_LOCAL_HOUR: int = env_int("NWS_CLIMO_MIN_LOCAL_HOUR", 14)
 
 # Cache: (metric, utc_date_str) → parsed max temperature (°F).
 # Re-populated once per calendar day per city — avoids re-fetching the same
@@ -298,7 +299,7 @@ async def _fetch_city_climo(
     for stub in stubs:
         issuance_str = stub.get("issuanceTime", "")
         try:
-            issuance_dt = datetime.fromisoformat(issuance_str.replace("Z", "+00:00"))
+            issuance_dt = parse_iso_dt(issuance_str)
         except (ValueError, AttributeError):
             continue
 

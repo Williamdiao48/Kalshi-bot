@@ -34,6 +34,7 @@ Thresholds (env-var overridable):
 
 import logging
 import os
+from ..utils import env_float, env_int
 from dataclasses import dataclass
 
 import aiohttp
@@ -41,9 +42,9 @@ import aiohttp
 _API_URL = "https://www.metaculus.com/api2/questions/"
 _FETCH_LIMIT = 300   # broad enough to surface well-forecasted questions across topics
 
-META_MIN_DIVERGENCE: float  = float(os.environ.get("META_MIN_DIVERGENCE",  "0.20"))
-META_MIN_FORECASTERS: int   = int(os.environ.get("META_MIN_FORECASTERS",   "20"))
-META_MIN_MATCH_SCORE: float = float(os.environ.get("META_MIN_MATCH_SCORE", "0.20"))
+META_MIN_DIVERGENCE: float  = env_float("META_MIN_DIVERGENCE", 0.2)
+META_MIN_FORECASTERS: int   = env_int("META_MIN_FORECASTERS", 20)
+META_MIN_MATCH_SCORE: float = env_float("META_MIN_MATCH_SCORE", 0.2)
 
 
 @dataclass

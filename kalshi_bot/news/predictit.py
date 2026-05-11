@@ -47,15 +47,16 @@ Thresholds (env-var overridable):
 
 import logging
 import os
+from ..utils import env_float
 from dataclasses import dataclass
 
 import aiohttp
 
 _API_URL = "https://www.predictit.org/api/marketdata/all/"
 
-PDIT_MIN_DIVERGENCE:  float = float(os.environ.get("PDIT_MIN_DIVERGENCE",  "0.15"))
-PDIT_MIN_VOLUME:      float = float(os.environ.get("PDIT_MIN_VOLUME",      "500"))
-PDIT_MIN_MATCH_SCORE: float = float(os.environ.get("PDIT_MIN_MATCH_SCORE", "0.20"))
+PDIT_MIN_DIVERGENCE:  float = env_float("PDIT_MIN_DIVERGENCE", 0.15)
+PDIT_MIN_VOLUME:      float = env_float("PDIT_MIN_VOLUME", 500.0)
+PDIT_MIN_MATCH_SCORE: float = env_float("PDIT_MIN_MATCH_SCORE", 0.2)
 
 
 @dataclass

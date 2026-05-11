@@ -97,6 +97,7 @@ import json
 import logging
 import math
 import os
+from .utils import env_bool, env_float, env_int, parse_iso_dt
 import sqlite3
 
 from .db import open_db, OPPORTUNITY_LOG_DB
@@ -131,11 +132,11 @@ from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSig
 # ---------------------------------------------------------------------------
 
 # Default True so the bot never touches real capital without an explicit opt-in.
-TRADE_DRY_RUN: bool = os.environ.get("TRADE_DRY_RUN", "true").lower() != "false"
+TRADE_DRY_RUN: bool = env_bool("TRADE_DRY_RUN", True)
 
 # Hard cap on contracts per trade regardless of what Kelly recommends.
 # Raise this after validating signal quality in dry-run.
-TRADE_MAX_CONTRACTS: int = int(os.environ.get("TRADE_MAX_CONTRACTS", "10"))
+TRADE_MAX_CONTRACTS: int = env_int("TRADE_MAX_CONTRACTS", 10)
 
 # Minimum composite score required to attempt a trade.
 # Raised 0.50 → 0.65 → 0.75: each band below the current threshold showed
@@ -144,7 +145,7 @@ TRADE_MAX_CONTRACTS: int = int(os.environ.get("TRADE_MAX_CONTRACTS", "10"))
 #   0.70–0.75: 26 trades, 11.54% win rate, -$7.31 (polymarket-free)
 # Recent 14-day data confirms: <0.75 is 0% win rate, -$2.80.
 # The 0.75–0.80 band shows 63–83% win rate in both windows.
-TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.75"))
+TRADE_MIN_SCORE: float = env_float("TRADE_MIN_SCORE", 0.75)
 
 # Lower minimum score for text opportunities.  Text composite scores are
 # structurally capped below numeric ones (no edge component, specificity
@@ -152,12 +153,12 @@ TRADE_MIN_SCORE: float = float(os.environ.get("TRADE_MIN_SCORE", "0.75"))
 # text unfairly.  Default 0.68 — just above the observed ceiling of crypto
 # noise (~0.68) while allowing genuine politics/economics signals through.
 # Set to 0 to fall back to TRADE_MIN_SCORE for all opportunity types.
-TEXT_TRADE_MIN_SCORE: float = float(os.environ.get("TEXT_TRADE_MIN_SCORE", "0.68"))
+TEXT_TRADE_MIN_SCORE: float = env_float("TEXT_TRADE_MIN_SCORE", 0.68)
 
 # Minimum |p_yes - 0.5| required to act on a text opportunity's classifier signal.
 # At AUC 0.675, require at least 20pp confidence (p_yes < 0.30 or > 0.70).
 # Set to 0 to trade any non-NEUTRAL signal.
-TEXT_MIN_CONFIDENCE: float = float(os.environ.get("TEXT_MIN_CONFIDENCE", "0.20"))
+TEXT_MIN_CONFIDENCE: float = env_float("TEXT_MIN_CONFIDENCE", 0.2)
 
 # Higher minimum score for forex (rate_eur_usd, rate_usd_jpy) markets.
 # Forex short-duration contracts are driven by intraday moves that the ECB
@@ -165,7 +166,7 @@ TEXT_MIN_CONFIDENCE: float = float(os.environ.get("TEXT_MIN_CONFIDENCE", "0.20")
 # forex trades in the historical data were stop-lossed for a combined -$3.74.
 # Default: 0.80 — requires a much stronger signal before entering a forex bet.
 # Set to 0 to disable (falls back to TRADE_MIN_SCORE for forex).
-FOREX_MIN_SCORE: float = float(os.environ.get("FOREX_MIN_SCORE", "0.80"))
+FOREX_MIN_SCORE: float = env_float("FOREX_MIN_SCORE", 0.8)
 
 # Metric prefixes that text/RSS trades should never touch.  Price metrics
 # (crypto, forex) are driven by real-time exchange data — an RSS article
@@ -182,7 +183,7 @@ TEXT_SKIP_METRIC_PREFIXES: tuple[str, ...] = tuple(
 # Wins only appeared at score ≥ 0.82.  Below that the divergence signal
 # has shown no predictive value on Kalshi direction.
 # Set to 0 to disable (falls back to TRADE_MIN_SCORE for poly).
-POLY_MIN_SCORE: float = float(os.environ.get("POLY_MIN_SCORE", "0.82"))
+POLY_MIN_SCORE: float = env_float("POLY_MIN_SCORE", 0.82)
 
 # Higher minimum score for day-ahead (noaa_day2) and longer-range (noaa_day3+)
 # temperature forecasts.  Historical win rate on noaa_day2 trades 186–210 was
@@ -194,13 +195,13 @@ NOAA_DAY2_MIN_SCORE: float = float(os.environ.get("NOAA_DAY2_MIN_SCORE", "0.90")
 # Minimum score for same-day NOAA forecast (noaa) and NOAA observed (noaa_observed)
 # trades.  Score reflects multi-source corroboration; 0.80 requires at least one
 # strong corroborating source.  Set to 0 to disable.
-NOAA_MIN_SCORE: float = float(os.environ.get("NOAA_MIN_SCORE", "0.80"))
-NOAA_OBSERVED_MIN_SCORE: float = float(os.environ.get("NOAA_OBSERVED_MIN_SCORE", "0.80"))
+NOAA_MIN_SCORE: float = env_float("NOAA_MIN_SCORE", 0.8)
+NOAA_OBSERVED_MIN_SCORE: float = env_float("NOAA_OBSERVED_MIN_SCORE", 0.8)
 
 # Block noaa_observed YES trades when the market prices YES at less than this
 # number of cents (i.e., market is ≥95% NO).  When YES ask < 5¢ the market has
 # already priced in near-certainty of NO; our p_estimate=1.0 always loses.
-NOAA_OBSERVED_MIN_YES_ASK: int = int(os.environ.get("NOAA_OBSERVED_MIN_YES_ASK", "5"))
+NOAA_OBSERVED_MIN_YES_ASK: int = env_int("NOAA_OBSERVED_MIN_YES_ASK", 5)
 
 # Minimum YES ask for numeric YES trades.  When the market prices YES below this
 # threshold, the crowd is near-certain YES loses — thin signal edges (e.g. 0.5°F
@@ -209,7 +210,7 @@ NOAA_OBSERVED_MIN_YES_ASK: int = int(os.environ.get("NOAA_OBSERVED_MIN_YES_ASK",
 # yes_ask=10¢, edge=0.48°F, synoptic source) illustrates the failure mode: market
 # was right, we lost.  Exempt locked observed YES (noaa_observed/nws_climo/
 # nws_alert) since those have ground-truth confirmation, not forecasts.
-NUMERIC_YES_MIN_ASK: int = int(os.environ.get("NUMERIC_YES_MIN_ASK", "20"))
+NUMERIC_YES_MIN_ASK: int = env_int("NUMERIC_YES_MIN_ASK", 20)
 
 # POLY_MAX_OPEN_PER_UNDERLYING — Maximum number of concurrent open positions
 # allowed on the same underlying prefix (e.g. KXUSDJPY, KXBTCD).  Prevents
@@ -224,7 +225,7 @@ POLY_MAX_OPEN_PER_UNDERLYING: int = int(
 # Disabled by default: 67 dry-run trades at 21% win rate produced -$15.04 P&L
 # even with POLY_MIN_SCORE=0.82.  The text-similarity matching introduces too
 # much noise.  Re-enable with POLY_ENABLED=true once matching quality improves.
-POLY_ENABLED: bool = os.environ.get("POLY_ENABLED", "false").lower() == "true"
+POLY_ENABLED: bool = env_bool("POLY_ENABLED", False)
 
 # Metrics to skip entirely, regardless of score or edge.
 # Comma-separated.  Based on observed 0% win rate across all dry-run trades.
@@ -255,7 +256,7 @@ PASSIVE_PATIENT_SCORE_THRESHOLD: float = float(
 # scales down from this ceiling.  Default $7.50 = 750 cents.
 # Raised from $5.00 after last-10-trade WR hit 80% (+$3.40 net); revisit at
 # $10.00 after another 20 trades sustain ≥55% WR.
-MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "750"))
+MAX_POSITION_CENTS: int = env_int("MAX_POSITION_CENTS", 750)
 
 # Drawdown-based position scaling.
 # When the equity curve falls below its peak, MAX_POSITION_CENTS is multiplied
@@ -263,28 +264,28 @@ MAX_POSITION_CENTS: int = int(os.environ.get("MAX_POSITION_CENTS", "750"))
 # DRAWDOWN_MIN_FACTOR (at DRAWDOWN_FULL_REDUCE_PCT drawdown or worse).
 # This reduces exposure during losing streaks and restores it automatically
 # as equity recovers.  Set DRAWDOWN_SCALING_ENABLED=false to disable.
-DRAWDOWN_FULL_REDUCE_PCT: float = float(os.environ.get("DRAWDOWN_FULL_REDUCE_PCT", "0.20"))
-DRAWDOWN_MIN_FACTOR: float      = float(os.environ.get("DRAWDOWN_MIN_FACTOR",       "0.25"))
-DRAWDOWN_ENABLED: bool          = os.environ.get("DRAWDOWN_SCALING_ENABLED", "true").lower() == "true"
+DRAWDOWN_FULL_REDUCE_PCT: float = env_float("DRAWDOWN_FULL_REDUCE_PCT", 0.2)
+DRAWDOWN_MIN_FACTOR: float      = env_float("DRAWDOWN_MIN_FACTOR", 0.25)
+DRAWDOWN_ENABLED: bool          = env_bool("DRAWDOWN_SCALING_ENABLED", True)
 # How many recent resolved trades to use when computing the drawdown equity curve.
 # Using all-time history unfairly penalises sizing for losses incurred when the
 # bot's signal quality was much lower (e.g. pre-score-gate legacy trades).
 # Default 50: covers ~5–7 weeks of recent history at current trade frequency.
 # Set to 0 to use all-time history (original behaviour).
-DRAWDOWN_LOOKBACK_TRADES: int = int(os.environ.get("DRAWDOWN_LOOKBACK_TRADES", "50"))
+DRAWDOWN_LOOKBACK_TRADES: int = env_int("DRAWDOWN_LOOKBACK_TRADES", 50)
 # Exclude trades with id < this value from the drawdown equity curve.
 # Use to remove known-buggy trades from the PnL series without discarding the
 # drawdown mechanism or reducing the lookback window.
 # Example: set DRAWDOWN_IGNORE_BEFORE_ID=229 to start the equity clock from
 # trade 229 (first midnight ghost band-arb) onward.
 # 0 = disabled (use all trades within DRAWDOWN_LOOKBACK_TRADES).
-DRAWDOWN_IGNORE_BEFORE_ID: int = int(os.environ.get("DRAWDOWN_IGNORE_BEFORE_ID", "0"))
+DRAWDOWN_IGNORE_BEFORE_ID: int = env_int("DRAWDOWN_IGNORE_BEFORE_ID", 0)
 # Rolling time window for drawdown calculation.  Only trades exited within the
 # last N hours feed into the per-category equity curve.  Losses older than
 # this window are not held against current sizing.
 # Default 48 h.  Set to 0 to disable the window (use all history within
 # DRAWDOWN_LOOKBACK_TRADES).
-DRAWDOWN_WINDOW_HOURS: int = int(os.environ.get("DRAWDOWN_WINDOW_HOURS", "48"))
+DRAWDOWN_WINDOW_HOURS: int = env_int("DRAWDOWN_WINDOW_HOURS", 48)
 
 # Module-level drawdown factors, updated each cycle by main.py via
 # set_drawdown_factors().  Per-category dict for numeric trades; _dd_factor
@@ -330,14 +331,14 @@ def set_drawdown_factor(factor: float) -> None:
 # Fractional Kelly multiplier.  1.0 = full Kelly (aggressive).
 # 0.25 = quarter-Kelly (conservative, recommended before calibration).
 # 0.5  = half-Kelly (common practitioner choice after calibration).
-KELLY_FRACTION: float = float(os.environ.get("KELLY_FRACTION", "0.25"))
+KELLY_FRACTION: float = env_float("KELLY_FRACTION", 0.25)
 
 # Elevated Kelly fraction for high-conviction trades (score ≥ KELLY_HIGH_SCORE_THRESHOLD).
 # Applies a moderately higher fraction so signals we're most confident in get
 # meaningfully larger positions while low-score trades remain conservatively sized.
 # Default: 0.33 for scores ≥ 0.80; the standard KELLY_FRACTION applies below that.
-KELLY_FRACTION_HIGH: float = float(os.environ.get("KELLY_FRACTION_HIGH", "0.40"))
-KELLY_HIGH_SCORE_THRESHOLD: float = float(os.environ.get("KELLY_HIGH_SCORE_THRESHOLD", "0.80"))
+KELLY_FRACTION_HIGH: float = env_float("KELLY_FRACTION_HIGH", 0.4)
+KELLY_HIGH_SCORE_THRESHOLD: float = env_float("KELLY_HIGH_SCORE_THRESHOLD", 0.8)
 
 # Position sizing overrides for locked-observation trades (noaa_observed, metar,
 # nws_climo, nws_alert).  These positions are near-certain by definition: the
@@ -349,9 +350,9 @@ KELLY_HIGH_SCORE_THRESHOLD: float = float(os.environ.get("KELLY_HIGH_SCORE_THRES
 # model has only ~65% directional accuracy — a corroboration signal, not a lock.
 # Historical "100% WR" was all trivially easy NO trades on far-OTM strikes;
 # the first genuinely contested signal (#32 YES on T91.99) produced a bad trade.
-LOCKED_OBS_MAX_POSITION_CENTS: int = int(os.environ.get("LOCKED_OBS_MAX_POSITION_CENTS", "5000"))
-LOCKED_OBS_KELLY_FRACTION: float    = float(os.environ.get("LOCKED_OBS_KELLY_FRACTION",  "0.75"))
-LOCKED_OBS_MAX_CONTRACTS: int       = int(os.environ.get("LOCKED_OBS_MAX_CONTRACTS",      "50"))
+LOCKED_OBS_MAX_POSITION_CENTS: int = env_int("LOCKED_OBS_MAX_POSITION_CENTS", 5000)
+LOCKED_OBS_KELLY_FRACTION: float    = env_float("LOCKED_OBS_KELLY_FRACTION", 0.75)
+LOCKED_OBS_MAX_CONTRACTS: int       = env_int("LOCKED_OBS_MAX_CONTRACTS", 50)
 _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
     "noaa_observed", "metar", "nws_climo", "nws_alert",
 })
@@ -360,7 +361,7 @@ _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
 # when entering same-direction adjacent strikes.  Prevents unlimited stacking
 # while allowing the bot to capture edge on 2-3 strikes of a temp ladder.
 # Set to 1 to restore the old behavior (single position per underlying).
-MAX_SAME_UNDERLYING_OPEN: int = int(os.environ.get("MAX_SAME_UNDERLYING_OPEN", "3"))
+MAX_SAME_UNDERLYING_OPEN: int = env_int("MAX_SAME_UNDERLYING_OPEN", 3)
 
 # Add-on (position averaging) controls.
 # When the bot already has an open position on the EXACT same ticker+side,
@@ -376,14 +377,14 @@ MAX_SAME_UNDERLYING_OPEN: int = int(os.environ.get("MAX_SAME_UNDERLYING_OPEN", "
 #   ticker + side across all trades including the original entry.  Limits
 #   total dollar exposure per market.  Default 20 contracts (≈ $10 at 50¢).
 #   Set to 0 to disable.
-ADDON_MIN_GAP_MINUTES: int = int(os.environ.get("ADDON_MIN_GAP_MINUTES", "60"))
-ADDON_MAX_TOTAL_CONTRACTS: int = int(os.environ.get("ADDON_MAX_TOTAL_CONTRACTS", "20"))
+ADDON_MIN_GAP_MINUTES: int = env_int("ADDON_MIN_GAP_MINUTES", 60)
+ADDON_MAX_TOTAL_CONTRACTS: int = env_int("ADDON_MAX_TOTAL_CONTRACTS", 20)
 
 # Band-arb YES p_win parameters.
 # Pre-lock: dynamic model adds clearance_factor + time_factor to BASE_P.
 # Locked (post-4:30 PM): flat LOCKED_P mirrors band_arb NO confidence level.
-BAND_ARB_YES_BASE_P: float = float(os.environ.get("BAND_ARB_YES_BASE_P", "0.62"))
-BAND_ARB_YES_LOCKED_P: float = float(os.environ.get("BAND_ARB_YES_LOCKED_P", "0.88"))
+BAND_ARB_YES_BASE_P: float = env_float("BAND_ARB_YES_BASE_P", 0.62)
+BAND_ARB_YES_LOCKED_P: float = env_float("BAND_ARB_YES_LOCKED_P", 0.88)
 
 # Maximum total cost basis across all currently open positions (cents).
 # Guards against correlated blowup when many weather markets are open
@@ -392,7 +393,7 @@ BAND_ARB_YES_LOCKED_P: float = float(os.environ.get("BAND_ARB_YES_LOCKED_P", "0.
 # it can compare the exact cost of the proposed trade against the live total.
 # Default $150 (15000¢) — allows ~6 locked-obs trades at ~$23 each, or ~15
 # standard trades at ~$10 each.  Set to 0 to disable.
-MAX_TOTAL_EXPOSURE_CENTS: int = int(os.environ.get("MAX_TOTAL_EXPOSURE_CENTS", "15000"))
+MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 15000)
 
 # Maximum contracts per leg for guaranteed-profit arb trades.
 # Arb sizing is not Kelly-based (P(win)=1.0 by construction) — it is capped
@@ -401,7 +402,7 @@ MAX_TOTAL_EXPOSURE_CENTS: int = int(os.environ.get("MAX_TOTAL_EXPOSURE_CENTS", "
 # Default 20: EUR/USD 37¢ arb at 20 pairs = $12.60 invested, $7.40 guaranteed.
 # Bracket arb default is lower (ARB_MAX_CONTRACTS // 2) because it places N
 # legs simultaneously and the per-event cost multiplies by bracket count.
-ARB_MAX_CONTRACTS: int = int(os.environ.get("ARB_MAX_CONTRACTS", "20"))
+ARB_MAX_CONTRACTS: int = env_int("ARB_MAX_CONTRACTS", 20)
 
 # Score-weighted position sizing.  When enabled, the Kelly count is multiplied
 # by a score-derived factor that scales linearly from SCORE_WEIGHT_MIN_FACTOR
@@ -412,13 +413,13 @@ ARB_MAX_CONTRACTS: int = int(os.environ.get("ARB_MAX_CONTRACTS", "20"))
 #   to trades that just clear the score gate.  Hardcoded to 0.25 historically;
 #   now configurable so the dead zone just above the gate can be tuned.
 # Set SCORE_WEIGHTED_SIZING=false to disable entirely.
-SCORE_WEIGHTED_SIZING: bool = os.environ.get("SCORE_WEIGHTED_SIZING", "true").lower() != "false"
-SCORE_WEIGHT_MIN_FACTOR: float = float(os.environ.get("SCORE_WEIGHT_MIN_FACTOR", "0.25"))
+SCORE_WEIGHTED_SIZING: bool = env_bool("SCORE_WEIGHTED_SIZING", True)
+SCORE_WEIGHT_MIN_FACTOR: float = env_float("SCORE_WEIGHT_MIN_FACTOR", 0.25)
 
 # Default P(win) estimate used when no per-metric prior is available.
 # 0.60 is a conservative starting point — only slightly above break-even for
 # a market priced at ~50¢.  Adjust per-metric after dry-run calibration.
-KELLY_DEFAULT_P: float = float(os.environ.get("KELLY_DEFAULT_P", "0.60"))
+KELLY_DEFAULT_P: float = env_float("KELLY_DEFAULT_P", 0.6)
 
 # Per-metric P(win) priors loaded from JSON.  Keys are metric prefixes
 # (e.g. "temp_high", "price_btc").  Set via env var after dry-run:
@@ -479,7 +480,7 @@ ADVERSE_PEAK_SOURCES: frozenset[str] = frozenset(
 # NWS day-1 forecasts have MAE ≈ 3–4°F, so edges smaller than this are
 # within normal forecast noise and carry no real signal.
 # Set to 0 to disable. Only applies to "temp_high" metrics.
-NUMERIC_MIN_TEMP_EDGE: float = float(os.environ.get("NUMERIC_MIN_TEMP_EDGE", "5.0"))
+NUMERIC_MIN_TEMP_EDGE: float = env_float("NUMERIC_MIN_TEMP_EDGE", 5.0)
 
 # Late-day UTC hour cutoff for daily temperature-high NO trades.
 # After this UTC hour the daily maximum temperature for US ET cities is
@@ -488,13 +489,13 @@ NUMERIC_MIN_TEMP_EDGE: float = float(os.environ.get("NUMERIC_MIN_TEMP_EDGE", "5.
 # at 20:11 UTC / 4:11 PM ET) is the canonical failure this prevents.
 # Only applies to tickers matching "KXHIGH" (Kalshi daily high markets).
 # Default: 19 (3 PM ET / noon PT).  Set to 0 to disable.
-TEMP_HIGH_NO_CUTOFF_UTC: int = int(os.environ.get("TEMP_HIGH_NO_CUTOFF_UTC", "19"))
+TEMP_HIGH_NO_CUTOFF_UTC: int = env_int("TEMP_HIGH_NO_CUTOFF_UTC", 19)
 
 # Minimum disagreement between model-implied P(YES) and market-implied P(YES)
 # before trading. Prevents acting on signals the market has already priced in.
 # E.g. 0.20 means our model must imply a probability ≥20pp different from the
 # market mid. Set to 0 to disable.
-NUMERIC_MIN_DISAGREEMENT: float = float(os.environ.get("NUMERIC_MIN_DISAGREEMENT", "0.15"))
+NUMERIC_MIN_DISAGREEMENT: float = env_float("NUMERIC_MIN_DISAGREEMENT", 0.15)
 
 # Extreme model-market disagreement guard.
 # When our model is very confident (implied_p > EXTREME_DISAGREE_MODEL_P) but
@@ -502,7 +503,7 @@ NUMERIC_MIN_DISAGREEMENT: float = float(os.environ.get("NUMERIC_MIN_DISAGREEMENT
 # is near-certain we are wrong — almost certainly a station mismatch, wrong
 # data source, or ticker cross.  Block unconditionally regardless of score.
 # Set EXTREME_DISAGREE_MODEL_P=0 to disable.
-EXTREME_DISAGREE_MODEL_P: float     = float(os.environ.get("EXTREME_DISAGREE_MODEL_P",     "0.85"))
+EXTREME_DISAGREE_MODEL_P: float     = env_float("EXTREME_DISAGREE_MODEL_P", 0.85)
 EXTREME_DISAGREE_MARKET_CENTS: int  = int(  os.environ.get("EXTREME_DISAGREE_MARKET_CENTS", "25"))
 # Symmetric NO-side guard: when model is very confident of NO (implied_p_yes < 1 − MODEL_P)
 # but the market is pricing YES strongly (yes_bid > this threshold), block the trade.
@@ -515,7 +516,7 @@ EXTREME_DISAGREE_NO_BID_MIN: int    = int(  os.environ.get("EXTREME_DISAGREE_NO_
 # for all cities and months — useful for quick experimentation.  When absent,
 # _temp_forecast_sigma(metric) returns a per-city seasonal value from the
 # lookup table in noaa.py (derived from published NWS NDFD verification data).
-TEMP_FORECAST_SIGMA: float = float(os.environ.get("TEMP_FORECAST_SIGMA", "4.0"))
+TEMP_FORECAST_SIGMA: float = env_float("TEMP_FORECAST_SIGMA", 4.0)
 _TEMP_SIGMA_IS_OVERRIDE: bool = "TEMP_FORECAST_SIGMA" in os.environ
 
 
@@ -557,7 +558,7 @@ def _temp_forecast_sigma(metric: str, source: str = "noaa") -> float:
 # the bot may query a different nearby station — introducing 1–3°F of
 # structural mismatch.  2.0°F keeps observed signals well above forecast
 # quality while reflecting the real inter-station uncertainty.
-NOAA_OBSERVED_SIGMA: float = float(os.environ.get("NOAA_OBSERVED_SIGMA", "2.0"))
+NOAA_OBSERVED_SIGMA: float = env_float("NOAA_OBSERVED_SIGMA", 2.0)
 
 # P(win) estimate for trades driven by observed station data (source="noaa_observed").
 # Observed temps are near-certain for NO signals (sensor confirms band crossed).
@@ -565,29 +566,29 @@ NOAA_OBSERVED_SIGMA: float = float(os.environ.get("NOAA_OBSERVED_SIGMA", "2.0"))
 # NOAA_OBSERVED_P: floor for P(win) on NO-side observed trades.
 # NOAA_OBSERVED_YES_P: floor for P(win) on YES-side observed trades.
 # Empirical YES win rate across 34 trades = 32%; 0.40 is calibrated + margin of safety.
-NOAA_OBSERVED_P: float = float(os.environ.get("NOAA_OBSERVED_P", "0.80"))
-NOAA_OBSERVED_YES_P: float = float(os.environ.get("NOAA_OBSERVED_YES_P", "0.40"))
+NOAA_OBSERVED_P: float = env_float("NOAA_OBSERVED_P", 0.8)
+NOAA_OBSERVED_YES_P: float = env_float("NOAA_OBSERVED_YES_P", 0.4)
 
 # Maximum P(YES) returned by _implied_p_yes() for forecast-only sources
 # (any source other than noaa_observed and nws_alert).  The Normal-CDF model
 # can return p > 0.999 when the edge is many sigma — but NWS day-1 forecasts
 # are not that reliable.  Capping at 0.95 prevents Kelly from over-sizing on
 # overconfident forecast signals while leaving observed-data signals uncapped.
-FORECAST_MAX_P: float = float(os.environ.get("FORECAST_MAX_P", "0.95"))
+FORECAST_MAX_P: float = env_float("FORECAST_MAX_P", 0.95)
 
 # Maximum P(YES) for crypto price signals (source="coinbase", metric="price_*").
 # The Normal-CDF model assumes Gaussian returns, but BTC/ETH exhibit fat tails
 # (flash crashes, pumps) that the model dramatically underestimates.  A p=0.9995
 # from a $6k BTC gap to strike sounds confident but a $6k intraday move is a
 # real tail risk.  0.90 is a hard ceiling regardless of edge size or time to close.
-CRYPTO_MAX_P: float = float(os.environ.get("CRYPTO_MAX_P", "0.90"))
+CRYPTO_MAX_P: float = env_float("CRYPTO_MAX_P", 0.9)
 
 # Maximum P(YES) for observed-station data (source="noaa_observed").
 # The Normal-CDF with σ=2°F can return p≈1.0 for large edges (e.g. observed
 # temp 10°F above strike), causing Kelly to over-size positions.  0.97 is
 # highly confident while preventing numerical over-betting.  Set to 1.0 to
 # disable (not recommended — Kelly explodes when p→1 and cost is small).
-NOAA_OBSERVED_MAX_P: float = float(os.environ.get("NOAA_OBSERVED_MAX_P", "0.97"))
+NOAA_OBSERVED_MAX_P: float = env_float("NOAA_OBSERVED_MAX_P", 0.97)
 
 # Crypto temporal edge: BTC/ETH/etc. price volatility scales with √t (Brownian
 # motion).  CRYPTO_REFERENCE_HOURS is the window the METRIC_EDGE_SCALES values
@@ -596,17 +597,17 @@ NOAA_OBSERVED_MAX_P: float = float(os.environ.get("NOAA_OBSERVED_MAX_P", "0.97")
 # rather than ~55%.  E.g. BTC $500 above strike with 1h to close:
 #   σ_ref = $2,500  →  σ(1h) = $2,500 × √(1/24) = $510  →  z=0.98, p≈0.84
 # Set to 0 to disable time-scaling (reverts to old flat-sigma behaviour).
-CRYPTO_REFERENCE_HOURS: float = float(os.environ.get("CRYPTO_REFERENCE_HOURS", "24.0"))
+CRYPTO_REFERENCE_HOURS: float = env_float("CRYPTO_REFERENCE_HOURS", 24.0)
 # Minimum hours_to_close to use for the sqrt scaling — prevents sigma collapsing
 # to zero in the final seconds before market close.
-CRYPTO_MIN_HOURS: float = float(os.environ.get("CRYPTO_MIN_HOURS", "0.083"))  # 5 min
+CRYPTO_MIN_HOURS: float = env_float("CRYPTO_MIN_HOURS", 0.083)  # 5 min
 
 # Hours before market close at which forecast-only trades are blocked.
 # Late in the day the forecast adds little — real outcomes are already largely
 # determined by actual conditions.  Observed-data trades (noaa_observed) are
 # exempt because station readings ARE the real conditions.
 # Set to 0 to disable.
-SAME_DAY_CUTOFF_HOURS: float = float(os.environ.get("SAME_DAY_CUTOFF_HOURS", "4.0"))
+SAME_DAY_CUTOFF_HOURS: float = env_float("SAME_DAY_CUTOFF_HOURS", 4.0)
 
 # Number of consecutive settled losses in one market category before the circuit
 # breaker trips and blocks further trades in that category.  0 = disabled.
@@ -652,7 +653,7 @@ _calibrated_source_priors: dict[str, float] = {}
 # cancelled automatically.  Only applies in live mode — passive midpoint orders
 # may take a few cycles to fill; aggressive orders should fill within seconds.
 # Set to 0 to disable automatic cancellation.
-FILL_TIMEOUT_MINUTES: int = int(os.environ.get("FILL_TIMEOUT_MINUTES", "5"))
+FILL_TIMEOUT_MINUTES: int = env_int("FILL_TIMEOUT_MINUTES", 5)
 
 # Minimum number of contracts that must be available at the relevant side of
 # the orderbook before entering a trade.  Prevents the bot from placing a
@@ -660,7 +661,7 @@ FILL_TIMEOUT_MINUTES: int = int(os.environ.get("FILL_TIMEOUT_MINUTES", "5"))
 # When the available depth is between MIN_DEPTH_CONTRACTS and the Kelly count,
 # the trade is downsized to the available depth rather than skipped entirely.
 # Set to 0 to disable.  Default: 3.
-MIN_DEPTH_CONTRACTS: int = int(os.environ.get("MIN_DEPTH_CONTRACTS", "3"))
+MIN_DEPTH_CONTRACTS: int = env_int("MIN_DEPTH_CONTRACTS", 3)
 
 # Minimum bid on our side of the book before entering a trade.
 # For a YES buy, this is the yes_bid.  For a NO buy, this is 100 − yes_ask
@@ -670,7 +671,7 @@ MIN_DEPTH_CONTRACTS: int = int(os.environ.get("MIN_DEPTH_CONTRACTS", "3"))
 # seconds of entry on contracts where the bid was already 0¢.  Setting
 # this to 2 blocks "dead on arrival" entries at the source.
 # Set to 0 to disable.  Default: 2.
-TRADE_MIN_BID_CENTS: int = int(os.environ.get("TRADE_MIN_BID_CENTS", "2"))
+TRADE_MIN_BID_CENTS: int = env_int("TRADE_MIN_BID_CENTS", 2)
 
 # ---------------------------------------------------------------------------
 # Spread (synthetic range) trading
@@ -680,18 +681,18 @@ TRADE_MIN_BID_CENTS: int = int(os.environ.get("TRADE_MIN_BID_CENTS", "2"))
 # and log only).  Read the pnl_attribution.txt output first to confirm that
 # the spread detector is identifying genuine mispricings before enabling.
 SPREAD_EXECUTION_ENABLED: bool = (
-    os.environ.get("SPREAD_EXECUTION_ENABLED", "false").lower() == "true"
+    env_bool("SPREAD_EXECUTION_ENABLED", False)
 )
 
 # Minimum P(win) required before a spread is executed.  Must exceed break-even
 # for the spread's net cost.  At total_cost=120¢, break-even p=120/200=0.60.
-SPREAD_MIN_WIN_PROB: float = float(os.environ.get("SPREAD_MIN_WIN_PROB", "0.65"))
+SPREAD_MIN_WIN_PROB: float = env_float("SPREAD_MIN_WIN_PROB", 0.65)
 
 # Kelly fraction multiplier for spreads.  Spreads carry more complexity and
 # execution risk than single-leg trades, so a more conservative fraction is
 # used by default (half of the standard KELLY_FRACTION).
 SPREAD_KELLY_FRACTION: float = float(
-    os.environ.get("SPREAD_KELLY_FRACTION", str(float(os.environ.get("KELLY_FRACTION", "0.25")) / 2))
+    os.environ.get("SPREAD_KELLY_FRACTION", str(env_float("KELLY_FRACTION", 0.25) / 2))
 )
 
 _ORDERS_PATH = "/trade-api/v2/orders"
@@ -1423,9 +1424,7 @@ class TradeExecutor:
             close_time_str = detail.get("close_time") or detail.get("expiration_time")
             if close_time_str:
                 try:
-                    close_dt = datetime.fromisoformat(
-                        close_time_str.replace("Z", "+00:00")
-                    )
+                    close_dt = parse_iso_dt(close_time_str)
                     hours_remaining = (
                         close_dt - datetime.now(timezone.utc)
                     ).total_seconds() / 3600
@@ -1505,7 +1504,7 @@ class TradeExecutor:
                 close_str = detail.get("close_time") or detail.get("expiration_time", "")
                 _applies = True
                 try:
-                    close_dt   = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                    close_dt   = parse_iso_dt(close_str)
                     meeting_dt = datetime.fromisoformat(fomc.date + "T23:59:59+00:00")
                     if close_dt > meeting_dt + timedelta(days=14):
                         _applies = False
@@ -2498,7 +2497,7 @@ class TradeExecutor:
                 ).fetchone()
                 if _last_band_row and _last_band_row[0]:
                     try:
-                        _last_band_ts = datetime.fromisoformat(_last_band_row[0].replace("Z", "+00:00"))
+                        _last_band_ts = parse_iso_dt(_last_band_row[0])
                         _band_age_min = (datetime.now(timezone.utc) - _last_band_ts).total_seconds() / 60
                         if _band_age_min < ADDON_MIN_GAP_MINUTES:
                             logging.info(
@@ -2644,9 +2643,7 @@ class TradeExecutor:
                 ).fetchone()
                 if _last_yes_row and _last_yes_row[0]:
                     try:
-                        _last_yes_ts = datetime.fromisoformat(
-                            _last_yes_row[0].replace("Z", "+00:00")
-                        )
+                        _last_yes_ts = parse_iso_dt(_last_yes_row[0])
                         _yes_age_min = (
                             datetime.now(timezone.utc) - _last_yes_ts
                         ).total_seconds() / 60

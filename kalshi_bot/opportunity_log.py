@@ -45,6 +45,7 @@ Written to `opportunity_log.db` in the project root (same directory as
 
 import logging
 import os
+from .utils import env_int
 import sqlite3
 
 from .db import open_db, OPPORTUNITY_LOG_DB
@@ -62,9 +63,9 @@ _DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 # Set to 0 to disable purging for a given table.
 # trades and circuit_breakers are never purged (tiny tables, irreplaceable).
 # ---------------------------------------------------------------------------
-RETENTION_OPPORTUNITIES_DAYS: int = int(os.environ.get("RETENTION_OPPORTUNITIES_DAYS", "30"))
-RETENTION_RAW_FORECASTS_DAYS: int = int(os.environ.get("RETENTION_RAW_FORECASTS_DAYS", "30"))
-RETENTION_PRICE_SNAPSHOTS_DAYS: int = int(os.environ.get("RETENTION_PRICE_SNAPSHOTS_DAYS", "30"))
+RETENTION_OPPORTUNITIES_DAYS: int = env_int("RETENTION_OPPORTUNITIES_DAYS", 30)
+RETENTION_RAW_FORECASTS_DAYS: int = env_int("RETENTION_RAW_FORECASTS_DAYS", 30)
+RETENTION_PRICE_SNAPSHOTS_DAYS: int = env_int("RETENTION_PRICE_SNAPSHOTS_DAYS", 30)
 
 _CREATE_RAW_FORECASTS_SQL = """
 CREATE TABLE IF NOT EXISTS raw_forecasts (

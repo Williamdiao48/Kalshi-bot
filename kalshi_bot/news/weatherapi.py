@@ -56,6 +56,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_int
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -70,7 +71,7 @@ _BASE_URL = "https://api.weatherapi.com/v1/forecast.json"
 WEATHERAPI_FORECAST_DAYS: int = min(10, max(1, int(
     os.environ.get("WEATHERAPI_FORECAST_DAYS", "3")
 )))
-WEATHERAPI_CACHE_MINUTES: int = int(os.environ.get("WEATHERAPI_CACHE_MINUTES", "15"))
+WEATHERAPI_CACHE_MINUTES: int = env_int("WEATHERAPI_CACHE_MINUTES", 15)
 
 # Per-city cache: metric → (monotonic_time, list[DataPoint])
 _city_cache: dict[str, tuple[float, list[DataPoint]]] = {}

@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta, date
 import importlib.util as _ilu
 import logging
 import os
+from .utils import env_bool, env_float, env_int, parse_iso_dt
 from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
@@ -92,12 +93,12 @@ logging.basicConfig(
 # Configuration — all overridable via environment variables
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SECONDS: int = int(os.environ.get("POLL_INTERVAL", "60"))
+POLL_INTERVAL_SECONDS: int = env_int("POLL_INTERVAL", 60)
 
 # Faster poll interval used during high-opportunity windows.  Must be ≤
 # POLL_INTERVAL_SECONDS to have any effect; if larger, it is ignored.
 # Default 20s: catches EIA repricing and band arb crossings 3× more often.
-POLL_INTERVAL_FAST: int = int(os.environ.get("POLL_INTERVAL_FAST", "20"))
+POLL_INTERVAL_FAST: int = env_int("POLL_INTERVAL_FAST", 20)
 
 # Number of minutes after each EIA/natgas release to use POLL_INTERVAL_FAST.
 # EIA KXWTI markets can reprice within 1–2 minutes of the 10:30 AM release —
@@ -113,14 +114,14 @@ POLL_INTERVAL_EIA_WINDOW_MINUTES: int = int(
 #   Mountain cities: peak by ~4:30 PM MT = 6:30 PM ET
 #   Pacific cities:  peak by ~4:30 PM PT = 7:30 PM ET
 # Expressed as integer hours (start inclusive, end exclusive).
-POLL_BAND_ARB_START_ET_HOUR: int = int(os.environ.get("POLL_BAND_ARB_START_ET_HOUR", "13"))
-POLL_BAND_ARB_END_ET_HOUR:   int = int(os.environ.get("POLL_BAND_ARB_END_ET_HOUR",   "21"))
+POLL_BAND_ARB_START_ET_HOUR: int = env_int("POLL_BAND_ARB_START_ET_HOUR", 13)
+POLL_BAND_ARB_END_ET_HOUR:   int = env_int("POLL_BAND_ARB_END_ET_HOUR", 21)
 
 # Fast inner loop: METAR + near-threshold KXHIGH price refresh between full cycles.
 # WATCH_THRESHOLD_F: cities within this many °F of a band ceiling go on the watchlist.
 # FAST_LOOP_INTERVAL: seconds between fast loop iterations during the sleep window.
-WATCH_THRESHOLD_F: float = float(os.environ.get("WATCH_THRESHOLD_F", "3.0"))
-FAST_LOOP_INTERVAL: float = float(os.environ.get("FAST_LOOP_INTERVAL", "10.0"))
+WATCH_THRESHOLD_F: float = env_float("WATCH_THRESHOLD_F", 3.0)
+FAST_LOOP_INTERVAL: float = env_float("FAST_LOOP_INTERVAL", 10.0)
 
 # Shared state between _poll() and _fast_loop().
 # _near_threshold_cities: metric keys (e.g. "temp_high_den") whose METAR reading
@@ -158,7 +159,7 @@ _last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
 # Maximum age (seconds) of the cached NOAA observed values before the fast loop
 # treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
 # the cached reading may no longer represent the current observed daily max.
-NOAA_OBS_MAX_AGE_S: float = float(os.environ.get("NOAA_OBS_MAX_AGE_S", "1800"))
+NOAA_OBS_MAX_AGE_S: float = env_float("NOAA_OBS_MAX_AGE_S", 1800.0)
 
 # Require NWS corroboration for band_arb:no signals on KXLOWT markets.
 # METAR is a spot-temperature reading at an airport station; KXLOWT markets
@@ -174,12 +175,12 @@ BAND_ARB_REQUIRE_NWS_FOR_KXLOWT: bool = os.environ.get(
 # How often to re-fetch the NUMERIC series markets (KXHIGH, KXBTCD, etc.).
 # These are the markets the bot actually trades; stale prices cause bad fills.
 # Default 60s: ~5s fetch cost, ensures prices are never more than ~90s old.
-NUMERIC_MARKET_REFRESH_INTERVAL: int = int(os.environ.get("NUMERIC_MARKET_REFRESH_INTERVAL", "60"))
+NUMERIC_MARKET_REFRESH_INTERVAL: int = env_int("NUMERIC_MARKET_REFRESH_INTERVAL", 60)
 
 # How often to re-fetch the general (text/keyword) market list.
 # Used only for Federal Register / RSS keyword matching; these markets move
 # slowly so a 5-minute cache is fine.  ~20s fetch cost, infrequent.
-GENERAL_MARKET_REFRESH_INTERVAL: int = int(os.environ.get("GENERAL_MARKET_REFRESH_INTERVAL", "300"))
+GENERAL_MARKET_REFRESH_INTERVAL: int = env_int("GENERAL_MARKET_REFRESH_INTERVAL", 300)
 
 # Legacy alias — if set, overrides both intervals for backwards compatibility.
 _MARKET_REFRESH_OVERRIDE: int | None = (
@@ -424,7 +425,7 @@ _SOURCE_GROUPS: list[dict] = [
 
 # Minimum distance from strike for numeric opportunities (0 = show all).
 # This global default applies to all non-weather numeric metrics.
-NUMERIC_MIN_EDGE: float = float(os.environ.get("NUMERIC_MIN_EDGE", "0"))
+NUMERIC_MIN_EDGE: float = env_float("NUMERIC_MIN_EDGE", 0.0)
 
 # Per-category minimum edge expressed as a fraction of each metric's reference
 # scale (METRIC_EDGE_SCALES in scoring.py).  Applied after find_numeric_opportunities
@@ -433,7 +434,7 @@ NUMERIC_MIN_EDGE: float = float(os.environ.get("NUMERIC_MIN_EDGE", "0"))
 # 0.0 = disabled (default — keeps existing behaviour).
 # Recommended starting value: 0.05 (5% of the reference scale per metric).
 # Examples at 0.05: BTC $250, ETH $15, EUR/USD 0.002, CPI 0.025pp, SPX 2.5pts.
-NUMERIC_MIN_EDGE_FRACTION: float = float(os.environ.get("NUMERIC_MIN_EDGE_FRACTION", "0.0"))
+NUMERIC_MIN_EDGE_FRACTION: float = env_float("NUMERIC_MIN_EDGE_FRACTION", 0.0)
 
 # Gate: suppress noaa_observed / metar YES signals on KXLOWT daily-low markets
 # when any forecast model predicts the daily low will be within
@@ -459,7 +460,7 @@ KXLOWT_FORECAST_CORROBORATION_MIN: int = int(
 # than the global LIQUIDITY_MAX_SPREAD (20¢) because KXLOWT markets are newer
 # and thinner — a 15¢ spread costs ~8% round-trip on a typical 50¢ contract.
 # Set to 0 to use the global spread limit for KXLOWT (disables override).
-KXLOWT_MAX_SPREAD_CENTS: int = int(os.environ.get("KXLOWT_MAX_SPREAD_CENTS", "15"))
+KXLOWT_MAX_SPREAD_CENTS: int = env_int("KXLOWT_MAX_SPREAD_CENTS", 15)
 # When noaa_observed/metar fires YES on a KXLOWT market and is NOT suppressed by
 # the contradiction gate, require at least this many forecast sources to actively
 # confirm the YES direction (fc_low > strike) before allowing the signal through.
@@ -496,13 +497,13 @@ _KXLOWT_NEAR_TERM_SOURCES: frozenset[str] = frozenset({"hrrr", "nws_hourly"})
 #   Mean error = -1.29°F (consistent underestimation → favorable for YES side)
 #   Reliable hours: 11–15 local. Unreliable: none in the 10–16 window.
 #   Recommended TRAJ_MIN_EDGE_F = 3.0°F (2× MAE).
-TRAJ_START_LOCAL_HOUR:  int   = int(os.environ.get("TRAJ_START_LOCAL_HOUR", "10"))
-TRAJ_END_LOCAL_HOUR:    int   = int(os.environ.get("TRAJ_END_LOCAL_HOUR", "16"))
-TRAJ_LOOKBACK_HOURS:    float = float(os.environ.get("TRAJ_LOOKBACK_HOURS", "2.0"))
-TRAJ_MIN_OBS:           int   = int(os.environ.get("TRAJ_MIN_OBS", "3"))
-TRAJ_MIN_SLOPE_FPH:     float = float(os.environ.get("TRAJ_MIN_SLOPE_FPH", "0.3"))
-TRAJ_MIN_HOURS_TO_PEAK: float = float(os.environ.get("TRAJ_MIN_HOURS_TO_PEAK", "0.5"))
-TRAJ_MIN_EDGE_F:        float = float(os.environ.get("TRAJ_MIN_EDGE_F", "3.0"))
+TRAJ_START_LOCAL_HOUR:  int   = env_int("TRAJ_START_LOCAL_HOUR", 10)
+TRAJ_END_LOCAL_HOUR:    int   = env_int("TRAJ_END_LOCAL_HOUR", 16)
+TRAJ_LOOKBACK_HOURS:    float = env_float("TRAJ_LOOKBACK_HOURS", 2.0)
+TRAJ_MIN_OBS:           int   = env_int("TRAJ_MIN_OBS", 3)
+TRAJ_MIN_SLOPE_FPH:     float = env_float("TRAJ_MIN_SLOPE_FPH", 0.3)
+TRAJ_MIN_HOURS_TO_PEAK: float = env_float("TRAJ_MIN_HOURS_TO_PEAK", 0.5)
+TRAJ_MIN_EDGE_F:        float = env_float("TRAJ_MIN_EDGE_F", 3.0)
 
 # City-specific typical dawn/peak hours (local). Dawn = daily minimum;
 # peak = daily maximum. Define the phase u in the parabolic diurnal model.
@@ -537,9 +538,9 @@ TRAJ_PEAK_LOCAL_HOUR: dict[str, int] = {
 # TEMP_OBSERVED_MIN_EDGE_UNDER — direction=under (observed still below strike).
 #   The observed max is a lower bound; residual afternoon warming before the
 #   4:30 PM gate is the main risk.  2°F provides adequate headroom given lag.
-TEMP_OBSERVED_MIN_EDGE_OVER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_OVER", "0.5"))
-TEMP_OBSERVED_MIN_EDGE_BETWEEN: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_BETWEEN", "0.2"))
-TEMP_OBSERVED_MIN_EDGE_UNDER: float = float(os.environ.get("TEMP_OBSERVED_MIN_EDGE_UNDER", "2.0"))
+TEMP_OBSERVED_MIN_EDGE_OVER: float = env_float("TEMP_OBSERVED_MIN_EDGE_OVER", 0.5)
+TEMP_OBSERVED_MIN_EDGE_BETWEEN: float = env_float("TEMP_OBSERVED_MIN_EDGE_BETWEEN", 0.2)
+TEMP_OBSERVED_MIN_EDGE_UNDER: float = env_float("TEMP_OBSERVED_MIN_EDGE_UNDER", 2.0)
 
 # Stricter min edge for noaa_observed/metar between YES on KXLOWT daily-low
 # markets.  Unlike KXHIGHT between YES (where the daily peak is confirmed past
@@ -561,14 +562,14 @@ KXLOWT_OBS_BETWEEN_YES_MIN_EDGE: float = float(
 # already been recorded at settlement.  Post-fix backtest shows all losses on
 # noaa_observed were at edges ≥10°F (sensor errors), while all wins were ≤10°F.
 # Cap set at 10.0°F; set to a large number to disable.
-TEMP_OBSERVED_MAX_EDGE: float = float(os.environ.get("TEMP_OBSERVED_MAX_EDGE", "10.0"))
+TEMP_OBSERVED_MAX_EDGE: float = env_float("TEMP_OBSERVED_MAX_EDGE", 10.0)
 
 # TEMP_OBSERVED_MAX_HOURS — For noaa_observed NO signals (observed max is still
 #   *below* the strike — the temperature may still rise to hit it), only surface
 #   the opportunity within this many hours of market close.  Beyond this window
 #   the remaining-day rise is too uncertain.  YES signals (observed max already
 #   *exceeds* the strike) are always surfaced — the outcome is locked.
-TEMP_OBSERVED_MAX_HOURS: float = float(os.environ.get("TEMP_OBSERVED_MAX_HOURS", "4.0"))
+TEMP_OBSERVED_MAX_HOURS: float = env_float("TEMP_OBSERVED_MAX_HOURS", 4.0)
 
 # HRRR_MAX_SPREAD_F — Maximum acceptable spread (°F) between the NWS daily
 #   forecast high and the HRRR-derived hourly daytime high.  When the two
@@ -576,7 +577,7 @@ TEMP_OBSERVED_MAX_HOURS: float = float(os.environ.get("TEMP_OBSERVED_MAX_HOURS",
 #   unstable / convectively uncertain and the daily forecast is unreliable.
 #   Signals from source="noaa" are suppressed; noaa_observed and
 #   nws_alert DataPoints are never gated (they are ground truth / official).
-HRRR_MAX_SPREAD_F: float = float(os.environ.get("HRRR_MAX_SPREAD_F", "8.0"))
+HRRR_MAX_SPREAD_F: float = env_float("HRRR_MAX_SPREAD_F", 8.0)
 
 # MORNING_OBS_GAP_F — Maximum allowed gap (°F) between the Kalshi strike and
 #   the current noaa_observed max (recorded since midnight) before a *forecast*
@@ -585,7 +586,7 @@ HRRR_MAX_SPREAD_F: float = float(os.environ.get("HRRR_MAX_SPREAD_F", "8.0"))
 #   the model says so — early-morning observations are a reality check.
 #   Example: strike=92°F, gap=15°F → observed must be ≥ 77°F to trade YES.
 #   Set to 0 to disable (allow any observed gap).
-MORNING_OBS_GAP_F: float = float(os.environ.get("MORNING_OBS_GAP_F", "20.0"))
+MORNING_OBS_GAP_F: float = env_float("MORNING_OBS_GAP_F", 20.0)
 
 # NWS_HOURLY_MAX_AGE_HOURS — Maximum age of an nws_hourly DataPoint before it
 #   is considered stale and dropped from corroboration.  nws_hourly updates every
@@ -595,14 +596,14 @@ MORNING_OBS_GAP_F: float = float(os.environ.get("MORNING_OBS_GAP_F", "20.0"))
 #   The canonical failure is trade #224: nws_hourly last fetched at 2:15 AM ET
 #   but was used to corroborate a 9:55 AM entry — 7+ hours stale.
 #   Set to 0 to disable (allow DataPoints of any age).
-NWS_HOURLY_MAX_AGE_HOURS: float = float(os.environ.get("NWS_HOURLY_MAX_AGE_HOURS", "3.0"))
+NWS_HOURLY_MAX_AGE_HOURS: float = env_float("NWS_HOURLY_MAX_AGE_HOURS", 3.0)
 
 # FORECAST_CORROBORATION_MIN — Minimum number of distinct forecast sources
 #   (from {noaa, open_meteo}) that must independently agree on a YES
 #   direction before the signal is traded.  Lone signals (only one source)
 #   are suppressed — they are more likely to be model noise than genuine alpha.
 #   Set to 1 to disable (allow single-source signals).
-FORECAST_CORROBORATION_MIN: int = int(os.environ.get("FORECAST_CORROBORATION_MIN", "2"))
+FORECAST_CORROBORATION_MIN: int = env_int("FORECAST_CORROBORATION_MIN", 2)
 
 # OBS_CONSENSUS_MIN — Minimum number of confirmed-observation sources
 #   (noaa_observed, nws_climo) that must independently agree on a YES outcome
@@ -611,13 +612,13 @@ FORECAST_CORROBORATION_MIN: int = int(os.environ.get("FORECAST_CORROBORATION_MIN
 #   the primary safety net in place of strict multi-source verification.
 #   nws_climo is only available after ~5 PM local, so OBS_CONSENSUS_MIN=2
 #   blocked all afternoon observation trades before that window.
-OBS_CONSENSUS_MIN: int = int(os.environ.get("OBS_CONSENSUS_MIN", "1"))
+OBS_CONSENSUS_MIN: int = env_int("OBS_CONSENSUS_MIN", 1)
 
 # RELEASE_WINDOW_MINUTES — (Option D) Maximum minutes after a scheduled data
 #   release during which BLS, FRED, and EIA numeric opportunities are allowed
 #   to trigger trades.  Outside this window the data is already priced in.
 #   Set to 0 to disable the gate (allow trades at any time).
-RELEASE_WINDOW_MINUTES: int = int(os.environ.get("RELEASE_WINDOW_MINUTES", "30"))
+RELEASE_WINDOW_MINUTES: int = env_int("RELEASE_WINDOW_MINUTES", 30)
 
 # EIA_MAX_STALE_DAYS — Maximum age (calendar days) of EIA data before it is
 # considered stale and dropped entirely.  EIA daily spot prices (RWTC for WTI,
@@ -628,7 +629,7 @@ RELEASE_WINDOW_MINUTES: int = int(os.environ.get("RELEASE_WINDOW_MINUTES", "30")
 # Default: 1 (allow yesterday's data; drop anything older — effectively
 # prevents trading over weekends and holidays when data is stale).
 # Set to 0 to require same-day data; set to 7 to disable the gate.
-EIA_MAX_STALE_DAYS: int = int(os.environ.get("EIA_MAX_STALE_DAYS", "1"))
+EIA_MAX_STALE_DAYS: int = env_int("EIA_MAX_STALE_DAYS", 1)
 
 # FOREX_MAX_STALE_DAYS — Maximum age (calendar days) of ECB/Frankfurter data
 # before it is considered stale.  ECB reference rates publish once per day
@@ -639,7 +640,7 @@ EIA_MAX_STALE_DAYS: int = int(os.environ.get("EIA_MAX_STALE_DAYS", "1"))
 # Default: 0 (same-day data only; yesterday's rate is blocked).
 # Set to 1 to allow yesterday's rate (e.g. while debugging); set to 7 to
 # disable the gate entirely.
-FOREX_MAX_STALE_DAYS: int = int(os.environ.get("FOREX_MAX_STALE_DAYS", "0"))
+FOREX_MAX_STALE_DAYS: int = env_int("FOREX_MAX_STALE_DAYS", 0)
 
 # GDPNOW_MAX_STALE_DAYS — Maximum age (calendar days) of the Atlanta Fed GDPNow
 # estimate before it is considered stale and dropped.  GDPNow updates ~2-3x per
@@ -649,21 +650,21 @@ FOREX_MAX_STALE_DAYS: int = int(os.environ.get("FOREX_MAX_STALE_DAYS", "0"))
 # before GDPNow starts updating for the next quarter.
 # Default: 5 (covers weekends + minor gaps; drops stale inter-quarter readings).
 # Set to 30 to disable and always use the most recent available estimate.
-GDPNOW_MAX_STALE_DAYS: int = int(os.environ.get("GDPNOW_MAX_STALE_DAYS", "5"))
+GDPNOW_MAX_STALE_DAYS: int = env_int("GDPNOW_MAX_STALE_DAYS", 5)
 
 # FOREX_CLOSE_HOURS — Gate for forex daily-fix markets (KXEURUSD, KXUSDJPY).
 # Only surface opportunities when within this many hours of the market's
 # close_time.  The ECB fixing and Kalshi resolution both land at ~10 AM ET;
 # the rate is not predictive of the fixing until it IS the fixing.
 # Set to 0 to disable.  Default: 1.0
-FOREX_CLOSE_HOURS: float = float(os.environ.get("FOREX_CLOSE_HOURS", "2.0"))
+FOREX_CLOSE_HOURS: float = env_float("FOREX_CLOSE_HOURS", 2.0)
 
 # CRYPTO_DAILY_CLOSE_HOURS — Gate for daily-close crypto markets (KXBTCD).
 # Binance returns the live intraday spot price, which can be several percent
 # away from the 5 PM ET settlement price many hours before close.  Only
 # surface KXBTCD opportunities when within this many hours of the market's
 # close_time.  Set to 0 to disable.  Default: 2.0
-CRYPTO_DAILY_CLOSE_HOURS: float = float(os.environ.get("CRYPTO_DAILY_CLOSE_HOURS", "6.0"))
+CRYPTO_DAILY_CLOSE_HOURS: float = env_float("CRYPTO_DAILY_CLOSE_HOURS", 6.0)
 
 # CONTRARIAN_MAX_ENTRY_CENTS — (Option E) Maximum cost (in cents) to enter a
 #   numeric position.  For a YES trade this is yes_ask; for a NO trade it is
@@ -671,7 +672,7 @@ CRYPTO_DAILY_CLOSE_HOURS: float = float(os.environ.get("CRYPTO_DAILY_CLOSE_HOURS
 #   data signal (cheap entry) pass this gate.  Trades where the market already
 #   agrees (expensive entry) offer no information edge.
 #   Set to 0 to disable (allow any price).
-CONTRARIAN_MAX_ENTRY_CENTS: int = int(os.environ.get("CONTRARIAN_MAX_ENTRY_CENTS", "65"))
+CONTRARIAN_MAX_ENTRY_CENTS: int = env_int("CONTRARIAN_MAX_ENTRY_CENTS", 65)
 
 # MARKET_MIN_PRICE_CENTS — Mirror of CONTRARIAN_MAX_ENTRY_CENTS.
 #   The contrarian gate blocks expensive entries (market agrees → priced in).
@@ -690,7 +691,7 @@ CONTRARIAN_MAX_ENTRY_CENTS: int = int(os.environ.get("CONTRARIAN_MAX_ENTRY_CENTS
 #   Raised from 8→10: a YES ask of 8¢ on a near-certain noaa_observed signal
 #   is almost always a station mismatch (different NWS resolution station),
 #   not a real arbitrage opportunity.
-MARKET_MIN_PRICE_CENTS: int = int(os.environ.get("MARKET_MIN_PRICE_CENTS", "10"))
+MARKET_MIN_PRICE_CENTS: int = env_int("MARKET_MIN_PRICE_CENTS", 10)
 
 # Maximum yes_ask for noaa_observed YES direction=over entries.
 # When the observed temperature ALREADY exceeds the strike (direction=over), the
@@ -711,23 +712,23 @@ NOAA_OBS_OVER_MAX_ENTRY_CENTS: int = int(
 # Maximum days until market close to consider for text matching.
 # Markets resolving further out than this are excluded — today's news
 # rarely provides actionable alpha on a market that settles in 2 years.
-MARKET_MAX_DAYS_OUT: int = int(os.environ.get("MARKET_MAX_DAYS_OUT", "30"))
+MARKET_MAX_DAYS_OUT: int = env_int("MARKET_MAX_DAYS_OUT", 30)
 
 # Minimum minutes until market close. Markets closing sooner than this
 # (including already-closed markets still listed as "open") are dropped.
 # Prevents betting on markets that have already resolved or are in their
 # final minutes where information edge can't be acted on in time.
-MARKET_MIN_MINUTES_TO_CLOSE: int = int(os.environ.get("MARKET_MIN_MINUTES_TO_CLOSE", "30"))
+MARKET_MIN_MINUTES_TO_CLOSE: int = env_int("MARKET_MIN_MINUTES_TO_CLOSE", 30)
 
 # Liquidity filters applied after orderbook enrichment.
 # Set LIQUIDITY_MAX_SPREAD=0 to disable spread filtering.
-LIQUIDITY_MAX_SPREAD: int = int(os.environ.get("LIQUIDITY_MAX_SPREAD", "10"))
-LIQUIDITY_MIN_VOLUME: int = int(os.environ.get("LIQUIDITY_MIN_VOLUME", "0"))
+LIQUIDITY_MAX_SPREAD: int = env_int("LIQUIDITY_MAX_SPREAD", 10)
+LIQUIDITY_MIN_VOLUME: int = env_int("LIQUIDITY_MIN_VOLUME", 0)
 
 # Cross-cycle display cooldown. If the same (ticker, signal) pair was surfaced
 # within this many minutes, it is suppressed from stdout (but a fresh signal
 # type on the same ticker will still surface). Set to 0 to disable suppression.
-OPPORTUNITY_COOLDOWN_MINUTES: int = int(os.environ.get("OPPORTUNITY_COOLDOWN_MINUTES", "60"))
+OPPORTUNITY_COOLDOWN_MINUTES: int = env_int("OPPORTUNITY_COOLDOWN_MINUTES", 60)
 
 # Post-exit re-entry cooldown.
 # After a stop_loss or trailing_stop exit on a ticker, block re-entry into
@@ -742,34 +743,34 @@ OPPORTUNITY_COOLDOWN_MINUTES: int = int(os.environ.get("OPPORTUNITY_COOLDOWN_MIN
 # Profit-take exits are NOT blocked — a market that hit its profit target
 # may still have actionable upside worth re-entering.
 # Set to 0 to disable.
-EXIT_REENTRY_COOLDOWN_MINUTES: int = int(os.environ.get("EXIT_REENTRY_COOLDOWN_MINUTES", "240"))
+EXIT_REENTRY_COOLDOWN_MINUTES: int = env_int("EXIT_REENTRY_COOLDOWN_MINUTES", 240)
 
 # Minimum absolute net position (in contracts) at which an opportunity in that
 # market is suppressed from display. Prevents re-alerting on a market where we
 # already hold a meaningful position. Set to 0 to always surface all markets
 # regardless of existing exposure.
-POSITION_SKIP_CONTRACTS: int = int(os.environ.get("POSITION_SKIP_CONTRACTS", "5"))
+POSITION_SKIP_CONTRACTS: int = env_int("POSITION_SKIP_CONTRACTS", 5)
 
 # Manifold consensus gate.  Manifold-only signals with divergence above this
 # threshold are blocked unless Polymarket or Metaculus independently agrees on
 # the same Kalshi ticker.  Real-money platforms rarely sustain 50%+ divergences
 # — if only Manifold shows it, it is almost certainly stale/frozen data.
 # Set to 0 to disable.
-MANI_MAX_SOLO_DIVERGENCE: float = float(os.environ.get("MANI_MAX_SOLO_DIVERGENCE", "0.50"))
+MANI_MAX_SOLO_DIVERGENCE: float = env_float("MANI_MAX_SOLO_DIVERGENCE", 0.5)
 
 # Manifold hard cap.  Manifold opportunities with divergence above this threshold
 # are ALWAYS blocked, even if Polymarket or Metaculus corroborates.  A 40%+
 # divergence (Manifold 85%, Kalshi 45%) is almost certainly a stale Manifold
 # market or a matching error — legitimate Kalshi mispricings rarely exceed 30–35pp.
 # Set to 0 to disable.
-MANI_HARD_CAP_DIVERGENCE: float = float(os.environ.get("MANI_HARD_CAP_DIVERGENCE", "0.40"))
+MANI_HARD_CAP_DIVERGENCE: float = env_float("MANI_HARD_CAP_DIVERGENCE", 0.4)
 
 # Maximum number of simultaneously open temperature (KXHIGH*) positions.
 # When this many temperature positions are already open, new temperature numeric
 # opportunities are skipped for the cycle.  Prevents a single weather system
 # from flooding the portfolio with 15–20 correlated positions that all win or
 # lose together.  Set to 0 to disable.  Default: 8.
-TEMP_MAX_CONCURRENT_POSITIONS: int = int(os.environ.get("TEMP_MAX_CONCURRENT_POSITIONS", "8"))
+TEMP_MAX_CONCURRENT_POSITIONS: int = env_int("TEMP_MAX_CONCURRENT_POSITIONS", 8)
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +870,7 @@ def _filter_by_close_time(
             result.append(m)
             continue
         try:
-            close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+            close_dt = parse_iso_dt(ct)
             if max_cutoff is not None and close_dt > max_cutoff:
                 continue
             if min_cutoff is not None and close_dt < min_cutoff:
@@ -900,7 +901,7 @@ def _days_to_close(ticker: str, ticker_detail: dict[str, dict]) -> float:
     if not ct:
         return float("inf")
     try:
-        close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        close_dt = parse_iso_dt(ct)
         delta = close_dt - datetime.now(timezone.utc)
         return max(0.0, delta.total_seconds() / 86_400)
     except (ValueError, AttributeError):
@@ -955,7 +956,7 @@ _CITY_TZ.update({
 # Minimum local hour before a noaa_observed YES trade is allowed.
 # Daily temp max is typically established 1–5 PM local; before 1 PM the
 # "observed" max is still a morning partial reading — not a confirmed high.
-NOAA_OBS_YES_MIN_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_YES_MIN_LOCAL_HOUR", "13"))
+NOAA_OBS_YES_MIN_LOCAL_HOUR: int = env_int("NOAA_OBS_YES_MIN_LOCAL_HOUR", 13)
 
 # Stricter minimum local hour for "below threshold" YES signals (direction=under).
 # Observed 66°F against a 76°F strike is only a locked signal AFTER the daily
@@ -963,8 +964,8 @@ NOAA_OBS_YES_MIN_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_YES_MIN_LOCAL_HO
 # warming.  Daily highs are typically established by 4 PM local; requiring
 # local hour >= 16 ensures we're already in the cooling-off phase before
 # committing to "temp will stay below strike".
-NOAA_OBS_PEAK_PAST_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LOCAL_HOUR", "16"))
-NOAA_OBS_PEAK_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LOCAL_MINUTE", "30"))
+NOAA_OBS_PEAK_PAST_LOCAL_HOUR: int = env_int("NOAA_OBS_PEAK_PAST_LOCAL_HOUR", 16)
+NOAA_OBS_PEAK_PAST_LOCAL_MINUTE: int = env_int("NOAA_OBS_PEAK_PAST_LOCAL_MINUTE", 30)
 
 # Morning gate for low-temperature observed YES signals (direction=over on
 # temp_low_* metrics).  The running daily minimum resets at local midnight and
@@ -974,8 +975,8 @@ NOAA_OBS_PEAK_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_PEAK_PAST_LO
 # and the running min is a reliable confirmed floor.
 # Default: 05:00 local (typically past the overnight low trough).
 # Override via NOAA_OBS_LOW_PAST_LOCAL_HOUR / _MINUTE env vars.
-NOAA_OBS_LOW_PAST_LOCAL_HOUR: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_HOUR", "5"))
-NOAA_OBS_LOW_PAST_LOCAL_MINUTE: int = int(os.environ.get("NOAA_OBS_LOW_PAST_LOCAL_MINUTE", "0"))
+NOAA_OBS_LOW_PAST_LOCAL_HOUR: int = env_int("NOAA_OBS_LOW_PAST_LOCAL_HOUR", 5)
+NOAA_OBS_LOW_PAST_LOCAL_MINUTE: int = env_int("NOAA_OBS_LOW_PAST_LOCAL_MINUTE", 0)
 
 # Forecast floor gate for noaa_observed temp_low YES signals.
 # After the morning trough, temps rise during the day then drop again at sunset.
@@ -993,7 +994,7 @@ TEMP_LOW_YES_FORECAST_BUFFER_F: float = float(
 # If True (default), suppress YES when no tonight forecast is available.
 # Set to 'false' to fall back to pre-fix behavior (allow without forecast).
 TEMP_LOW_YES_REQUIRE_FORECAST: bool = (
-    os.environ.get("TEMP_LOW_YES_REQUIRE_FORECAST", "true").lower() == "true"
+    env_bool("TEMP_LOW_YES_REQUIRE_FORECAST", True)
 )
 # Only enforce the TEMP_LOW_YES_REQUIRE_FORECAST gate at or after this local
 # hour.  Before this hour the signal is about the confirmed overnight/morning
@@ -1120,7 +1121,7 @@ def _gate_date_alignment(
     """Return False if opp should be dropped due to date mismatch, True otherwise."""
     if opp.as_of:
         try:
-            as_of_utc = datetime.fromisoformat(opp.as_of.replace("Z", "+00:00"))
+            as_of_utc = parse_iso_dt(opp.as_of)
             as_of_et_date = as_of_utc.astimezone(_ET).date()
             market_date = _ticker_date(opp.market_ticker)
             if market_date is not None and market_date != as_of_et_date:
@@ -1291,9 +1292,7 @@ def _filter_weather_opportunities(
         ct = m.get("close_time") or m.get("expiration_time")
         if ct:
             try:
-                close_dt_by_ticker[ticker] = datetime.fromisoformat(
-                    ct.replace("Z", "+00:00")
-                )
+                close_dt_by_ticker[ticker] = parse_iso_dt(ct)
             except (ValueError, AttributeError):
                 close_dt_by_ticker[ticker] = None
         else:
@@ -1876,7 +1875,7 @@ def _apply_forecast_consensus(
                     continue
                 try:
                     _fc_date = (
-                        datetime.fromisoformat(_fc.as_of.replace("Z", "+00:00"))
+                        parse_iso_dt(_fc.as_of)
                         .astimezone(_ET)
                         .date()
                     )
@@ -3007,7 +3006,7 @@ async def _poll(
             ct_str = close_dt_index.get(opp.market_ticker)
             if ct_str:
                 try:
-                    close_dt = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    close_dt = parse_iso_dt(ct_str)
                     hours_to_close = (close_dt - now_utc).total_seconds() / 3600
                     if hours_to_close <= CRYPTO_DAILY_CLOSE_HOURS:
                         passed_cc.append(opp)
@@ -3062,7 +3061,7 @@ async def _poll(
             ct_str = fx_close_dt_index.get(opp.market_ticker)
             if ct_str:
                 try:
-                    close_dt = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    close_dt = parse_iso_dt(ct_str)
                     hours_to_close = (close_dt - now_utc).total_seconds() / 3600
                     if hours_to_close <= FOREX_CLOSE_HOURS:
                         passed_fx.append(opp)

@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import logging
 import os
+from .utils import env_bool, env_int
 from dataclasses import dataclass, field
 from typing import Any
 
-BRACKET_ARB_MIN_PROFIT: int = int(os.environ.get("BRACKET_ARB_MIN_PROFIT", "2"))
+BRACKET_ARB_MIN_PROFIT: int = env_int("BRACKET_ARB_MIN_PROFIT", 2)
 BRACKET_ARB_ENABLED: bool = (
-    os.environ.get("BRACKET_ARB_ENABLED", "true").lower() != "false"
+    env_bool("BRACKET_ARB_ENABLED", True)
 )
 
 _MIN_BRACKETS = 3   # require at least this many brackets to qualify a group

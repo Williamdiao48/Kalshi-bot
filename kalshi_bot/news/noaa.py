@@ -48,6 +48,7 @@ _PHX = ZoneInfo("America/Phoenix")    # no DST observed in Arizona
 
 import aiohttp
 
+from ..utils import parse_iso_dt
 from ..data import DataPoint
 
 # NWS requires a descriptive User-Agent or requests get rejected
@@ -584,9 +585,7 @@ async def _fetch_high_temp(
     for dp in daytime_periods[1:7]:
         try:
             ext_temp = float(dp["temperature"])
-            period_start_dt = datetime.fromisoformat(
-                dp["startTime"].replace("Z", "+00:00")
-            ).astimezone(city_tz)
+            period_start_dt = parse_iso_dt(dp["startTime"]).astimezone(city_tz)
             period_start = period_start_dt.date()
         except (KeyError, ValueError, TypeError):
             continue
@@ -780,9 +779,7 @@ async def _fetch_low_temp(
     for np_ in nighttime_periods[:5]:
         try:
             low_temp = float(np_["temperature"])
-            period_start_dt = datetime.fromisoformat(
-                np_["startTime"].replace("Z", "+00:00")
-            ).astimezone(city_tz)
+            period_start_dt = parse_iso_dt(np_["startTime"]).astimezone(city_tz)
             period_start = period_start_dt.date()
         except (KeyError, ValueError, TypeError):
             continue

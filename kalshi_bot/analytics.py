@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from .utils import env_float, env_int, parse_iso_dt
 import sqlite3
 import statistics
 from collections import defaultdict
@@ -55,7 +56,7 @@ from .market_parser import TICKER_TO_METRIC
 _DEFAULT_DB_PATH  = OPPORTUNITY_LOG_DB
 _DEFAULT_OUT_PATH = Path(__file__).parent.parent / "pnl_attribution.txt"
 
-ANALYTICS_LOOKBACK_DAYS: int = int(os.environ.get("ANALYTICS_LOOKBACK_DAYS", "30"))
+ANALYTICS_LOOKBACK_DAYS: int = env_int("ANALYTICS_LOOKBACK_DAYS", 30)
 ANALYTICS_MODE: str = os.environ.get("ANALYTICS_MODE", "dry_run")
 PNL_ATTRIBUTION_PATH: Path = Path(
     os.environ.get("PNL_ATTRIBUTION_PATH", str(_DEFAULT_OUT_PATH))
@@ -337,7 +338,7 @@ def _section(
 # Risk metrics
 # ---------------------------------------------------------------------------
 
-_ANALYTICS_STARTING_CAPITAL: float = float(os.environ.get("DRY_RUN_STARTING_CAPITAL", "100")) * 100
+_ANALYTICS_STARTING_CAPITAL: float = env_float("DRY_RUN_STARTING_CAPITAL", 100.0) * 100
 
 
 def _compute_risk_metrics(trades: list[_ResolvedTrade]) -> dict:
@@ -376,8 +377,8 @@ def _compute_risk_metrics(trades: list[_ResolvedTrade]) -> dict:
     # Annualisation based on date range
     n = len(returns)
     try:
-        t0 = datetime.fromisoformat(trades[0].logged_at.replace("Z", "+00:00"))
-        t1 = datetime.fromisoformat(trades[-1].logged_at.replace("Z", "+00:00"))
+        t0 = parse_iso_dt(trades[0].logged_at)
+        t1 = parse_iso_dt(trades[-1].logged_at)
         years = max((t1 - t0).total_seconds() / 31_557_600, 1 / 365)
         tpy   = n / years
     except (ValueError, AttributeError):

@@ -31,6 +31,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_bool
 from datetime import datetime, timezone
 
 import aiohttp
@@ -38,7 +39,7 @@ import aiohttp
 from ..data import DataPoint
 
 YAHOO_FOREX_ENABLED: bool = (
-    os.environ.get("YAHOO_FOREX_ENABLED", "true").lower() != "false"
+    env_bool("YAHOO_FOREX_ENABLED", True)
 )
 
 _BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"

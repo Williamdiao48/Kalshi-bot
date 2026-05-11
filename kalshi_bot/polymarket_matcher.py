@@ -34,6 +34,7 @@ discriminating tokens.
 """
 
 import os
+from .utils import env_float
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -47,10 +48,10 @@ from .news.predictit import PredictItContract, PDIT_MIN_DIVERGENCE, PDIT_MIN_VOL
 # Configuration
 # ---------------------------------------------------------------------------
 
-POLY_MIN_DIVERGENCE: float  = float(os.environ.get("POLY_MIN_DIVERGENCE",  "0.20"))
-POLY_MAX_DIVERGENCE: float  = float(os.environ.get("POLY_MAX_DIVERGENCE",  "0.65"))
-POLY_MIN_LIQUIDITY:  float  = float(os.environ.get("POLY_MIN_LIQUIDITY",   "5000"))
-POLY_MIN_MATCH_SCORE: float = float(os.environ.get("POLY_MIN_MATCH_SCORE", "0.40"))
+POLY_MIN_DIVERGENCE: float  = env_float("POLY_MIN_DIVERGENCE", 0.2)
+POLY_MAX_DIVERGENCE: float  = env_float("POLY_MAX_DIVERGENCE", 0.65)
+POLY_MIN_LIQUIDITY:  float  = env_float("POLY_MIN_LIQUIDITY", 5000.0)
+POLY_MIN_MATCH_SCORE: float = env_float("POLY_MIN_MATCH_SCORE", 0.4)
 
 
 # ---------------------------------------------------------------------------

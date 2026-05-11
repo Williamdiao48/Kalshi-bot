@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import logging
 import os
+from ..utils import env_float, env_int
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -99,8 +100,8 @@ from ..numeric_matcher import NumericOpportunity
 # Configuration
 # ---------------------------------------------------------------------------
 
-WH_MATCH_THRESHOLD: float = float(os.environ.get("WH_MATCH_THRESHOLD", "0.25"))
-WH_POLL_INTERVAL:   int   = int(os.environ.get("WH_POLL_INTERVAL", "60"))
+WH_MATCH_THRESHOLD: float = env_float("WH_MATCH_THRESHOLD", 0.25)
+WH_POLL_INTERVAL:   int   = env_int("WH_POLL_INTERVAL", 60)
 
 _FEED_URL = "https://www.whitehouse.gov/briefing-room/presidential-actions/feed/"
 _HEADERS  = {"User-Agent": "kalshi-bot/1.0 (educational; contact: user@example.com)"}

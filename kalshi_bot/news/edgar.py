@@ -37,13 +37,14 @@ Normalized document format (compatible with matcher.py and SeenDocuments):
 import html
 import logging
 import os
+from ..utils import env_int
 import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
 import aiohttp
 
-EDGAR_FETCH_COUNT: int = int(os.environ.get("EDGAR_FETCH_COUNT", "40"))
+EDGAR_FETCH_COUNT: int = env_int("EDGAR_FETCH_COUNT", 40)
 
 _EDGAR_URL = (
     "https://www.sec.gov/cgi-bin/browse-edgar"

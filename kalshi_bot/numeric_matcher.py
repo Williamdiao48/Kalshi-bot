@@ -31,6 +31,7 @@ Environment variables
 
 import logging
 import os
+from .utils import parse_iso_dt
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -341,7 +342,7 @@ def find_numeric_opportunities(
         ct_str = m.get("close_time") or m.get("expiration_time")
         if ct_str:
             try:
-                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                ct = parse_iso_dt(ct_str)
                 close_time_by_ticker[ticker] = max(0.0, (ct - now_utc).total_seconds() / 3600)
             except (ValueError, TypeError):
                 close_time_by_ticker[ticker] = None
@@ -384,7 +385,7 @@ def find_numeric_opportunities(
                 if _city_info is not None:
                     _city_tz = _city_info[3]
                     try:
-                        _as_of_dt = datetime.fromisoformat(dp.as_of.replace("Z", "+00:00"))
+                        _as_of_dt = parse_iso_dt(dp.as_of)
                         _dp_local_date = _as_of_dt.astimezone(_city_tz).date()
                     except (ValueError, AttributeError):
                         _dp_local_date = None

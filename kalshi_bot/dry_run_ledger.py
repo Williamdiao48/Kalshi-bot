@@ -70,6 +70,7 @@ with exit event data in the ``trades`` table, it enables queries such as:
 import logging
 import math
 import os
+from .utils import env_float, parse_iso_dt
 import sqlite3
 
 from .db import open_db, OPPORTUNITY_LOG_DB
@@ -88,7 +89,7 @@ _DEFAULT_OVERVIEW_PATH = Path(__file__).parent.parent / "dry_run_overview.txt"
 
 # Starting paper capital in cents (default $100.00 = 10_000¢).
 STARTING_CAPITAL_CENTS: int = int(
-    float(os.environ.get("DRY_RUN_STARTING_CAPITAL", "100")) * 100
+    env_float("DRY_RUN_STARTING_CAPITAL", 100.0) * 100
 )
 OVERVIEW_PATH: Path = Path(
     os.environ.get("DRY_RUN_OVERVIEW_PATH", str(_DEFAULT_OVERVIEW_PATH))
@@ -546,8 +547,8 @@ class DryRunLedger:
         # Annualisation factor based on actual date range
         n = len(returns)
         try:
-            t0 = datetime.fromisoformat(resolved[0].logged_at.replace("Z", "+00:00"))
-            t1 = datetime.fromisoformat(resolved[-1].logged_at.replace("Z", "+00:00"))
+            t0 = parse_iso_dt(resolved[0].logged_at)
+            t1 = parse_iso_dt(resolved[-1].logged_at)
             years = max((t1 - t0).total_seconds() / 31_557_600, 1 / 365)
             tpy   = n / years
         except (ValueError, AttributeError):
@@ -965,9 +966,7 @@ class DryRunLedger:
             days_to_close: float | None = None
             if t.close_time:
                 try:
-                    ct = datetime.fromisoformat(
-                        t.close_time.replace("Z", "+00:00")
-                    )
+                    ct = parse_iso_dt(t.close_time)
                     days_to_close = (ct - now).total_seconds() / 86400
                 except (ValueError, TypeError):
                     pass

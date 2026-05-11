@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import math
 import os
+from .utils import env_float
 
 from .matcher import Opportunity
 from .numeric_matcher import NumericOpportunity
@@ -498,7 +499,7 @@ def score_poly_opportunity(
 # (moved here from main.py so scoring owns all threshold config)
 # ---------------------------------------------------------------------------
 
-TEMP_FORECAST_MIN_EDGE: float = float(os.environ.get("TEMP_FORECAST_MIN_EDGE", "5.0"))
+TEMP_FORECAST_MIN_EDGE: float = env_float("TEMP_FORECAST_MIN_EDGE", 5.0)
 TEMP_LOW_FORECAST_MIN_EDGE: float = float(
     os.environ.get("TEMP_LOW_FORECAST_MIN_EDGE", "6.0")
 )

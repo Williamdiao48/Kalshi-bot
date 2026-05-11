@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from .utils import env_float
 import re
 from typing import Any
 
@@ -30,8 +31,8 @@ from .data import DataPoint
 from .numeric_matcher import NumericOpportunity
 from .market_parser import _OVER_RE, _UNDER_RE, _BETWEEN_RE, _to_float
 
-BOX_OFFICE_MIN_MATCH: float = float(os.environ.get("BOX_OFFICE_MIN_MATCH", "0.40"))
-BOX_OFFICE_MIN_EDGE_M: float = float(os.environ.get("BOX_OFFICE_MIN_EDGE_M", "10.0"))
+BOX_OFFICE_MIN_MATCH: float = env_float("BOX_OFFICE_MIN_MATCH", 0.4)
+BOX_OFFICE_MIN_EDGE_M: float = env_float("BOX_OFFICE_MIN_EDGE_M", 10.0)
 
 # Keywords that identify a Kalshi market as a box office market.
 _BO_KEYWORDS = ("opening weekend", "box office", "weekend gross", "weekend box", "domestic gross")

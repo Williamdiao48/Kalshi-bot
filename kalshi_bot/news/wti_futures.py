@@ -32,6 +32,7 @@ Environment variables
 
 import logging
 import os
+from ..utils import env_bool
 from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
@@ -39,7 +40,7 @@ import aiohttp
 from ..data import DataPoint
 
 WTI_FUTURES_ENABLED: bool = (
-    os.environ.get("WTI_FUTURES_ENABLED", "true").lower() != "false"
+    env_bool("WTI_FUTURES_ENABLED", True)
 )
 
 # Yahoo Finance base URL for a specific CME contract, e.g. CLK26.NYM

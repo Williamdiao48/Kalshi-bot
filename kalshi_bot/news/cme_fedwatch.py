@@ -28,6 +28,7 @@ FOMCMeeting.hike_prob  — probability of at least one 25bp hike
 
 import logging
 import os
+from ..utils import env_float
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,7 +56,7 @@ CME_FEDWATCH_CACHE_MINUTES: float = float(
 # update in .env when the Fed changes rates.  Used to compute the expected
 # post-meeting rate from CME FedWatch cut/hold/hike probabilities.
 # Default: 4.50% (rate as of 2026-03).
-CME_CURRENT_RATE: float = float(os.environ.get("CME_CURRENT_RATE", "4.50"))
+CME_CURRENT_RATE: float = env_float("CME_CURRENT_RATE", 4.5)
 
 
 @dataclass

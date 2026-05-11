@@ -53,6 +53,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_int
 import time
 from collections import defaultdict
 from datetime import datetime, time as _dtime, timedelta, timezone
@@ -65,8 +66,8 @@ from .noaa import CITIES, KALSHI_STATION_IDS
 
 _BASE_URL = "https://aviationweather.gov/api/data/metar"
 
-METAR_CACHE_SECONDS: int = int(os.environ.get("METAR_CACHE_SECONDS", "30"))
-METAR_LOOKBACK_HOURS: int = int(os.environ.get("METAR_LOOKBACK_HOURS", "24"))
+METAR_CACHE_SECONDS: int = env_int("METAR_CACHE_SECONDS", 30)
+METAR_LOOKBACK_HOURS: int = env_int("METAR_LOOKBACK_HOURS", 24)
 
 # Reverse map: ICAO station ID → metric key (e.g. "KNYC" → "temp_high_ny")
 _STATION_TO_METRIC: dict[str, str] = {

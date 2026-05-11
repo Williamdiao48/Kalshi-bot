@@ -96,6 +96,7 @@ After settlement, compare captured vs. hypothetical hold P&L:
 import json
 import logging
 import os
+from .utils import env_bool, env_float, env_int, parse_iso_dt
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -115,8 +116,8 @@ if TYPE_CHECKING:
 # Config
 # ---------------------------------------------------------------------------
 
-EXIT_PROFIT_TAKE: float = float(os.environ.get("EXIT_PROFIT_TAKE", "0.20"))
-EXIT_STOP_LOSS: float   = float(os.environ.get("EXIT_STOP_LOSS",   "0.70"))
+EXIT_PROFIT_TAKE: float = env_float("EXIT_PROFIT_TAKE", 0.2)
+EXIT_STOP_LOSS: float   = env_float("EXIT_STOP_LOSS", 0.7)
 
 # Tight stop-loss for YES trades on KXLOWT (daily-low) markets backed by
 # observed sources (noaa_observed, metar).  Unlike KXHIGHT observed YES trades
@@ -124,7 +125,7 @@ EXIT_STOP_LOSS: float   = float(os.environ.get("EXIT_STOP_LOSS",   "0.70"))
 # running-minimum above the strike is not locked — temps can still fall due to
 # cold fronts.  A tight SL cuts losses quickly if the market moves against us.
 # Set to 0 to disable (falls back to source-specific EXIT_SOURCE_STOP_LOSS).
-KXLOWT_OBS_YES_STOP_LOSS: float = float(os.environ.get("KXLOWT_OBS_YES_STOP_LOSS", "0.20"))
+KXLOWT_OBS_YES_STOP_LOSS: float = env_float("KXLOWT_OBS_YES_STOP_LOSS", 0.2)
 
 # Dynamic stop widening for KXLOWT YES positions far from close.
 # KXLOWT markets are illiquid overnight (5–15¢ bid-ask spreads common from
@@ -164,21 +165,21 @@ CAPITAL_RECYCLE_SOURCES: frozenset[str] = frozenset(
 )
 # Minimum current NO value (¢) to be eligible.  At 97¢ the YES bid is ≤ 3¢ —
 # the market has essentially priced in settlement.  Set to 0 to disable recycling.
-CAPITAL_RECYCLE_MIN_NO_VALUE: int = int(os.environ.get("CAPITAL_RECYCLE_MIN_NO_VALUE", "97"))
+CAPITAL_RECYCLE_MIN_NO_VALUE: int = env_int("CAPITAL_RECYCLE_MIN_NO_VALUE", 97)
 
 # Contra-signal exit: if this many independent real-time sources all say NO on
 # a ticker where we hold a noaa_day2:yes between position, exit immediately.
 # Eligible sources: noaa_observed, metar, hrrr, open_meteo, nws_hourly.
 # CONTRA_SIGNAL_MIN_EDGE_F: each source must have at least this edge (°F) on
 # its NO signal to count (filters out marginal forecasts near the band edge).
-CONTRA_SIGNAL_MIN_SOURCES: int   = int(os.environ.get("CONTRA_SIGNAL_MIN_SOURCES", "2"))
-CONTRA_SIGNAL_MIN_EDGE_F:  float = float(os.environ.get("CONTRA_SIGNAL_MIN_EDGE_F",  "3.0"))
+CONTRA_SIGNAL_MIN_SOURCES: int   = env_int("CONTRA_SIGNAL_MIN_SOURCES", 2)
+CONTRA_SIGNAL_MIN_EDGE_F:  float = env_float("CONTRA_SIGNAL_MIN_EDGE_F", 3.0)
 
 # Forecast NO signal invalidation: exit open forecast_no positions when the
 # anchor models that originally qualified the signal now predict the wrong outcome.
 # Anchor sources mirror FORECAST_NO_REQUIRE_NEAR_TERM — the high-reliability models.
 FORECAST_NO_INVALIDATION_ENABLED: bool = (
-    os.environ.get("FORECAST_NO_INVALIDATION_ENABLED", "true").lower() != "false"
+    env_bool("FORECAST_NO_INVALIDATION_ENABLED", True)
 )
 FORECAST_NO_INVALIDATION_MIN_ANCHORS: int = int(
     os.environ.get("FORECAST_NO_INVALIDATION_MIN_ANCHORS", "1")
@@ -460,7 +461,7 @@ BAND_ARB_YES_EXIT_PRICE_CENTS: int = int(
 # Post-close markets show bid=0/ask=100 (pre-settlement), so normal exits can't
 # fire.  If the bot was shut down before settlement was detected, this sweep uses
 # the last known price snapshot to infer and record the outcome.
-STALE_TRADE_HOURS: float = float(os.environ.get("STALE_TRADE_HOURS", "2.0"))
+STALE_TRADE_HOURS: float = env_float("STALE_TRADE_HOURS", 2.0)
 _STALE_NO_WIN_BID:  int = 5   # last yes_bid ≤ this → infer NO win
 _STALE_YES_WIN_BID: int = 95  # last yes_bid ≥ this → infer YES win
 
@@ -704,9 +705,7 @@ class ExitManager:
             # Skip trades that haven't been held long enough yet.
             if _min_hold_cutoff is not None:
                 try:
-                    logged = datetime.fromisoformat(
-                        trade.logged_at.replace("Z", "+00:00")
-                    )
+                    logged = parse_iso_dt(trade.logged_at)
                     if logged > _min_hold_cutoff:
                         continue
                 except (AttributeError, ValueError):
@@ -803,7 +802,7 @@ class ExitManager:
             ct_str = getattr(trade, "close_time", None)
             if ct_str:
                 try:
-                    ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    ct = parse_iso_dt(ct_str)
                     hours_to_close = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
                 except (ValueError, TypeError):
                     pass
@@ -1128,9 +1127,7 @@ class ExitManager:
             # Skip trades within the minimum hold window.
             if _cs_min_hold_cutoff is not None:
                 try:
-                    logged = datetime.fromisoformat(
-                        trade.logged_at.replace("Z", "+00:00")
-                    )
+                    logged = parse_iso_dt(trade.logged_at)
                     if logged > _cs_min_hold_cutoff:
                         continue
                 except (AttributeError, ValueError):
@@ -1589,7 +1586,7 @@ class ExitManager:
             if not ct_str:
                 continue
             try:
-                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                ct = parse_iso_dt(ct_str)
                 hours_past = (now_utc - ct).total_seconds() / 3600
             except (ValueError, TypeError):
                 continue

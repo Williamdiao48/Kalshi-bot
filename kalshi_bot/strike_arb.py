@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import os
+from .utils import env_bool, env_float, env_int, parse_iso_dt
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, date
@@ -93,10 +94,10 @@ if _bias_path.exists():
         _OM_BIAS = getattr(_bias_mod, "BIAS_F", {})
 
 BAND_ARB_EXECUTION_ENABLED: bool = (
-    os.environ.get("BAND_ARB_EXECUTION_ENABLED", "true").lower() == "true"
+    env_bool("BAND_ARB_EXECUTION_ENABLED", True)
 )
-BAND_ARB_MIN_NO_ASK: int = int(os.environ.get("BAND_ARB_MIN_NO_ASK", "20"))
-BAND_ARB_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_MAX_NO_ASK", "95"))
+BAND_ARB_MIN_NO_ASK: int = env_int("BAND_ARB_MIN_NO_ASK", 20)
+BAND_ARB_MAX_NO_ASK: int = env_int("BAND_ARB_MAX_NO_ASK", 95)
 # Maximum divergence between METAR and noaa_observed before suppressing a band
 # arb signal.  A 27.5°F gap (DEN, APR06) indicates sensor failure; 4°F is
 # a conservative threshold that catches gross errors while tolerating the
@@ -121,13 +122,13 @@ BAND_ARB_HRRR_CONTRADICT_F: float = float(
 # if the market price provides soft confirmation (NO ask ≤ this cap).  At 40¢
 # NO ask the market is ~40% certain the band was crossed.  Set to 0 to block
 # all signals when NOAA is absent (restores old BLOCKER 1 behaviour).
-BAND_ARB_NOAA_NONE_MAX_NO_ASK: int = int(os.environ.get("BAND_ARB_NOAA_NONE_MAX_NO_ASK", "40"))
+BAND_ARB_NOAA_NONE_MAX_NO_ASK: int = env_int("BAND_ARB_NOAA_NONE_MAX_NO_ASK", 40)
 # NWS rounding buffer for LOW-temp band_arb (KXLOWT markets) — applied always.
 # 0.5°F mirrors the +0.5 used for HIGH markets: ensures the METAR reading is
 # far enough below the floor that NWS integer rounding can't put the official
 # low back inside the band (e.g. METAR 24.4°F rounds to 24°F, but 24.6°F
 # rounds to 25°F which is still inside [25–26]).
-BAND_ARB_LOW_BUFFER_F: float = float(os.environ.get("BAND_ARB_LOW_BUFFER_F", "0.5"))
+BAND_ARB_LOW_BUFFER_F: float = env_float("BAND_ARB_LOW_BUFFER_F", 0.5)
 # Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
 # data gap, or the midnight-to-1 AM window before the first QC obs arrives).
 # During this window only METAR and the market-price cap protect against
@@ -161,37 +162,37 @@ BAND_ARB_NWS_CLIMO_VETO: bool = (
 )
 
 # --- Band-arb YES signal configuration ------------------------------------
-BAND_ARB_YES_ENABLED: bool = os.environ.get("BAND_ARB_YES_ENABLED", "true").lower() == "true"
+BAND_ARB_YES_ENABLED: bool = env_bool("BAND_ARB_YES_ENABLED", True)
 # Comma-separated city suffixes to skip for YES signals (e.g. "aus,bos"). Default: "aus"
 BAND_ARB_YES_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in os.environ.get("BAND_ARB_YES_BLACKLIST_CITIES", "aus").split(",")
     if c.strip()
 )
 # Pre-lock: only fire within this many hours of close
-BAND_ARB_YES_MAX_HOURS_PRELOCK: float = float(os.environ.get("BAND_ARB_YES_MAX_HOURS_PRELOCK", "6.0"))
+BAND_ARB_YES_MAX_HOURS_PRELOCK: float = env_float("BAND_ARB_YES_MAX_HOURS_PRELOCK", 6.0)
 # Max YES ask to enter (market already priced in above this). Default: 85¢
-BAND_ARB_YES_MAX_YES_ASK: int = int(os.environ.get("BAND_ARB_YES_MAX_YES_ASK", "85"))
+BAND_ARB_YES_MAX_YES_ASK: int = env_int("BAND_ARB_YES_MAX_YES_ASK", 85)
 # Min YES ask (no edge if market is already near-certain YES). Default: 10¢
-BAND_ARB_YES_MIN_YES_ASK: int = int(os.environ.get("BAND_ARB_YES_MIN_YES_ASK", "50"))
+BAND_ARB_YES_MIN_YES_ASK: int = env_int("BAND_ARB_YES_MIN_YES_ASK", 50)
 # Buffer (°F) inside band edges before firing.
 # Kalshi KXHIGHT bands are 1°F wide (e.g. B56.5 = [56, 57]°F).  A symmetric
 # 1.0°F buffer makes in_band always False for these bands.  0.0 = fire whenever
 # observed_max is inside [strike_lo, strike_hi]; NWS rounding safety is provided
 # by the lock-time gate (past 4:30 PM) and NOAA corroboration requirement.
-BAND_ARB_YES_BUFFER_F: float = float(os.environ.get("BAND_ARB_YES_BUFFER_F", "0.0"))
+BAND_ARB_YES_BUFFER_F: float = env_float("BAND_ARB_YES_BUFFER_F", 0.0)
 # Max METAR vs NOAA divergence. NOAA is required for YES (no market-price fallback).
-BAND_ARB_YES_MAX_DIVERGENCE_F: float = float(os.environ.get("BAND_ARB_YES_MAX_DIVERGENCE_F", "3.0"))
+BAND_ARB_YES_MAX_DIVERGENCE_F: float = env_float("BAND_ARB_YES_MAX_DIVERGENCE_F", 3.0)
 # Local hour + minute at which daily high is considered locked (matches NOAA_OBS_PEAK_PAST)
-BAND_ARB_YES_LOCK_LOCAL_HOUR: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_HOUR", "16"))
-BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = int(os.environ.get("BAND_ARB_YES_LOCK_LOCAL_MINUTE", "30"))
+BAND_ARB_YES_LOCK_LOCAL_HOUR: int = env_int("BAND_ARB_YES_LOCK_LOCAL_HOUR", 16)
+BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = env_int("BAND_ARB_YES_LOCK_LOCAL_MINUTE", 30)
 # Synoptic Celsius band arb (5-minute NWS updates via integer-°C range math)
-SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = os.environ.get("SYNOPTIC_BAND_ARB_NO_ENABLED", "true").lower() == "true"
+SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = env_bool("SYNOPTIC_BAND_ARB_NO_ENABLED", True)
 
 # --- Forecast-driven NO signal configuration --------------------------------
-FORECAST_NO_ENABLED: bool = os.environ.get("FORECAST_NO_ENABLED", "true").lower() == "true"
+FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
 # Minimum forecast-to-strike edge (°F) for a source's value to count toward
 # corroboration.  With NOAA day-1 MAE ~3-4°F, 5°F means P(correct) > 85%.
-FORECAST_NO_MIN_EDGE_F: float = float(os.environ.get("FORECAST_NO_MIN_EDGE_F", "3.0"))
+FORECAST_NO_MIN_EDGE_F: float = env_float("FORECAST_NO_MIN_EDGE_F", 3.0)
 # Direction-specific edge overrides for "between" band NO signals.
 # NO_HIGH (forecast above band) is more reliable than NO_LOW (forecast below
 # band) per backtest — lower threshold justified.  Both default to the global
@@ -203,7 +204,7 @@ FORECAST_NO_NO_LOW_MIN_EDGE_F: float = float(
     os.environ.get("FORECAST_NO_NO_LOW_MIN_EDGE_F", "3.5")
 )
 # Number of independent sources required (noaa_observed counts as 2 if edge >= 2°F)
-FORECAST_NO_MIN_SOURCES: int = int(os.environ.get("FORECAST_NO_MIN_SOURCES", "2"))
+FORECAST_NO_MIN_SOURCES: int = env_int("FORECAST_NO_MIN_SOURCES", 2)
 # Higher source minimum for KXLOWT forecast_no signals — overnight lows are harder
 # to forecast than daytime highs (cold-front timing uncertainty, boundary-layer
 # decoupling).  Requires 3 sources (hrrr + nws_hourly + open_meteo or noaa) all
@@ -220,12 +221,12 @@ FORECAST_NO_LOWT_MAX_SPREAD_CENTS: int = int(
 # Maximum NO ask to enter — market hasn't yet priced in the outcome.
 # Raised from 70 to 80: at 75-80¢ NO ask, Kelly still recommends 1-2 contracts
 # for high-confidence signals (p≥0.90) and the market hasn't fully repriced.
-FORECAST_NO_MAX_ASK: int = int(os.environ.get("FORECAST_NO_MAX_ASK", "80"))
+FORECAST_NO_MAX_ASK: int = env_int("FORECAST_NO_MAX_ASK", 80)
 # Minimum NO ask — skip markets where YES is near-certain (market priced it in).
 # A 2¢ NO ask means the market is 98% confident YES wins; the forecast edge
 # would need to be enormous to justify buying NO.  15¢ floor (85¢ YES bid cap)
 # keeps entries in the zone where we still have meaningful information edge.
-FORECAST_NO_MIN_ASK: int = int(os.environ.get("FORECAST_NO_MIN_ASK", "15"))
+FORECAST_NO_MIN_ASK: int = env_int("FORECAST_NO_MIN_ASK", 15)
 # City suffixes to skip (same default as band_arb YES — AUS has low hit rate)
 FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in
@@ -289,7 +290,7 @@ FORECAST_NO_LOW_UNDER_REQUIRE_METAR: bool = (
 # short-range terrain-aware model; its disagreement indicates the other models
 # are missing local dynamics (e.g. Rocky Mountain front-range cooling in Denver).
 FORECAST_NO_HRRR_VETO: bool = (
-    os.environ.get("FORECAST_NO_HRRR_VETO", "true").lower() == "true"
+    env_bool("FORECAST_NO_HRRR_VETO", True)
 )
 # Observed-minimum proximity margin for LOW-temperature forecast_no signals (°F).
 # If the running observed minimum (metar/noaa_observed) is within this distance
@@ -533,7 +534,7 @@ def _hours_to_close(close_time_str: str) -> float | None:
     if not close_time_str:
         return None
     try:
-        close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+        close_dt = parse_iso_dt(close_time_str)
         return max(0.0, (close_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
     except (ValueError, TypeError):
         return None

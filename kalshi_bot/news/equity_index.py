@@ -51,6 +51,7 @@ Environment variables
 
 import logging
 import os
+from ..utils import env_bool
 from datetime import datetime, timezone
 
 import aiohttp
@@ -62,7 +63,7 @@ from ..data import DataPoint
 # ---------------------------------------------------------------------------
 
 EQUITY_INDEX_PREMARKET: bool = (
-    os.environ.get("EQUITY_INDEX_PREMARKET", "true").lower() != "false"
+    env_bool("EQUITY_INDEX_PREMARKET", True)
 )
 
 # Yahoo Finance ticker → (canonical metric key, display label)

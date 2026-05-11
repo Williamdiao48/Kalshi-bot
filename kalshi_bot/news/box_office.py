@@ -29,6 +29,7 @@ actuals don't linger past settlement.
 
 import logging
 import os
+from ..utils import env_int
 import re
 from datetime import date, datetime
 from typing import Any
@@ -49,7 +50,7 @@ _HEADERS = {
 
 # Drop data older than this many days (prevents stale actuals from matching
 # Kalshi markets that have already settled).
-BOX_OFFICE_MAX_STALE_DAYS: int = int(os.environ.get("BOX_OFFICE_MAX_STALE_DAYS", "4"))
+BOX_OFFICE_MAX_STALE_DAYS: int = env_int("BOX_OFFICE_MAX_STALE_DAYS", 4)
 
 
 # ---------------------------------------------------------------------------

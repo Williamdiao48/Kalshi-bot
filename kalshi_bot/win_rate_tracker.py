@@ -40,6 +40,7 @@ Set to 1 to report every cycle (useful during initial tuning).
 import json
 import logging
 import os
+from .utils import env_float, env_int
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,12 +51,12 @@ from .db import open_db, OPPORTUNITY_LOG_DB
 from .market_parser import TICKER_TO_METRIC
 from .markets import fetch_market_detail
 
-WIN_RATE_REPORT_INTERVAL: int = int(os.environ.get("WIN_RATE_REPORT_INTERVAL", "60"))
+WIN_RATE_REPORT_INTERVAL: int = env_int("WIN_RATE_REPORT_INTERVAL", 60)
 
 _DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 
 # Minimum resolved trades for a source to appear in the summary.
-_MIN_SAMPLE = int(os.environ.get("WIN_RATE_MIN_SAMPLE", "3"))
+_MIN_SAMPLE = env_int("WIN_RATE_MIN_SAMPLE", 3)
 
 # Minimum settled trades per source before the auto-calibrator replaces the
 # static KELLY_DEFAULT_P.  Below this threshold the sample is too small to
@@ -66,7 +67,7 @@ KELLY_CALIBRATION_MIN_SAMPLES: int = int(
 
 # Default fallback P(win) used in blending when the source has no configured prior.
 # Imported by TradeExecutor to stay in sync.
-KELLY_DEFAULT_P_FALLBACK: float = float(os.environ.get("KELLY_DEFAULT_P", "0.60"))
+KELLY_DEFAULT_P_FALLBACK: float = env_float("KELLY_DEFAULT_P", 0.6)
 
 
 class WinRateTracker:

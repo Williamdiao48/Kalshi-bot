@@ -96,6 +96,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from ..utils import env_float, env_int
 import re
 import time
 from datetime import date, datetime, timezone
@@ -111,8 +112,8 @@ from ..numeric_matcher import NumericOpportunity
 # ---------------------------------------------------------------------------
 
 CONGRESS_API_KEY: str       = os.environ.get("CONGRESS_API_KEY", "")
-CONGRESS_MATCH_THRESHOLD: float = float(os.environ.get("CONGRESS_MATCH_THRESHOLD", "0.25"))
-CONGRESS_POLL_INTERVAL: int     = int(os.environ.get("CONGRESS_POLL_INTERVAL", "300"))
+CONGRESS_MATCH_THRESHOLD: float = env_float("CONGRESS_MATCH_THRESHOLD", 0.25)
+CONGRESS_POLL_INTERVAL: int     = env_int("CONGRESS_POLL_INTERVAL", 300)
 
 _BASE_URL       = "https://api.congress.gov/v3"
 _VOTE_LIST_LIMIT = 20

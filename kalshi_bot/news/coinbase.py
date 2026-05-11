@@ -28,6 +28,7 @@ Environment variables
 import asyncio
 import logging
 import os
+from ..utils import env_bool
 from datetime import datetime, timezone
 
 import aiohttp
@@ -35,7 +36,7 @@ import aiohttp
 from ..data import DataPoint
 
 COINBASE_ENABLED: bool = (
-    os.environ.get("COINBASE_ENABLED", "true").lower() != "false"
+    env_bool("COINBASE_ENABLED", True)
 )
 
 _BASE_URL = "https://api.exchange.coinbase.com/products/{product_id}/ticker"
