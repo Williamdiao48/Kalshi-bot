@@ -45,13 +45,12 @@ class _Classifier:
         if self._loaded:
             return self._pipeline is not None
 
-        self._loaded = True
-
         if not self._model_path.exists():
             logging.warning(
                 "classifier: model not found at %s — text trading disabled.",
                 self._model_path,
             )
+            self._loaded = True  # path won't appear without operator action; no retry
             return False
 
         try:
@@ -66,10 +65,11 @@ class _Classifier:
                 top_k=None,         # return scores for all labels
             )
             logging.info("classifier: loaded from %s", self._model_path)
+            self._loaded = True
             return True
         except Exception as exc:
             logging.warning("classifier: failed to load: %s — text trading disabled.", exc)
-            return False
+            return False  # leave _loaded=False so a transient failure can retry
 
     def predict(self, market_title: str, article_text: str) -> tuple[str, float]:
         """Return (direction, p_yes) for a (market, article) pair.

@@ -56,7 +56,7 @@ Environment variables
 import asyncio
 import logging
 import os
-from ..utils import env_int
+from ..utils import env_int, env_bool
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -72,6 +72,9 @@ WEATHERAPI_FORECAST_DAYS: int = min(10, max(1, int(
     os.environ.get("WEATHERAPI_FORECAST_DAYS", "3")
 )))
 WEATHERAPI_CACHE_MINUTES: int = env_int("WEATHERAPI_CACHE_MINUTES", 15)
+# Set WEATHERAPI_ENABLED=false to skip the fetch entirely even when a key is present.
+# Useful when weatherapi is providing no additional signal over NOAA/HRRR.
+WEATHERAPI_ENABLED: bool = env_bool("WEATHERAPI_ENABLED", True)
 
 # Per-city cache: metric → (monotonic_time, list[DataPoint])
 _city_cache: dict[str, tuple[float, list[DataPoint]]] = {}
@@ -189,6 +192,8 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
     Returns:
         List of DataPoints (one per city per forecast day).
     """
+    if not WEATHERAPI_ENABLED:
+        return []
     api_key = os.environ.get("WEATHERAPI_KEY", "")
     if not api_key:
         logging.warning("WEATHERAPI_KEY not set — skipping WeatherAPI fetch.")

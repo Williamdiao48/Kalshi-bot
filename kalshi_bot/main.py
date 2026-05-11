@@ -2764,11 +2764,16 @@ async def _poll(
     _eia_natgas_spot = next((dp.value for dp in data_points if dp.source == "eia" and dp.metric == "eia_natgas"), None)
     if _eia_wti_spot is not None or _eia_natgas_spot is not None:
         try:
-            _eia_inv_dps = await eia_inventory.fetch_signals(
-                session, wti_spot=_eia_wti_spot, natgas_spot=_eia_natgas_spot
+            _eia_inv_dps = await asyncio.wait_for(
+                eia_inventory.fetch_signals(
+                    session, wti_spot=_eia_wti_spot, natgas_spot=_eia_natgas_spot
+                ),
+                timeout=15.0,
             )
             if _eia_inv_dps:
                 data_points.extend(_eia_inv_dps)
+        except asyncio.TimeoutError:
+            logging.warning("EIA inventory fetch timed out after 15s — skipping.")
         except Exception as _e:
             logging.error("EIA inventory fetch error: %s", _e)
 
@@ -4079,7 +4084,7 @@ async def _fast_loop(
     obs_values: dict[str, float] = {}
     _fast_obs_dates: dict[str, date] = {}
     for _dp in metar_result:
-        if _dp.metric.startswith("temp_high"):
+        if _dp.metric.startswith(("temp_high", "temp_low")):
             obs_values[_dp.metric] = _dp.value
             _ld = (_dp.metadata or {}).get("local_date")
             if _ld:
@@ -4089,7 +4094,7 @@ async def _fast_loop(
 
     # Refresh prices only for near-threshold city series
     _METRIC_TO_SERIES: dict[str, str] = {
-        v: k for k, v in TICKER_TO_METRIC.items() if k.startswith("KXHIGH")
+        v: k for k, v in TICKER_TO_METRIC.items() if k.startswith(("KXHIGH", "KXLOWT"))
     }
     series_to_fetch = [
         _METRIC_TO_SERIES[m]
