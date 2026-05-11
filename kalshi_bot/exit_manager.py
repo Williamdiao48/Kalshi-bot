@@ -119,6 +119,15 @@ if TYPE_CHECKING:
 EXIT_PROFIT_TAKE: float = env_float("EXIT_PROFIT_TAKE", 0.2)
 EXIT_STOP_LOSS: float   = env_float("EXIT_STOP_LOSS", 0.7)
 
+# Profit-take threshold for forecast_no NO-side positions (disabled by default).
+# Set > 0 to enable early exit when pct_gain reaches this fraction of entry cost.
+# E.g. FORECAST_NO_PROFIT_TAKE=0.30 exits when up 30% on the NO position.
+FORECAST_NO_PROFIT_TAKE: float = env_float("FORECAST_NO_PROFIT_TAKE", 0.0)
+# Stop-loss threshold override for forecast_no NO-side positions (disabled by default).
+# When > 0, replaces the global EXIT_STOP_LOSS for these trades.
+# E.g. FORECAST_NO_STOP_LOSS=0.40 exits when down 40% on entry cost.
+FORECAST_NO_STOP_LOSS: float = env_float("FORECAST_NO_STOP_LOSS", 0.0)
+
 # Tight stop-loss for YES trades on KXLOWT (daily-low) markets backed by
 # observed sources (noaa_observed, metar).  Unlike KXHIGHT observed YES trades
 # (where a high above the strike is permanently locked in), a KXLOWT morning
@@ -780,6 +789,9 @@ class ExitManager:
                 if (_sl_composite in EXIT_SOURCE_STOP_LOSS or src in EXIT_SOURCE_STOP_LOSS)
                 else "stop_loss:global"
             )
+            if is_forecast_no and FORECAST_NO_STOP_LOSS > 0:
+                stop_loss_thresh = FORECAST_NO_STOP_LOSS
+                _sl_detail = "stop_loss:forecast_no"
 
             # Tighter stop-loss for KXLOWT YES trades from observed sources.
             # A morning running-minimum above the strike does not lock in a YES
@@ -934,10 +946,11 @@ class ExitManager:
 
             # Locked signals (observed/advisory): hold to settlement, no profit-take.
             # Forecast YES signals: profit-take enabled (model-projected, not locked).
-            # Forecast NO signals: stop-loss only (directional NO is less certain).
+            # Forecast NO signals: stop-loss only by default; FORECAST_NO_PROFIT_TAKE
+            #   enables an early exit at a configurable threshold.
             is_locked = (src in _LOCKED_STOP_LOSS_ONLY) and not (src == "band_arb" and side == "yes")
             is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
-            suppress_profit_take = is_locked or is_forecast_no
+            suppress_profit_take = is_locked or (is_forecast_no and FORECAST_NO_PROFIT_TAKE <= 0)
 
             reason: str | None = None
             detail: str | None = None
@@ -982,7 +995,10 @@ class ExitManager:
                 reason = "profit_take"
                 detail = "profit_take:band_arb_abs_price"
 
-            if reason is None and not suppress_profit_take and pct >= profit_take_thresh:
+            if reason is None and is_forecast_no and FORECAST_NO_PROFIT_TAKE > 0 and pct >= FORECAST_NO_PROFIT_TAKE:
+                reason = "profit_take"
+                detail = f"profit_take:forecast_no@{FORECAST_NO_PROFIT_TAKE:.0%}"
+            elif reason is None and not suppress_profit_take and pct >= profit_take_thresh:
                 reason = "profit_take"
                 detail = self._profit_take_detail(src, side, entry_cost)
             elif reason is None and stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
