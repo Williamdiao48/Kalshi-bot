@@ -242,7 +242,7 @@ def analyze(
         print(f"\n{'═' * 72}")
         print("  MAX ADVERSE MOVE DISTRIBUTION  (all trades with candle data)")
         print(f"{'═' * 72}")
-        buckets = [0, 5, 10, 15, 20, 30, 50, 999]
+        buckets = [0, 1, 6, 11, 16, 21, 31, 51]
         labels  = ["0¢", "1–5¢", "6–10¢", "11–15¢", "16–20¢", "21–30¢", "31–50¢", ">50¢"]
         for i, (lo, label) in enumerate(zip(buckets, labels)):
             hi = buckets[i + 1] if i + 1 < len(buckets) else 9999
