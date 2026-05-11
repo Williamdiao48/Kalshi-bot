@@ -1141,6 +1141,29 @@ def _compute_trajectory_projections(
 # ---------------------------------------------------------------------------
 
 _OBS_CONFIRMED = frozenset({"noaa_observed", "nws_climo", "metar"})
+# High-confidence tier that also includes NWS alert signals.
+# Used as the pass-through set in _filter_weather_opportunities and
+# _apply_forecast_consensus — these sources bypass the forecast consensus
+# check and always pass through unchanged.
+_PASS_THROUGH_SOURCES = _OBS_CONFIRMED | frozenset({"nws_alert"})
+# Forecast sources treated as unreliable for solo/same-day trading.
+# May still vote in consensus but cannot trade solo without corroboration.
+_FORECAST_UNRELIABLE = frozenset({"open_meteo", "weatherapi"})
+# Source priority for selecting the "best" source when multiple agree.
+# Lower number = higher priority.  Sources absent from this dict get 99.
+_FORECAST_SOURCE_PRIORITY: dict[str, int] = {
+    "hrrr":       0,
+    "noaa":       1,
+    "nws_hourly": 2,
+    "noaa_day2":  3,
+    "noaa_day3":  4,
+    "noaa_day4":  5,
+    "noaa_day5":  6,
+    "noaa_day6":  7,
+    "noaa_day7":  8,
+    "open_meteo": 9,
+    "weatherapi": 10,
+}
 
 
 def _gate_date_alignment(
@@ -1356,7 +1379,7 @@ def _filter_weather_opportunities(
         if not _gate_date_alignment(opp, now):
             continue
 
-        if opp.source in ("noaa_observed", "metar", "nws_climo", "nws_alert"):
+        if opp.source in _PASS_THROUGH_SOURCES:
             # High-confidence signals: ground truth (observed/climo) or NWS
             # warning.  Never gated by HRRR spread; direction-split edge threshold.
             if opp.direction == "over":
@@ -1748,7 +1771,7 @@ def _apply_forecast_consensus(
         # veto it.  Open-Meteo still runs and its DataPoints still count toward
         # corroboration when it agrees with NOAA, but it cannot block a NOAA
         # signal by disagreeing.
-        _PASS_THROUGH = ("noaa_observed", "metar", "nws_climo", "nws_alert")
+        _PASS_THROUGH = _PASS_THROUGH_SOURCES
 
         # Compute market date and same-day flag before building _EXCLUDE so
         # we can tune which sources participate in the vote.
@@ -2070,7 +2093,7 @@ def _apply_forecast_consensus(
             # - open_meteo: raw GFS, systematically underestimates cold-front timing
             # - weatherapi: commercial aggregator with demonstrated day+0/+1 errors
             #   (7°F+ same-day, >16°F next-day). Can still vote in consensus.
-            _SOLO_BLOCKED = {"open_meteo", "weatherapi"}
+            _SOLO_BLOCKED = _FORECAST_UNRELIABLE
             gfs_only = not noaa_yes  # True when no NOAA/HRRR/obs_trajectory source is in YES set
             solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
             if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
@@ -2245,7 +2268,7 @@ def _apply_forecast_consensus(
             # reliably call NO on a same-day market without real-time support.
             # Trade #12 (Boston KXHIGHT NO) was driven solely by weatherapi and
             # stopped out prematurely at −$0.44; the market resolved NO 10 min later.
-            _DAILY_UNRELIABLE = frozenset({"open_meteo", "weatherapi"})
+            _DAILY_UNRELIABLE = _FORECAST_UNRELIABLE
             if (
                 not rt_no
                 and daily_no <= _DAILY_UNRELIABLE
@@ -2263,21 +2286,8 @@ def _apply_forecast_consensus(
         # weatherapi/open_meteo above NOAA/HRRR when their edge is higher).
         # weatherapi and open_meteo are corroboration-only; they should never
         # be the logged "source" that drove the trade.
-        _SRC_PRIORITY: dict[str, int] = {
-            "hrrr":       0,
-            "noaa":       1,
-            "nws_hourly": 2,
-            "noaa_day2":  3,
-            "noaa_day3":  4,
-            "noaa_day4":  5,
-            "noaa_day5":  6,
-            "noaa_day6":  7,
-            "noaa_day7":  8,
-            "open_meteo": 9,
-            "weatherapi": 10,
-        }
         agreeing = [o for o in forecasts if o.implied_outcome == forecast_outcome]
-        best = min(agreeing, key=lambda o: _SRC_PRIORITY.get(o.source, 99))
+        best = min(agreeing, key=lambda o: _FORECAST_SOURCE_PRIORITY.get(o.source, 99))
         best.corroborating_sources = [
             o.source for o in agreeing if o.source != best.source
         ]
