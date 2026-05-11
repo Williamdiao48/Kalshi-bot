@@ -2822,6 +2822,10 @@ class TradeExecutor:
             _fno_note["model_spread_f"] = signal.model_spread_f
         if signal.hours_to_close is not None:
             _fno_note["hours_to_close"] = round(signal.hours_to_close, 1)
+        if signal.obs_temp_f is not None:
+            _fno_note["obs_temp_f"] = round(signal.obs_temp_f, 1)
+        if signal.obs_gap_f is not None:
+            _fno_note["obs_gap_f"] = signal.obs_gap_f
 
         self.stats.trades_attempted += 1
         await self._execute(

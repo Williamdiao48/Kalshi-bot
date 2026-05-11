@@ -526,6 +526,12 @@ class ForecastNoSignal:
     strike:    float | None = None    # "under" / "over" markets
     strike_lo: float | None = None    # "between" lower bound
     strike_hi: float | None = None    # "between" upper bound
+    # METAR observed temperature at signal time — running max for HIGH markets,
+    # running min for LOW markets.  obs_gap_f = obs_temp_f − effective_strike
+    # (positive = safe margin away from the strike; negative = already crossed).
+    # Not used for trade logic; stored in note for post-hoc analysis.
+    obs_temp_f: float | None = None
+    obs_gap_f:  float | None = None
 
 
 def _hours_to_close(close_time_str: str) -> float | None:
@@ -1700,6 +1706,21 @@ def find_forecast_nos(
             source_names, raw_score,
         )
 
+        # METAR observed temp and gap from effective strike at signal time.
+        _obs_temp_fno: float | None = (
+            obs_high_values.get(parsed.metric) if is_high_market
+            else obs_low_values.get(parsed.metric)
+        )
+        _effective_strike_fno: float | None = (
+            parsed.strike if parsed.direction in ("under", "over")
+            else (parsed.strike_hi if _signal_no_direction == "NO_HIGH" else parsed.strike_lo)
+        )
+        _obs_gap_fno: float | None = (
+            round(_obs_temp_fno - _effective_strike_fno, 1)
+            if _obs_temp_fno is not None and _effective_strike_fno is not None
+            else None
+        )
+
         # source_details stores (source, value, edge) for backward compat with executor
         signals.append(ForecastNoSignal(
             ticker=ticker,
@@ -1721,6 +1742,8 @@ def find_forecast_nos(
             strike=parsed.strike,
             strike_lo=parsed.strike_lo,
             strike_hi=parsed.strike_hi,
+            obs_temp_f=_obs_temp_fno,
+            obs_gap_f=_obs_gap_fno,
         ))
 
     return signals
