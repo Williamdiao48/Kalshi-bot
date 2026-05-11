@@ -42,6 +42,7 @@ from .arb_detector import (
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
 from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
+from .cities import CITY_TZ as _CITY_TZ
 from .news import federal_register
 from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
 from .news import polymarket, metaculus, manifold, edgar, predictit
@@ -981,15 +982,6 @@ def _drain_text_source(
 
 _ET = ZoneInfo("America/New_York")
 
-# City → local timezone, derived from nws_climo.CLIMO_LOCATIONS so there is a
-# single source of truth for the metric → timezone mapping.
-# Covers both temp_high_* and temp_low_* (same cities, same timezones).
-_CITY_TZ: dict[str, ZoneInfo] = {
-    metric: tz for metric, (_, _, tz) in nws_climo.CLIMO_LOCATIONS.items()
-}
-_CITY_TZ.update({
-    metric: tz for metric, (_, _, tz) in nws_climo.LOW_CLIMO_LOCATIONS.items()
-})
 # Minimum local hour before a noaa_observed YES trade is allowed.
 # Daily temp max is typically established 1–5 PM local; before 1 PM the
 # "observed" max is still a morning partial reading — not a confirmed high.

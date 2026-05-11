@@ -36,7 +36,8 @@ from typing import Any
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES, _gridpoint_cache, _resolve_gridpoint, _HEADERS
+from ..cities import CITIES
+from .noaa import _gridpoint_cache, _resolve_gridpoint, _HEADERS
 
 # Local-time daytime window used to identify today's peak temperature from
 # the hourly forecast.  Periods outside [_DAY_START, _DAY_END) are skipped

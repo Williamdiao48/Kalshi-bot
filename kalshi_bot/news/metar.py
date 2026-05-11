@@ -62,7 +62,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES, KALSHI_STATION_IDS
+from ..cities import CITIES, KALSHI_STATION_IDS
 
 _BASE_URL = "https://aviationweather.gov/api/data/metar"
 

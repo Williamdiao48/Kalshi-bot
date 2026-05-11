@@ -64,7 +64,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES
+from ..cities import CITIES
 
 _BASE_URL = "https://api.weatherapi.com/v1/forecast.json"
 

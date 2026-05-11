@@ -116,7 +116,8 @@ from .markets import KALSHI_API_BASE
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
 from .news import cme_fedwatch
-from .news.noaa import get_forecast_sigma, CITIES
+from .cities import CITIES
+from .news.noaa import get_forecast_sigma
 from .scoring import METRIC_EDGE_SCALES
 from .spread_matcher import SpreadOpportunity
 from .arb_detector import (

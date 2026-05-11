@@ -65,7 +65,7 @@ import importlib.util as _ilu
 from pathlib import Path as _Path
 
 from .market_parser import parse_market
-from .news.noaa import CITIES  # city timezone lookup for date-alignment guard
+from .cities import CITIES  # city timezone lookup for date-alignment guard
 
 # Per-city/month p75/p90 peak-time thresholds (minutes since local midnight).
 # Loaded from data/peak_hour_p90.py; p75 is used by band_arb is_locked,

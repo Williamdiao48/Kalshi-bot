@@ -77,7 +77,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES, CITY_TZ_STRINGS as _CITY_TZ_STRINGS  # same city registry as NOAA
+from ..cities import CITIES, CITY_TZ_STRINGS as _CITY_TZ_STRINGS  # same city registry as NOAA
 
 # ---------------------------------------------------------------------------
 # Configuration

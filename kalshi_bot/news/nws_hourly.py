@@ -51,7 +51,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from .noaa import CITIES
+from ..cities import CITIES
 
 _HEADERS = {"User-Agent": "kalshi-bot/1.0 (educational; contact: user@example.com)"}
 _POINTS_URL = "https://api.weather.gov/points/{lat},{lon}"

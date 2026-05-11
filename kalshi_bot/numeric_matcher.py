@@ -39,7 +39,7 @@ from typing import Any
 
 from .data import DataPoint
 from .market_parser import ParsedMarket, parse_all_markets
-from .news.noaa import CITIES as _TEMP_HIGH_CITIES  # timezone lookup for date-alignment guard
+from .cities import CITIES as _TEMP_HIGH_CITIES  # timezone lookup for date-alignment guard
 
 _MONTH_MAP: dict[str, int] = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,

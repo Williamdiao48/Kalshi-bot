@@ -43,61 +43,10 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
+from ..cities import CLIMO_LOCATIONS, LOW_CLIMO_LOCATIONS
 
 _HEADERS = {"User-Agent": "kalshi-bot/1.0 (educational; contact: user@example.com)"}
 _PRODUCTS_URL = "https://api.weather.gov/products"
-
-# NWS 3-letter location IDs for the CLI product, keyed by Kalshi metric.
-# These match the station IDs in noaa.KALSHI_STATION_IDS (same settlement stations).
-CLIMO_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
-    # metric              location  display     timezone
-    "temp_high_ny":  ("NYC", "New York/Central Park",    ZoneInfo("America/New_York")),
-    "temp_high_bos": ("BOS", "Boston",                   ZoneInfo("America/New_York")),
-    "temp_high_mia": ("MIA", "Miami",                    ZoneInfo("America/New_York")),
-    "temp_high_chi": ("MDW", "Chicago Midway",           ZoneInfo("America/Chicago")),
-    "temp_high_dal": ("DAL", "Dallas Love Field",        ZoneInfo("America/Chicago")),
-    "temp_high_dfw": ("DFW", "Dallas/Fort Worth",        ZoneInfo("America/Chicago")),
-    "temp_high_aus": ("AUS", "Austin",                   ZoneInfo("America/Chicago")),
-    "temp_high_hou": ("HOU", "Houston Hobby",            ZoneInfo("America/Chicago")),
-    "temp_high_den": ("DEN", "Denver",                   ZoneInfo("America/Denver")),
-    "temp_high_lax": ("LAX", "Los Angeles",              ZoneInfo("America/Los_Angeles")),
-    # New cities — active from 2026-04
-    "temp_high_sfo": ("SFO", "San Francisco",            ZoneInfo("America/Los_Angeles")),
-    "temp_high_sea": ("SEA", "Seattle",                  ZoneInfo("America/Los_Angeles")),
-    "temp_high_phx": ("PHX", "Phoenix",                  ZoneInfo("America/Phoenix")),
-    "temp_high_phl": ("PHL", "Philadelphia",             ZoneInfo("America/New_York")),
-    "temp_high_atl": ("ATL", "Atlanta",                  ZoneInfo("America/New_York")),
-    "temp_high_msp": ("MSP", "Minneapolis",              ZoneInfo("America/Chicago")),
-    "temp_high_dca": ("DCA", "Washington DC",            ZoneInfo("America/New_York")),
-    "temp_high_las": ("LAS", "Las Vegas",                ZoneInfo("America/Los_Angeles")),
-    "temp_high_okc": ("OKC", "Oklahoma City",            ZoneInfo("America/Chicago")),
-    "temp_high_sat": ("SAT", "San Antonio",              ZoneInfo("America/Chicago")),
-    "temp_high_msy": ("MSY", "New Orleans",              ZoneInfo("America/Chicago")),
-}
-
-# Same NWS 3-letter CLI location codes, but for daily low temperature metrics.
-LOW_CLIMO_LOCATIONS: dict[str, tuple[str, str, ZoneInfo]] = {
-    "temp_low_ny":  ("NYC", "New York/Central Park",    ZoneInfo("America/New_York")),
-    "temp_low_bos": ("BOS", "Boston",                   ZoneInfo("America/New_York")),
-    "temp_low_mia": ("MIA", "Miami",                    ZoneInfo("America/New_York")),
-    "temp_low_chi": ("MDW", "Chicago Midway",           ZoneInfo("America/Chicago")),
-    "temp_low_dfw": ("DFW", "Dallas/Fort Worth",        ZoneInfo("America/Chicago")),
-    "temp_low_aus": ("AUS", "Austin",                   ZoneInfo("America/Chicago")),
-    "temp_low_hou": ("HOU", "Houston Hobby",            ZoneInfo("America/Chicago")),
-    "temp_low_den": ("DEN", "Denver",                   ZoneInfo("America/Denver")),
-    "temp_low_lax": ("LAX", "Los Angeles",              ZoneInfo("America/Los_Angeles")),
-    "temp_low_sfo": ("SFO", "San Francisco",            ZoneInfo("America/Los_Angeles")),
-    "temp_low_sea": ("SEA", "Seattle",                  ZoneInfo("America/Los_Angeles")),
-    "temp_low_phx": ("PHX", "Phoenix",                  ZoneInfo("America/Phoenix")),
-    "temp_low_phl": ("PHL", "Philadelphia",             ZoneInfo("America/New_York")),
-    "temp_low_atl": ("ATL", "Atlanta",                  ZoneInfo("America/New_York")),
-    "temp_low_msp": ("MSP", "Minneapolis",              ZoneInfo("America/Chicago")),
-    "temp_low_dca": ("DCA", "Washington DC",            ZoneInfo("America/New_York")),
-    "temp_low_las": ("LAS", "Las Vegas",                ZoneInfo("America/Los_Angeles")),
-    "temp_low_okc": ("OKC", "Oklahoma City",            ZoneInfo("America/Chicago")),
-    "temp_low_sat": ("SAT", "San Antonio",              ZoneInfo("America/Chicago")),
-    "temp_low_msy": ("MSY", "New Orleans",              ZoneInfo("America/Chicago")),
-}
 
 # How long (minutes) to wait between retry attempts when the CLI product
 # is not yet published.  The preliminary CLI is typically published 5–8 PM
