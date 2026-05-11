@@ -124,6 +124,14 @@ WATCH_THRESHOLD_F: float = env_float("WATCH_THRESHOLD_F", 3.0)
 FAST_LOOP_INTERVAL: float = env_float("FAST_LOOP_INTERVAL", 10.0)
 
 # Shared state between _poll() and _fast_loop().
+#
+# Safety invariant: all writes go through _update_fast_loop_cache() and
+# _update_hrrr_cache() below, which are synchronous functions containing no
+# await points.  In CPython's single-threaded event loop two coroutines can
+# only interleave at await points, so each update function executes atomically
+# — _fast_loop will observe either the previous complete snapshot or the new
+# one, never a partial write.
+#
 # _near_threshold_cities: metric keys (e.g. "temp_high_den") whose METAR reading
 #   was within WATCH_THRESHOLD_F of a band ceiling in the last full cycle.
 # _last_noaa_obs: NOAA observed values cached from the last full cycle for
@@ -155,6 +163,35 @@ _last_synoptic_celsius: dict[str, int | None] = {}
 # previous day's METAR peak is still in memory at midnight).
 _last_hrrr_highs: dict[str, float] = {}
 _last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
+
+
+def _update_fast_loop_cache(
+    near_threshold: set[str],
+    noaa_obs: dict[str, float],
+    noaa_day1: dict[str, float],
+    nws_climo: dict[str, float],
+    synoptic_celsius: dict[str, int | None],
+) -> None:
+    """Replace the shared _poll → _fast_loop state in one synchronous block.
+
+    No await points here — callers must not insert any between computing the
+    arguments and calling this function, to preserve the atomicity guarantee.
+    """
+    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time
+    global _last_noaa_day1, _last_nws_climo, _last_synoptic_celsius
+    _near_threshold_cities = near_threshold
+    _last_noaa_obs        = noaa_obs
+    _last_noaa_obs_time   = time.monotonic()
+    _last_noaa_day1       = noaa_day1
+    _last_nws_climo       = nws_climo
+    _last_synoptic_celsius = synoptic_celsius
+
+
+def _update_hrrr_cache(highs: dict[str, float]) -> None:
+    """Replace the HRRR shared state in one synchronous block."""
+    global _last_hrrr_highs, _last_hrrr_highs_time
+    _last_hrrr_highs      = highs
+    _last_hrrr_highs_time = time.monotonic()
 
 # Maximum age (seconds) of the cached NOAA observed values before the fast loop
 # treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
@@ -2532,9 +2569,7 @@ async def _poll(
         logging.warning("HRRR fetch error: %s", hrrr_result)
     elif hrrr_result:
         hrrr_hourly_highs, hrrr_hourly_lows = hrrr_result  # type: ignore[misc]
-        global _last_hrrr_highs, _last_hrrr_highs_time
-        _last_hrrr_highs = hrrr_hourly_highs
-        _last_hrrr_highs_time = time.monotonic()
+        _update_hrrr_cache(hrrr_hourly_highs)
 
     # ---- numeric matching (NOAA, Binance, Frankfurter, BLS, FRED, EIA) ------
     # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
@@ -3946,8 +3981,7 @@ async def _poll(
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
     # inner loop only refreshes series prices for cities that matter.
-    global _near_threshold_cities, _last_noaa_obs, _last_noaa_obs_time, _last_noaa_day1, _last_nws_climo, _last_synoptic_celsius
-    _near_threshold_cities = set()
+    _near_threshold: set[str] = set()
     for _wl_mkt in markets:
         _wl_parsed = parse_market(_wl_mkt)
         if _wl_parsed is None or not _wl_parsed.metric.startswith(("temp_high", "temp_low")):
@@ -3961,16 +3995,18 @@ async def _poll(
         elif _wl_parsed.direction == "under" and _wl_parsed.strike is not None:
             _wl_ceil = _wl_parsed.strike
         if _wl_ceil is not None and abs(_wl_ceil - _wl_obs) <= WATCH_THRESHOLD_F:
-            _near_threshold_cities.add(_wl_parsed.metric)
-    _last_noaa_obs = _band_arb_noaa_obs_early.copy()
-    _last_noaa_obs_time = time.monotonic()
-    _last_noaa_day1 = _band_arb_noaa_day1.copy()
-    _last_nws_climo = _band_arb_nws_climo.copy()
-    _last_synoptic_celsius = _synoptic_celsius.copy()
-    if _near_threshold_cities:
+            _near_threshold.add(_wl_parsed.metric)
+    _update_fast_loop_cache(
+        near_threshold=_near_threshold,
+        noaa_obs=_band_arb_noaa_obs_early.copy(),
+        noaa_day1=_band_arb_noaa_day1.copy(),
+        nws_climo=_band_arb_nws_climo.copy(),
+        synoptic_celsius=_synoptic_celsius.copy(),
+    )
+    if _near_threshold:
         logging.debug(
             "Fast-loop watchlist: %d near-threshold city(ies): %s",
-            len(_near_threshold_cities), sorted(_near_threshold_cities),
+            len(_near_threshold), sorted(_near_threshold),
         )
 
 
