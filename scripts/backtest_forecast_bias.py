@@ -23,48 +23,14 @@ from pathlib import Path
 from statistics import mean, stdev
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from scripts.lib import open_db, DEFAULT_DB_PATH
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-# UTC hour at which each city's market closes (midnight local = UTC + offset,
-# on the calendar day AFTER trade_date).  Summer/DST offsets.
-CITY_CLOSE_UTC_HOUR: dict[str, int] = {
-    # Eastern UTC-4
-    "ny": 4, "bos": 4, "mia": 4, "phl": 4, "atl": 4, "dca": 4, "msy": 4,
-    # Central UTC-5
-    "chi": 5, "hou": 5, "dal": 5, "dfw": 5, "sat": 5, "msp": 5, "okc": 5,
-    # Mountain UTC-6
-    "den": 6,
-    # Pacific UTC-7 (Phoenix has no DST, same summer offset)
-    "lax": 7, "sfo": 7, "sea": 7, "las": 7, "phx": 7,
-}
-
-FORECAST_SOURCES = (
-    "nws_hourly", "noaa", "noaa_day2", "hrrr",
-    "open_meteo", "open_meteo_gfs", "open_meteo_ecmwf",
-    "open_meteo_gem", "open_meteo_icon",
+from scripts.lib import (
+    open_db, DEFAULT_DB_PATH,
+    FORECAST_SOURCES,
+    city_from_metric, build_market_close_utc,
 )
 
 # Preferred display columns (hours-to-close), shown right-to-left
 HTB_DISPLAY = [24, 22, 20, 18, 16, 14, 12, 10, 8, 6, 4, 2]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def city_from_metric(metric: str) -> str:
-    return metric.replace("temp_high_", "").replace("temp_low_", "")
-
-
-def build_close_utc(city: str, trade_date: date) -> datetime:
-    """Return the UTC datetime when this city's market closes (midnight local)."""
-    next_day = trade_date + timedelta(days=1)
-    hour = CITY_CLOSE_UTC_HOUR.get(city, 5)  # Central as safe default
-    return datetime(next_day.year, next_day.month, next_day.day, hour,
-                    tzinfo=timezone.utc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -268,7 +234,7 @@ def main() -> None:
                 continue
 
             trade_date = date.fromisoformat(d_str)
-            close_utc = build_close_utc(city, trade_date)
+            close_utc = build_market_close_utc(city, trade_date)
             # Use start-of-hour as the reading timestamp (readings are averaged
             # across the hour so mid-hour would be +30 min; difference is <1 bucket)
             logged_utc = datetime(trade_date.year, trade_date.month, trade_date.day,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from datetime import date, datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -16,7 +17,33 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent
-DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "db" / "opportunity_log.db"
+DEFAULT_DB_PATH            = PROJECT_ROOT / "data" / "db" / "opportunity_log.db"
+DEFAULT_CANDLESTICK_DB_PATH = PROJECT_ROOT / "data" / "candlesticks.db"
+
+# DST-adjusted UTC offsets (summer). Negative = hours behind UTC.
+CITY_UTC_OFFSET: dict[str, int] = {
+    "ny":   -4, "bos":  -4, "mia":  -4, "phi":  -4, "phl":  -4, "atl":  -4,
+    "dc":   -4, "dca":  -4,                                                   # Eastern
+    "chi":  -5, "dal":  -5, "dfw":  -5, "hou":  -5, "okc":  -5,
+    "sat":  -5, "aus":  -5, "min":  -5, "msp":  -5,
+    "msy":  -5, "nola": -5,                                                   # Central
+    "den":  -6,                                                                # Mountain
+    "lax":  -7, "sfo":  -7, "sea":  -7, "las":  -7, "lv":   -7, "phx": -7,  # Pacific
+}
+# UTC hour at which each city's market closes (midnight local → UTC).
+CITY_CLOSE_UTC_HOUR: dict[str, int] = {k: abs(v) for k, v in CITY_UTC_OFFSET.items()}
+
+# Weather observation sources (ground truth — not forecasts).
+GROUND_TRUTH_SOURCES: frozenset[str] = frozenset({
+    "metar_6hr", "metar", "metar_running_max", "noaa_observed", "nws_climo",
+})
+
+# Forecast model sources, ordered by typical near-term accuracy.
+FORECAST_SOURCES: tuple[str, ...] = (
+    "nws_hourly", "noaa", "noaa_day2", "hrrr",
+    "open_meteo", "open_meteo_gfs", "open_meteo_ecmwf",
+    "open_meteo_gem", "open_meteo_icon", "weatherapi",
+)
 
 STARTING_CAPITAL_CENTS: float = 10_000.0   # $100
 DRAWDOWN_WINDOW_HOURS:  int   = 48
@@ -153,3 +180,154 @@ def kelly_count(wp: float, cost: int, kf: float, pos_max: int) -> int:
     if raw_f <= 0:
         return 0
     return math.floor(kf * raw_f * pos_max / cost)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp / city utilities
+# ---------------------------------------------------------------------------
+
+def parse_iso_ts(iso: str) -> int:
+    """ISO 8601 string → Unix seconds. Returns 0 on parse failure."""
+    try:
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+    except (ValueError, AttributeError):
+        return 0
+
+
+def city_from_ticker(ticker: str) -> str:
+    """Extract lowercase city code from a Kalshi temperature ticker.
+
+    Examples: 'KXHIGHTBOS-26APR20-B52.5' → 'bos', 'KXLOWTDEN-26APR19-T31' → 'den'.
+    Returns '' for non-temperature tickers.
+    """
+    for prefix in ("KXHIGHT", "KXHIGH", "KXLOWT", "KXLOW"):
+        if ticker.upper().startswith(prefix):
+            return ticker[len(prefix):].split("-")[0].lower()
+    return ""
+
+
+def city_from_metric(metric: str) -> str:
+    """Extract city code from a metric string. 'temp_high_bos' → 'bos'."""
+    return metric.replace("temp_high_", "").replace("temp_low_", "")
+
+
+def local_hour_from_utc(utc_iso: str, city: str) -> int | None:
+    """Approximate local hour (0–23) for a UTC timestamp and city code.
+
+    Uses summer (DST) offsets from CITY_UTC_OFFSET. Returns None if the city
+    is not in the table or the timestamp cannot be parsed.
+    """
+    offset = CITY_UTC_OFFSET.get(city)
+    ts = parse_iso_ts(utc_iso)
+    if offset is None or ts == 0:
+        return None
+    from datetime import timezone as _tz
+    return (datetime.fromtimestamp(ts, tz=_tz.utc).hour + offset) % 24
+
+
+def build_market_close_utc(city: str, trade_date: date) -> datetime:
+    """UTC datetime when a city's temperature market closes (midnight local).
+
+    Falls back to Central (UTC-5, close_hour=5) for unknown cities.
+    """
+    from datetime import timedelta, timezone as _tz
+    next_day = trade_date + timedelta(days=1)
+    close_hour = CITY_CLOSE_UTC_HOUR.get(city, 5)
+    return datetime(next_day.year, next_day.month, next_day.day, close_hour, tzinfo=_tz.utc)
+
+
+# ---------------------------------------------------------------------------
+# Weather data helpers
+# ---------------------------------------------------------------------------
+
+def get_ground_truth(
+    conn: sqlite3.Connection, metric: str, trade_date: str
+) -> tuple[float | None, str]:
+    """Best available observed temperature for metric + date.
+
+    Priority: metar_6hr → metar (running max) → noaa_observed.
+    Returns (actual_f, source_label) or (None, '') when no data found.
+    """
+    for source, label in [
+        ("metar_6hr",     "metar_6hr"),
+        ("metar",         "metar_running_max"),
+        ("noaa_observed", "noaa_observed"),
+    ]:
+        row = conn.execute(
+            "SELECT MAX(data_value) FROM raw_forecasts "
+            "WHERE source = ? AND metric = ? AND date(logged_at) = ?",
+            (source, metric, trade_date),
+        ).fetchone()
+        if row and row[0] is not None:
+            return float(row[0]), label
+    return None, ""
+
+
+def load_resolved_trades(
+    conn: sqlite3.Connection,
+    *,
+    kind: "str | list[str] | None" = None,
+    exclude_kind: "str | list[str] | None" = None,
+    ids: "list[int] | None" = None,
+    since: "str | None" = None,
+    exit_reason: "str | None" = None,
+    columns: str = "*",
+) -> "list[sqlite3.Row]":
+    """Query resolved trades with composable filters, ordered by id ASC.
+
+    'Resolved' means outcome IS NOT NULL OR exit_pnl_cents IS NOT NULL.
+
+    Args:
+        kind:         Filter to one or more opportunity_kind values.
+        exclude_kind: Exclude one or more kinds (ignored when kind is set).
+        ids:          Filter to specific trade IDs.
+        since:        Filter logged_at >= this date string (YYYY-MM-DD or ISO).
+        exit_reason:  Filter to a specific exit_reason value.
+        columns:      SQL column list (default '*').
+    """
+    q = (
+        f"SELECT {columns} FROM trades "
+        "WHERE (outcome IS NOT NULL OR exit_pnl_cents IS NOT NULL)"
+    )
+    p: list = []
+
+    if ids:
+        q += f" AND id IN ({','.join('?' * len(ids))})"
+        p.extend(ids)
+
+    if kind is not None:
+        kinds = [kind] if isinstance(kind, str) else list(kind)
+        q += f" AND opportunity_kind IN ({','.join('?' * len(kinds))})"
+        p.extend(kinds)
+    elif exclude_kind is not None:
+        eks = [exclude_kind] if isinstance(exclude_kind, str) else list(exclude_kind)
+        q += f" AND opportunity_kind NOT IN ({','.join('?' * len(eks))})"
+        p.extend(eks)
+
+    if since:
+        q += " AND logged_at >= ?"
+        p.append(since)
+    if exit_reason:
+        q += " AND exit_reason = ?"
+        p.append(exit_reason)
+
+    return conn.execute(q + " ORDER BY id", p).fetchall()
+
+
+def pnl_from_dict(trade: dict) -> "float | None":
+    """Realized P&L in cents from a plain dict (e.g. from cursor.fetchall rows).
+
+    Side-aware: NO wins earn limit_price per contract; YES wins earn 100-limit_price.
+    Use lib.pnl() when the trade is a sqlite3.Row.
+    """
+    if trade.get("exit_pnl_cents") is not None:
+        return float(trade["exit_pnl_cents"])
+    outcome = trade.get("outcome")
+    side    = trade.get("side", "no")
+    count   = trade.get("count", 1)
+    lim     = trade.get("limit_price", 0)
+    if outcome == "won":
+        return float((100 - lim) * count if side == "yes" else lim * count)
+    if outcome == "lost":
+        return float(-lim * count if side == "yes" else -(100 - lim) * count)
+    return None

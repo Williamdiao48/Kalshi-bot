@@ -36,35 +36,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from kalshi_bot.market_parser import TICKER_TO_METRIC
+from scripts.lib import (
+    DEFAULT_DB_PATH,
+    GROUND_TRUTH_SOURCES, FORECAST_SOURCES,
+    get_ground_truth,
+)
 
-DB_PATH = ROOT / "data" / "db" / "opportunity_log.db"
-
-# Sources we treat as ground-truth observations (not forecasts)
-_GROUND_TRUTH_SOURCES = {"metar_6hr", "metar", "metar_running_max",
-                          "noaa_observed", "nws_climo"}
-# Sources we include when falling back to raw_forecasts_daily
-_FORECAST_SOURCES = {
-    "noaa", "noaa_day2", "nws_hourly", "hrrr",
-    "open_meteo", "open_meteo_gfs", "open_meteo_ecmwf",
-    "open_meteo_icon", "open_meteo_gem", "weatherapi",
-}
-
-
-def _get_ground_truth(conn: sqlite3.Connection, metric: str, trade_date: str) -> tuple[float | None, str]:
-    """Return (actual_f, source_label) using best available ground truth."""
-    for source, label in [
-        ("metar_6hr",    "metar_6hr"),
-        ("metar",        "metar_running_max"),
-        ("noaa_observed","noaa_observed"),
-    ]:
-        row = conn.execute(
-            "SELECT MAX(data_value) FROM raw_forecasts "
-            "WHERE source = ? AND metric = ? AND date(logged_at) = ?",
-            (source, metric, trade_date),
-        ).fetchone()
-        if row and row[0] is not None:
-            return float(row[0]), label
-    return None, ""
+_FORECAST_SOURCES_SET = set(FORECAST_SOURCES)
 
 
 def _get_forecasts_from_note(note_json: str | None) -> list[tuple[str, float]]:
@@ -77,24 +55,23 @@ def _get_forecasts_from_note(note_json: str | None) -> list[tuple[str, float]]:
         return []
     sources_detail = note.get("sources_detail", [])
     if not sources_detail:
-        # Single-source trades store data_value directly
-        val = note.get("data_value")
-        return [] if val is None else []  # handled by raw_forecasts_daily fallback
+        return []  # handled by raw_forecasts_daily fallback
     return [(src, float(val)) for src, val, *_ in sources_detail
-            if src not in _GROUND_TRUTH_SOURCES]
+            if src not in GROUND_TRUTH_SOURCES]
 
 
 def _get_forecasts_from_db(conn: sqlite3.Connection, ticker: str, trade_date: str) -> list[tuple[str, float]]:
     """Fall back to raw_forecasts_daily for trades without sources_detail."""
+    gts = tuple(sorted(GROUND_TRUTH_SOURCES))
     rows = conn.execute(
         "SELECT source, avg_forecast FROM raw_forecasts_daily "
         "WHERE ticker = ? AND date = ? AND source NOT IN ({})".format(
-            ",".join("?" * len(_GROUND_TRUTH_SOURCES))
+            ",".join("?" * len(gts))
         ),
-        (ticker, trade_date, *_GROUND_TRUTH_SOURCES),
+        (ticker, trade_date, *gts),
     ).fetchall()
     return [(src, float(avg)) for src, avg in rows
-            if avg is not None and src in _FORECAST_SOURCES]
+            if avg is not None and src in _FORECAST_SOURCES_SET]
 
 
 def _already_recorded(conn: sqlite3.Connection, trade_id: int, source: str) -> bool:
@@ -146,7 +123,7 @@ def backfill(
         if not trade_date:
             continue
 
-        actual_f, actual_src = _get_ground_truth(conn, metric, trade_date)
+        actual_f, actual_src = get_ground_truth(conn, metric, trade_date)
         if actual_f is None:
             # Last-resort: check note for observed_f (stored by some signal types)
             try:
@@ -233,7 +210,7 @@ def main() -> None:
                         help="Only process these trade IDs")
     parser.add_argument("--since", metavar="YYYY-MM-DD",
                         help="Only process trades logged on or after this date")
-    parser.add_argument("--db", default=str(DB_PATH),
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH),
                         help="Path to opportunity_log.db")
     args = parser.parse_args()
 

@@ -25,14 +25,12 @@ Usage:
 import argparse
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-OPP_DB    = ROOT / "data" / "db" / "opportunity_log.db"
-CANDLE_DB = ROOT / "data" / "candlesticks.db"
+from scripts.lib import DEFAULT_DB_PATH, DEFAULT_CANDLESTICK_DB_PATH, parse_iso_ts
 
 # A NO position profits when YES price falls.
 # Adverse move = YES ask rising above our entry (pushing our mark-to-market negative).
@@ -42,15 +40,6 @@ CANDLE_DB = ROOT / "data" / "candlesticks.db"
 # Classification thresholds
 _REVERSAL_CANDLES  = 5    # if the adverse peak reverses within this many candles → noise
 _TREND_PERSIST_PCT = 0.50 # adverse move must persist for this fraction of the hold window
-
-
-def _ts(iso: str) -> int:
-    """Convert ISO timestamp to Unix seconds."""
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except (ValueError, AttributeError):
-        return 0
 
 
 def _classify_stop(candles: list[tuple[int, int | None, int | None]],
@@ -140,8 +129,8 @@ def analyze(
     for (trade_id, ticker, opp_kind, side, yes_bid_entry, yes_ask_entry,
          limit_price, logged_at, exited_at, exit_reason, exit_pnl_cents, outcome) in trades:
 
-        entry_ts = _ts(logged_at) if logged_at else 0
-        exit_ts  = _ts(exited_at) if exited_at else 0
+        entry_ts = parse_iso_ts(logged_at) if logged_at else 0
+        exit_ts  = parse_iso_ts(exited_at) if exited_at else 0
 
         # Trades that resolved at market settlement have exited_at=NULL.
         # Fall back to close_ts from candlesticks.db markets table.
@@ -202,7 +191,7 @@ def analyze(
             flag = f"  [{r['classification'].upper()} STOP]"
         print(
             f"  #{r['id']:<4d}  {r['ticker']:<38}"
-            f"  {r['exit_reason']:<20}  pnl={r['pnl']:+.2f}$"
+            f"  {(r['exit_reason'] or 'unknown'):<20}  pnl={r['pnl']:+.2f}$"
             f"  max_adv={r['max_adverse']:+3d}¢{flag}"
         )
 
@@ -280,8 +269,8 @@ def main() -> None:
     parser.add_argument("--ids", type=int, nargs="+", metavar="ID")
     parser.add_argument("--exit-reason", metavar="REASON",
                         help="Filter to a specific exit_reason (e.g. stop_loss)")
-    parser.add_argument("--opp-db", default=str(OPP_DB))
-    parser.add_argument("--candle-db", default=str(CANDLE_DB))
+    parser.add_argument("--opp-db", default=str(DEFAULT_DB_PATH))
+    parser.add_argument("--candle-db", default=str(DEFAULT_CANDLESTICK_DB_PATH))
     args = parser.parse_args()
 
     opp_conn    = sqlite3.connect(args.opp_db,    isolation_level=None)

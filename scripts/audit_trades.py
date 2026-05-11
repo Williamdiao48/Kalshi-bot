@@ -50,11 +50,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from scripts.lib import (
+    DEFAULT_DB_PATH,
+    city_from_ticker,
+    local_hour_from_utc,
+    pnl_from_dict,
+)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-DB_PATH = Path(__file__).parent.parent / "data" / "db" / "opportunity_log.db"
 
 # Cities with documented terrain-driven forecast difficulty
 TERRAIN_CITIES = frozenset({"den", "okc", "dal", "slc"})
@@ -66,37 +72,6 @@ HRRR_DISSENT_F     = 2.0   # °F — HRRR edge below this means HRRR is near or 
 LATE_HIGH_HOUR     = 15    # local hour — HIGH entry at or past this is "late"
 OVERNIGHT_LOW_HOUR = 6     # local hour — LOW entry before this is overnight window
 MARGINAL_MKT_P     = 0.45  # YES bid — market giving YES ≥ this means genuine uncertainty
-
-# City timezone abbreviations (local-hour computation uses UTC offset approximation)
-# For exact local hours we'd need the full tz table; this is good enough for audit.
-CITY_UTC_OFFSET: dict[str, int] = {
-    "ny": -4, "bos": -4, "mia": -4, "phi": -4, "phx": -7, "phl": -4,
-    "atl": -4, "dc": -4, "dca": -4,
-    "chi": -5, "dal": -5, "dfw": -5, "hou": -5, "okc": -5, "sat": -5,
-    "aus": -5, "nola": -5, "msy": -5,
-    "den": -6,
-    "lax": -7, "sfo": -7, "sea": -7, "las": -7, "lv": -7,
-    "min": -5, "msp": -5,
-}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def city_from_ticker(ticker: str) -> str:
-    """Extract the city suffix from a Kalshi temperature ticker.
-
-    KXHIGHTBOS-26APR20-B52.5  →  'bos'
-    KXLOWTDEN-26APR19-T31     →  'den'
-    Returns '' for non-temperature tickers.
-    """
-    for prefix in ("KXHIGHT", "KXHIGH", "KXLOWT", "KXLOW"):
-        if ticker.startswith(prefix):
-            rest = ticker[len(prefix):]
-            city = rest.split("-")[0].lower()
-            return city
-    return ""
 
 
 def market_type(ticker: str) -> str:
@@ -125,17 +100,6 @@ def market_direction(ticker: str) -> str:
     if strike_seg.startswith("T"):
         return "over"
     return "?"
-
-
-def local_hour(utc_iso: str, city: str) -> int | None:
-    """Approximate local hour of entry for a given city."""
-    try:
-        dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
-        offset = CITY_UTC_OFFSET.get(city, 0)
-        local_h = (dt.hour + offset) % 24
-        return local_h
-    except Exception:
-        return None
 
 
 def load_trades(conn: sqlite3.Connection, ids: list[int] | None,
@@ -207,11 +171,10 @@ def compute_flags(trade: dict, fc_summary: dict) -> list[str]:
     mtype    = market_type(ticker)
     mdir     = market_direction(ticker)
     kind     = trade["opportunity_kind"]
-    src      = trade["source"] or ""
     corr     = trade["corroborating_sources"] or ""
     mkt_p    = trade["market_p_entry"]
     entry_ts = trade["logged_at"]
-    lhour    = local_hour(entry_ts, city) if city else None
+    lhour    = local_hour_from_utc(entry_ts, city) if city else None
 
     # THIN_EDGE: minimum observed qualifying edge across all sources < threshold
     all_min_edges = [
@@ -274,25 +237,13 @@ def compute_flags(trade: dict, fc_summary: dict) -> list[str]:
     return flags
 
 
-def pnl_cents(trade: dict) -> float | None:
-    """Return net P&L in cents (positive = win)."""
-    if trade["exit_pnl_cents"] is not None:
-        return float(trade["exit_pnl_cents"])
-    if trade["outcome"] == "won":
-        # settled win: profit = (100 - limit_price) * count
-        return (100 - trade["limit_price"]) * trade["count"]
-    if trade["outcome"] == "lost":
-        return -trade["limit_price"] * trade["count"]
-    return None
-
-
 def is_loss(trade: dict) -> bool:
-    p = pnl_cents(trade)
+    p = pnl_from_dict(trade)
     return p is not None and p < 0
 
 
 def is_win(trade: dict) -> bool:
-    p = pnl_cents(trade)
+    p = pnl_from_dict(trade)
     return p is not None and p > 0
 
 
@@ -314,7 +265,7 @@ def report_per_trade(trades: list[dict], fc_map: dict[str, dict],
                      targeted_ids: set[int], out: TextIO) -> None:
     print_header("PER-TRADE DRILL-DOWN", out)
     for t in trades:
-        p = pnl_cents(t)
+        p = pnl_from_dict(t)
         result = "WIN " if is_win(t) else ("LOSS" if is_loss(t) else "???")
         targeted = " ◄ TARGETED" if t["id"] in targeted_ids else ""
         flags = compute_flags(t, fc_map.get(t["ticker"], {}))
@@ -329,7 +280,7 @@ def report_per_trade(trades: list[dict], fc_map: dict[str, dict],
             print(f"         mkt_p_YES={t['market_p_entry']:.2f}"
                   f"  yes_bid={t['yes_bid_entry']}¢  yes_ask={t['yes_ask_entry']}¢", file=out)
         city = city_from_ticker(t["ticker"])
-        lh = local_hour(t["logged_at"], city)
+        lh = local_hour_from_utc(t["logged_at"], city)
         print(f"         city={city:<6s} mtype={market_type(t['ticker'])}"
               f"  dir={market_direction(t['ticker']):<8s} local_entry_hour={lh}", file=out)
         print(f"         exit_reason={t['exit_reason']}  pnl={p:+.0f}¢" if p is not None
@@ -340,7 +291,7 @@ def report_per_trade(trades: list[dict], fc_map: dict[str, dict],
         # Per-source forecast summary
         fc = fc_map.get(t["ticker"], {})
         if fc:
-            print(f"         forecasts:", file=out)
+            print("         forecasts:", file=out)
             for src, info in sorted(fc.items(), key=lambda x: -(x[1]["edge_max"] or 0)):
                 e_range = (f"edge=[{info['edge_min']:.1f},{info['edge_max']:.1f}]°F"
                            if info["edge_min"] is not None else "edge=N/A")
@@ -421,10 +372,10 @@ def report_entry_hour_winrate(losses: list[dict], wins: list[dict], out: TextIO)
     bl: dict[str, int] = defaultdict(int)
     for t in wins:
         city = city_from_ticker(t["ticker"])
-        bw[bucket(local_hour(t["logged_at"], city))] += 1
+        bw[bucket(local_hour_from_utc(t["logged_at"], city))] += 1
     for t in losses:
         city = city_from_ticker(t["ticker"])
-        bl[bucket(local_hour(t["logged_at"], city))] += 1
+        bl[bucket(local_hour_from_utc(t["logged_at"], city))] += 1
 
     all_b = sorted(set(bw) | set(bl))
     print(f"\n  {'Hour window':<12s}  {'W':>4s}  {'L':>4s}  {'Win%':>6s}", file=out)
@@ -468,7 +419,7 @@ def report_flag_checklist(targeted: list[dict], fc_map: dict[str, dict],
         if not is_loss(t):
             continue
         flags = compute_flags(t, fc_map.get(t["ticker"], {}))
-        p = pnl_cents(t)
+        p = pnl_from_dict(t)
         print(f"\n  #{t['id']}  {t['ticker']}  pnl={p:+.0f}¢", file=out)
         if flags:
             for f in flags:
@@ -514,7 +465,7 @@ def main() -> None:
 
     out: TextIO = open(args.out, "w") if args.out else sys.stdout
 
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DEFAULT_DB_PATH))
     conn.row_factory = sqlite3.Row
 
     # Determine which kinds to load
