@@ -104,7 +104,7 @@ async def _fetch_product(
         logging.warning("Coinbase: unparseable price %r for %s", raw, product_id)
         return None
 
-    logging.info("Coinbase [%s]: $%.4f", _LABELS[product_id], price)
+    logging.debug("Coinbase [%s]: $%.4f", _LABELS[product_id], price)
     return DataPoint(
         source   = "coinbase",
         metric   = metric,

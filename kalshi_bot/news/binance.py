@@ -105,11 +105,11 @@ async def fetch_prices(session: aiohttp.ClientSession) -> list[DataPoint]:
         _last_price[symbol] = price
 
         if pct_change is not None:
-            logging.info(
+            logging.debug(
                 "Binance [%s]: $%.4f  %+.3f%%", _LABELS[symbol], price, pct_change * 100
             )
         else:
-            logging.info("Binance [%s]: $%.4f", _LABELS[symbol], price)
+            logging.debug("Binance [%s]: $%.4f", _LABELS[symbol], price)
 
         data_points.append(
             DataPoint(

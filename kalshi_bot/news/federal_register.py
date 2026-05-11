@@ -39,7 +39,7 @@ async def fetch_documents(
             resp.raise_for_status()
             data = await resp.json()
             docs = data.get("results", [])
-            logging.info(
+            logging.debug(
                 "Federal Register [%s]: fetched %d documents.", agency_slug, len(docs)
             )
             return docs

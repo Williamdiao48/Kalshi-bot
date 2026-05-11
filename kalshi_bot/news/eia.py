@@ -125,7 +125,7 @@ async def fetch_prices(session: aiohttp.ClientSession) -> list[DataPoint]:
         if result is None:
             return None
         value, period_str = result
-        logging.info("EIA [%s]: %.4f %s (as of %s)", label, value, unit, period_str)
+        logging.debug("EIA [%s]: %.4f %s (as of %s)", label, value, unit, period_str)
         return DataPoint(
             source="eia",
             metric=metric,

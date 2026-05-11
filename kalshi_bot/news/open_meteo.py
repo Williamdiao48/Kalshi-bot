@@ -306,7 +306,7 @@ async def _fetch_city_forecast(
                 ))
 
     if summary_parts:
-        logging.info("Open-Meteo [%s]: %s", city_name, "  ".join(summary_parts))
+        logging.debug("Open-Meteo [%s]: %s", city_name, "  ".join(summary_parts))
     else:
         logging.warning("Open-Meteo: no forecast data for %s", city_name)
 
@@ -452,7 +452,7 @@ async def fetch_model_forecasts(
     if points:
         _models_cache_time = now
         _models_cache_points = points
-        logging.info(
+        logging.debug(
             "Open-Meteo model forecasts: %d DataPoints (%d city×model fetches)",
             len(points), len(tasks),
         )

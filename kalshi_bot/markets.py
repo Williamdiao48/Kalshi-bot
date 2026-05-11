@@ -243,7 +243,7 @@ async def fetch_markets_by_series(
 
         await asyncio.sleep(0.2)
 
-    logging.info(
+    logging.debug(
         "Series fetch: %d market(s) across %d series.", len(all_markets), len(series_tickers)
     )
     return all_markets
@@ -266,7 +266,7 @@ async def fetch_markets(
         List of market dicts as returned by the Kalshi API.
     """
     markets = await _paginate(session, status=status, total_limit=limit)
-    logging.info("Fetched %d Kalshi markets.", len(markets))
+    logging.debug("Fetched %d Kalshi markets.", len(markets))
     return markets
 
 
@@ -308,7 +308,7 @@ async def fetch_all_markets(
     seen = {m["ticker"] for m in series_markets}
     combined = series_markets + [m for m in general_markets if m["ticker"] not in seen]
 
-    logging.info(
+    logging.debug(
         "Full market sync: %d total (%d series + %d general, %d deduped).",
         len(combined),
         len(series_markets),

@@ -159,5 +159,5 @@ async def fetch_contracts(session: aiohttp.ClientSession) -> list[PredictItContr
         except (ValueError, TypeError):
             continue
 
-    logging.info("PredictIt: %d active binary market(s) fetched.", len(contracts))
+    logging.debug("PredictIt: %d active binary market(s) fetched.", len(contracts))
     return contracts

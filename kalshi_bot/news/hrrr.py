@@ -206,7 +206,7 @@ async def fetch_hourly_temps(
                     hourly_lows[low_metric] = low
 
     if hourly_highs:
-        logging.info(
+        logging.debug(
             "HRRR: hourly temps resolved for %d/%d city(ies) (highs=%d lows=%d).",
             len(hourly_highs), len(CITIES), len(hourly_highs), len(hourly_lows),
         )

@@ -155,7 +155,7 @@ async def _fetch_symbol(
     if previous_close and previous_close != 0:
         pct_change = (regular_price - previous_close) / previous_close
 
-    logging.info(
+    logging.debug(
         "Yahoo Finance [%s]: %.2f  %+.2f%%  state=%s",
         label,
         regular_price,
@@ -194,7 +194,7 @@ async def _fetch_symbol(
                 datetime.fromtimestamp(pre_ts, tz=timezone.utc).isoformat()
                 if pre_ts else as_of
             )
-            logging.info(
+            logging.debug(
                 "Yahoo Finance [%s] PRE-MARKET: %.2f  %+.2f%%",
                 label, pre_price, (pre_pct or 0) * 100,
             )

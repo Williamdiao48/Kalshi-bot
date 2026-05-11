@@ -140,7 +140,7 @@ async def fetch_rates(session: aiohttp.ClientSession) -> list[DataPoint]:
         if result is None:
             return None
         value, date_str = result
-        logging.info("FRED [%s]: %.4f%s (as of %s)", label, value, unit, date_str)
+        logging.debug("FRED [%s]: %.4f%s (as of %s)", label, value, unit, date_str)
         return DataPoint(
             source="fred",
             metric=metric,

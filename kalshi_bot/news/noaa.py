@@ -495,7 +495,7 @@ async def _fetch_high_temp(
             },
         ))
 
-    logging.info(
+    logging.debug(
         "NOAA [%s]: day1=%.1f%s  %s  observed_max=%s",
         city_name,
         forecast_temp, unit,
@@ -704,7 +704,7 @@ async def _fetch_low_temp(
             low_obs_url = obs_url
         observed_min = await _fetch_observed_min_today(session, city_name, low_obs_url, city_tz)
 
-    logging.info(
+    logging.debug(
         "NOAA low [%s]: %s  observed_min=%s",
         city_name,
         "  ".join(extended_summary) if extended_summary else "no nighttime periods",

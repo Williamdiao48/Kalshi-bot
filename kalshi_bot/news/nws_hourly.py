@@ -239,7 +239,7 @@ async def _fetch_city_hourly(
             ))
 
     if summary_parts:
-        logging.info("NWS Hourly [%s]: %s", city_name, "  ".join(summary_parts))
+        logging.debug("NWS Hourly [%s]: %s", city_name, "  ".join(summary_parts))
     else:
         logging.warning("NWS Hourly: no hourly data for %s", city_name)
 

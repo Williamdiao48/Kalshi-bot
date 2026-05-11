@@ -117,7 +117,7 @@ async def _fetch_pair(
         datetime.now(timezone.utc).isoformat()
     )
 
-    logging.info("Yahoo Forex [%s]: %.5f", label, price)
+    logging.debug("Yahoo Forex [%s]: %.5f", label, price)
     return DataPoint(
         source   = "yahoo_forex",
         metric   = metric,

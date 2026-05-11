@@ -129,5 +129,5 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list[PolyMarket]:
         except (ValueError, TypeError, json.JSONDecodeError):
             continue
 
-    logging.info("Polymarket: fetched %d active binary markets.", len(markets))
+    logging.debug("Polymarket: fetched %d active binary markets.", len(markets))
     return markets

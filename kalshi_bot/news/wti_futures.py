@@ -192,7 +192,7 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
             symbol, price, days_to_ltd,
         )
     else:
-        logging.info(
+        logging.debug(
             "WTI Futures [%s]: %.2f $/bbl  state=%s  (Kalshi LTD=%s, %d days)",
             symbol, price, market_state, ltd, days_to_ltd,
         )

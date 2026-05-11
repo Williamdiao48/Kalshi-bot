@@ -128,5 +128,5 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list[ManifoldMarket]:
         except (ValueError, TypeError):
             continue
 
-    logging.info("Manifold: %d active binary market(s) fetched.", len(markets))
+    logging.debug("Manifold: %d active binary market(s) fetched.", len(markets))
     return markets

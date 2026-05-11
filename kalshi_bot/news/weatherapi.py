@@ -175,7 +175,7 @@ async def _fetch_city_forecast(
         ))
 
     if summary_parts:
-        logging.info("WeatherAPI [%s]: %s", city_name, "  ".join(summary_parts))
+        logging.debug("WeatherAPI [%s]: %s", city_name, "  ".join(summary_parts))
     else:
         logging.warning("WeatherAPI: no forecast data for %s", city_name)
 

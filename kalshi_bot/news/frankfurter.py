@@ -58,7 +58,7 @@ async def _fetch_pair(
 
     rate = float(rate)
     ecb_date: str = data.get("date", as_of)
-    logging.info("Frankfurter [%s/%s]: %.5f (ECB date: %s)", base, quote, rate, ecb_date)
+    logging.debug("Frankfurter [%s/%s]: %.5f (ECB date: %s)", base, quote, rate, ecb_date)
 
     return DataPoint(
         source="frankfurter",

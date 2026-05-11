@@ -282,7 +282,7 @@ async def _fetch_city_climo(
         if min_f is not None:
             _min_cache[min_cache_key] = min_f
 
-        logging.info(
+        logging.debug(
             "NWS climo [%s]: today's preliminary max = %.1f°F  min = %s (from %s)",
             city_name, max_f,
             f"{min_f:.1f}°F" if min_f is not None else "N/A",
@@ -338,5 +338,5 @@ async def fetch_city_climo(session: aiohttp.ClientSession) -> list[DataPoint]:
         elif result:
             points.extend(result)
     if points:
-        logging.info("NWS climo: fetched %d city reading(s).", len(points))
+        logging.debug("NWS climo: fetched %d city reading(s).", len(points))
     return points

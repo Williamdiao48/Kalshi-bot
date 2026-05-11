@@ -262,7 +262,7 @@ async def _fetch_feed(
         return []
 
     articles = _parse_feed_xml(content, feed)
-    logging.info("RSS [%s]: %d article(s) fetched.", feed.name, len(articles))
+    logging.debug("RSS [%s]: %d article(s) fetched.", feed.name, len(articles))
     return articles
 
 
@@ -293,5 +293,5 @@ async def fetch_all_feeds(
         else:
             articles.extend(result)
 
-    logging.info("RSS: %d total articles across %d feed(s).", len(articles), len(feeds))
+    logging.debug("RSS: %d total articles across %d feed(s).", len(articles), len(feeds))
     return articles

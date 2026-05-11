@@ -154,7 +154,7 @@ def _parse_response(data: list | dict) -> FOMCMeeting | None:
         hold_prob=hold_prob,
         hike_prob=hike_prob,
     )
-    logging.info(
+    logging.debug(
         "CME FedWatch [%s]: cut=%.1f%%  hold=%.1f%%  hike=%.1f%%",
         meeting.date,
         meeting.cut_prob  * 100,
@@ -242,7 +242,7 @@ async def fetch_fedwatch_datapoints(
     )
     expected_rate = CME_CURRENT_RATE + expected_change_pct
 
-    logging.info(
+    logging.debug(
         "CME FedWatch DataPoint: current_rate=%.2f%%  E[change]=%.3f%%"
         "  E[rate]=%.3f%%  (cut=%.1f%% hold=%.1f%% hike=%.1f%%)",
         CME_CURRENT_RATE, expected_change_pct, expected_rate,

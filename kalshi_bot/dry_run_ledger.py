@@ -926,6 +926,8 @@ class DryRunLedger:
                     trade.yes_bid = int(bid)
                     trade.yes_ask = int(ask)
                     if trade.side == "yes":
+                        # Uses orderbook bid, not last_price — can diverge in thin
+                        # markets where a stale high bid sits above recent trades.
                         trade.current_mid = float(bid)
                     else:
                         trade.current_mid = float(100 - ask)

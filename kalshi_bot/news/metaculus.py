@@ -122,5 +122,5 @@ async def fetch_questions(session: aiohttp.ClientSession) -> list[MetaculusQuest
         except (ValueError, TypeError):
             continue
 
-    logging.info("Metaculus: %d active binary question(s) fetched.", len(questions))
+    logging.debug("Metaculus: %d active binary question(s) fetched.", len(questions))
     return questions

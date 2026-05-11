@@ -777,6 +777,7 @@ class ExitManager:
             lp = getattr(trade, "limit_price", 100)
             entry_cost = lp if side == "yes" else (100 - lp)
             profit_take_thresh = self._resolve_profit_take(src, side, entry_cost)
+            is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
 
             _sl_composite = f"{src}:{side}"
             stop_loss_thresh = EXIT_SOURCE_STOP_LOSS.get(

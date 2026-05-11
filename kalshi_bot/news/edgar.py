@@ -150,5 +150,5 @@ async def fetch_filings(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
         return []
 
     filings = _parse_atom(content)
-    logging.info("EDGAR: %d 8-K filing(s) fetched.", len(filings))
+    logging.debug("EDGAR: %d 8-K filing(s) fetched.", len(filings))
     return filings

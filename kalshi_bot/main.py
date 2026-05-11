@@ -74,7 +74,7 @@ _LOG_DIR.mkdir(exist_ok=True)
 _log_handler = logging.FileHandler(_LOG_DIR / "bot.log")
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S"))
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(), _log_handler],
@@ -708,7 +708,7 @@ async def _get_markets(session: aiohttp.ClientSession) -> list[dict]:
     now = time.monotonic()
 
     if now - _numeric_cache_ts > NUMERIC_MARKET_REFRESH_INTERVAL:
-        logging.info("Numeric market cache stale — refreshing %d series …", len(NUMERIC_SERIES))
+        logging.debug("Numeric market cache stale — refreshing %d series …", len(NUMERIC_SERIES))
         fresh = await fetch_markets_by_series(session, status="open")
         if fresh:
             _numeric_cache = fresh
@@ -717,7 +717,7 @@ async def _get_markets(session: aiohttp.ClientSession) -> list[dict]:
             logging.warning("Numeric market sync returned empty.")
 
     if now - _general_cache_ts > GENERAL_MARKET_REFRESH_INTERVAL:
-        logging.info(
+        logging.debug(
             "General market cache stale — fetching %d text series …", len(TEXT_SERIES)
         )
         # Kalshi's default pagination returns thousands of KXMVE esports markets
@@ -726,7 +726,7 @@ async def _get_markets(session: aiohttp.ClientSession) -> list[dict]:
         fresh_general = await fetch_markets_by_series(
             session, series_tickers=TEXT_SERIES, status="open", limit_per_series=200
         )
-        logging.info("General market cache: %d text-series markets fetched.", len(fresh_general))
+        logging.debug("General market cache: %d text-series markets fetched.", len(fresh_general))
         if fresh_general:
             _general_cache = fresh_general
             _general_cache_ts = now
@@ -840,7 +840,7 @@ def _drain_text_source(
     new = seen.filter_new(docs, id_field=id_field)
     skipped = len(docs) - len(new)
     if new:
-        logging.info("%s: %d new item(s) (%d already seen).", label, len(new), skipped)
+        logging.debug("%s: %d new item(s) (%d already seen).", label, len(new), skipped)
     # Tag each doc so the matcher can report which feed it came from
     for d in new:
         d.setdefault("_source", source_tag)
@@ -925,7 +925,7 @@ def _compute_trajectory_projections(
             continue
 
         projected_peak = current_temp + projected_rise
-        logging.info(
+        logging.debug(
             "Trajectory [%s]: current=%.1f°F  slope=+%.2f°F/h  "
             "phase=%.0f%%  projected_peak=%.1f°F  (+%.1f°F in %.1fh)",
             dp.metric, current_temp, slope_fph,
@@ -1260,7 +1260,7 @@ async def _poll(
         for src, ids in by_source.items():
             seen.mark_many(ids, source=src)
     else:
-        logging.info("No new text items this cycle.")
+        logging.debug("No new text items this cycle.")
 
     # ---- HRRR hourly highs (quality gate + forecast corroboration source) ---
     hrrr_hourly_highs: dict[str, float] = {}
@@ -1396,7 +1396,7 @@ async def _poll(
         for _metric, _hval in (hrrr_hourly_highs or {}).items():
             _obs = _obs_high.get(_metric)
             if _obs is not None and _obs > _hval:
-                logging.info(
+                logging.debug(
                     "HRRR observed-exceeds gate: suppressing hrrr %s=%.1f°F"
                     " — noaa_observed/metar running max=%.1f°F already exceeds it",
                     _metric, _hval, _obs,
@@ -1408,7 +1408,7 @@ async def _poll(
         for _metric, _lval in (hrrr_hourly_lows or {}).items():
             _obs = _obs_low.get(_metric)
             if _obs is not None and _obs < _lval:
-                logging.info(
+                logging.debug(
                     "HRRR observed-exceeds gate: suppressing hrrr %s=%.1f°F"
                     " — noaa_observed/metar running min=%.1f°F already below it",
                     _metric, _lval, _obs,
@@ -1516,7 +1516,7 @@ async def _poll(
             except (ValueError, AttributeError):
                 fx_fresh.append(dp)  # unparseable date: allow through
         if fx_stale:
-            logging.info(
+            logging.debug(
                 "Forex staleness gate: dropped %d stale Frankfurter DataPoint(s)"
                 " (ECB data older than %d day(s)).",
                 fx_stale, FOREX_MAX_STALE_DAYS,
@@ -1552,7 +1552,7 @@ async def _poll(
                     gdp_fresh.append(dp)
                 else:
                     gdp_stale += 1
-                    logging.info(
+                    logging.debug(
                         "GDPNow staleness gate: dropped fred_gdp_nowcast"
                         " series_date=%s (age %d day(s) > max %d)",
                         dp.as_of, age_days, GDPNOW_MAX_STALE_DAYS,
@@ -1560,7 +1560,7 @@ async def _poll(
             except (ValueError, AttributeError):
                 gdp_fresh.append(dp)  # unparseable date: allow through
         if gdp_stale:
-            logging.info(
+            logging.debug(
                 "GDPNow staleness gate: dropped %d stale GDPNow DataPoint(s)"
                 " (series date older than %d day(s)).",
                 gdp_stale, GDPNOW_MAX_STALE_DAYS,
@@ -1693,7 +1693,7 @@ async def _poll(
             else:
                 nxt = next_release(opp.metric, now_utc)
                 nxt_str = nxt.strftime("%Y-%m-%d %H:%M UTC") if nxt else "unknown"
-                logging.info(
+                logging.debug(
                     "Release gate: suppressed %s [%s] — outside %d-min window"
                     " (next release: %s)",
                     opp.market_ticker, opp.metric, RELEASE_WINDOW_MINUTES, nxt_str,
@@ -1701,7 +1701,7 @@ async def _poll(
         numeric_opps = passed_rw
         dropped_rw = before_rw - len(numeric_opps)
         if dropped_rw:
-            logging.info(
+            logging.debug(
                 "Release gate: suppressed %d opportunity(ies) outside %d-min release window.",
                 dropped_rw, RELEASE_WINDOW_MINUTES,
             )
@@ -1921,7 +1921,7 @@ async def _poll(
     # ---- orderbook enrichment (only matched tickers, concurrent) -----------
     pre_liquidity = len(text_opps) + len(numeric_opps) + len(poly_opps)
     if pre_liquidity == 0:
-        logging.info("No opportunities surfaced this cycle.")
+        logging.debug("No opportunities surfaced this cycle.")
         if ledger is not None:
             await ledger.refresh_and_write(
                 session,
@@ -1958,7 +1958,7 @@ async def _poll(
         # Serial fetching with a 0.5s gap between requests to stay within
         # Kalshi rate limits.  Only called for tickers not in the market cache
         # (typically poly matches to general markets).
-        logging.info(
+        logging.debug(
             "Fetching live orderbook for %d ticker(s) not in market cache …",
             len(missing_tickers),
         )
@@ -2516,18 +2516,18 @@ async def _poll(
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)
     if total == 0:
-        logging.info("No new opportunities to surface this cycle.")
+        logging.debug("No new opportunities to surface this cycle.")
         executor.stats.log_summary()
         executor.stats.reset()
         if ledger is not None:
-            logging.info("DryRunLedger: refreshing overview (no-trade cycle).")
+            logging.debug("DryRunLedger: refreshing overview (no-trade cycle).")
             await ledger.refresh_and_write(
                 session,
                 numeric_opps=_exit_numeric_opps,
                 poly_opps=_exit_poly_opps,
                 data_points=data_points,
             )
-            logging.info("DryRunLedger: overview write complete.")
+            logging.debug("DryRunLedger: overview write complete.")
         return
 
     print(f"\n{_WIDE}")
@@ -2704,7 +2704,7 @@ def _adaptive_poll_interval(now_utc: datetime) -> int:
             is_within_release_window("eia_wti", now_utc, POLL_INTERVAL_EIA_WINDOW_MINUTES)
             or is_within_release_window("eia_natgas", now_utc, POLL_INTERVAL_EIA_WINDOW_MINUTES)
         ):
-            logging.info(
+            logging.debug(
                 "Adaptive poll: EIA release window active — using %ds interval.",
                 fast,
             )
@@ -2812,7 +2812,7 @@ async def _fast_loop(
         synoptic_celsius=_last_synoptic_celsius or None,
     )
     if signals:
-        logging.info("Fast loop: %d band_arb signal(s) found.", len(signals))
+        logging.debug("Fast loop: %d band_arb signal(s) found.", len(signals))
 
     fast_held: set[str] = set()
     if TRADE_DRY_RUN and ledger is not None:
@@ -2822,7 +2822,7 @@ async def _fast_loop(
 
     for signal in signals:
         if signal.ticker in fast_held:
-            logging.info(
+            logging.debug(
                 "Fast loop BandArb skip: %s in re-entry cooldown / held position.",
                 signal.ticker,
             )
@@ -2876,7 +2876,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                         logging.error("Win-rate tracker error: %s", exc)
 
                 _sleep = _adaptive_poll_interval(datetime.now(timezone.utc))
-                logging.info("Next poll in %ds …", _sleep)
+                logging.debug("Next poll in %ds …", _sleep)
                 # Interleave fast band-arb loops during the sleep window
                 _elapsed = 0.0
                 while _elapsed + FAST_LOOP_INTERVAL < _sleep:

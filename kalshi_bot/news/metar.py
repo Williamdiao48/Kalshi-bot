@@ -151,7 +151,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         logging.warning("METAR fetch failed: %s", exc)
         if _cache_points:
             stale = _filter_cache_to_today(now_utc)
-            logging.info(
+            logging.debug(
                 "METAR: serving stale cache after fetch failure "
                 "(%d/%d cities still valid for local today)",
                 len(stale), len(_cache_points),
@@ -284,7 +284,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
                 ))
 
     if summary_parts:
-        logging.info("METAR observed highs: %s", "  ".join(summary_parts))
+        logging.debug("METAR observed highs: %s", "  ".join(summary_parts))
     else:
         logging.warning("METAR: no valid temperature observations returned")
 

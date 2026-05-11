@@ -330,7 +330,7 @@ def _gate_forecast_source(
     ):
         obs_val = observed_values.get(opp.metric)
         if obs_val is not None and (opp.strike - obs_val) > MORNING_OBS_GAP_F:
-            logging.info(
+            logging.debug(
                 "Morning gate: suppressed %s YES forecast — observed %.1f°F"
                 " is %.1f°F below strike %.1f°F (gap > %.0f°F threshold)",
                 opp.market_ticker, obs_val,
@@ -361,7 +361,7 @@ def _gate_forecast_source(
                         hourly_yes = hourly_high <= opp.strike
                     outcome_flips = (daily_yes != hourly_yes)
                 if outcome_flips:
-                    logging.info(
+                    logging.debug(
                         "HRRR gate: suppressed %s — daily %.1f°F vs hourly %.1f°F"
                         " (spread %.1f°F flips outcome across strike %.1f°F)",
                         opp.market_ticker, opp.data_value, hourly_high,
@@ -381,7 +381,7 @@ def _gate_forecast_source(
                         )
                     return False
                 else:
-                    logging.info(
+                    logging.debug(
                         "HRRR spread %.1f°F on %s — daily %.1f°F and"
                         " hourly %.1f°F agree on outcome; allowing through",
                         spread, opp.market_ticker,
@@ -496,7 +496,7 @@ def _filter_weather_opportunities(
             # noaa_observed max-edge cap: very high edges signal a faulty sensor
             # reading (station reporting stale/wrong temp), not a genuine gap.
             if opp.source == "noaa_observed" and opp.edge > TEMP_OBSERVED_MAX_EDGE:
-                logging.info(
+                logging.debug(
                     "noaa_observed max-edge cap: edge=%.1f°F > %.1f°F on %s — "
                     "likely sensor error; suppressed",
                     opp.edge, TEMP_OBSERVED_MAX_EDGE, opp.market_ticker,
@@ -536,7 +536,7 @@ def _filter_weather_opportunities(
                         local_dt = now.astimezone(city_tz)
                         _mkt_date = _ticker_date(opp.market_ticker)
                         if _mkt_date is not None and _mkt_date != local_dt.date():
-                            logging.info(
+                            logging.debug(
                                 "Date guard (local): suppressed %s direction=over YES %s"
                                 " — market date %s ≠ city local date %s",
                                 opp.source, opp.market_ticker,
@@ -556,7 +556,7 @@ def _filter_weather_opportunities(
                             min_mins = (NOAA_OBS_LOW_PAST_LOCAL_HOUR * 60
                                         + NOAA_OBS_LOW_PAST_LOCAL_MINUTE)
                             if local_mins < min_mins:
-                                logging.info(
+                                logging.debug(
                                     "Morning gate: suppressed %s low-temp YES %s"
                                     " — local time %02d:%02d < %02d:%02d"
                                     " (overnight low not yet confirmed)",
@@ -581,7 +581,7 @@ def _filter_weather_opportunities(
                                         >= TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR
                                     )
                                     if _past_gate_hour:
-                                        logging.info(
+                                        logging.debug(
                                             "Forecast floor gate: suppressed noaa_observed YES %s"
                                             " — no tonight forecast after %02d:00 local"
                                             " (TEMP_LOW_YES_REQUIRE_FORECAST=true)",
@@ -602,7 +602,7 @@ def _filter_weather_opportunities(
                                     _fc_low is not None
                                     and _fc_low < opp.strike + TEMP_LOW_YES_FORECAST_BUFFER_F
                                 ):
-                                    logging.info(
+                                    logging.debug(
                                         "Forecast floor gate: suppressed noaa_observed YES %s"
                                         " — tonight forecast %.1f°F < strike+buf %.1f°F"
                                         " (strike=%.1f°F, buf=%.1f°F)",
@@ -630,7 +630,7 @@ def _filter_weather_opportunities(
                         # the city's local date, letting tomorrow's market slip through.
                         _mkt_date = _ticker_date(opp.market_ticker)
                         if _mkt_date is not None and _mkt_date != local_dt.date():
-                            logging.info(
+                            logging.debug(
                                 "Date guard (local): suppressed %s direction=%s YES %s"
                                 " — market date %s ≠ city local date %s",
                                 opp.source, opp.direction, opp.market_ticker,
@@ -639,7 +639,7 @@ def _filter_weather_opportunities(
                             continue
 
                         if local_mins < min_mins:
-                            logging.info(
+                            logging.debug(
                                 "Afternoon gate: suppressed %s YES %s"
                                 " — local time %02d:%02d < %02d:%02d"
                                 " (peak not yet confirmed)",
@@ -676,7 +676,7 @@ def _filter_weather_opportunities(
                     if OBS_CONSENSUS_MIN > 1:
                         confirming = obs_yes_sources.get((opp.metric, opp.strike), set())
                         if len(confirming) < OBS_CONSENSUS_MIN:
-                            logging.info(
+                            logging.debug(
                                 "Obs consensus gate: suppressed %s YES %s"
                                 " — %d/%d obs sources confirm"
                                 " (have: %s, need %d)",
@@ -720,7 +720,7 @@ def _filter_weather_opportunities(
                             if _noaa_meta_hi is not None and _noaa_meta_hi >= _ceil:
                                 _fc_ceiling_hits["noaa"] = _noaa_meta_hi
                             if _fc_ceiling_hits:
-                                logging.info(
+                                logging.debug(
                                     "Between-band YES fc-contradiction gate:"
                                     " suppressing %s %s — forecast(s) %s"
                                     " predict high ≥ strike_hi %.1f°F"
@@ -743,7 +743,7 @@ def _filter_weather_opportunities(
                                     )
                                 continue
 
-                        logging.info(
+                        logging.debug(
                             "%s LOCKED-BETWEEN-YES: %s  observed %.1f°F inside"
                             " [%.1f, %.1f], peak confirmed past %02d:%02d"
                             "  (edge %.1f°F above lo)",
@@ -752,14 +752,14 @@ def _filter_weather_opportunities(
                             min_mins // 60, min_mins % 60, opp.edge,
                         )
                     else:
-                        logging.info(
+                        logging.debug(
                             "%s LOCKED-YES: %s  observed %.1f°F already exceeds strike"
                             "  (edge %.1f°F)",
                             opp.source.upper(), opp.market_ticker,
                             opp.data_value, opp.edge,
                         )
                 else:
-                    logging.info(
+                    logging.debug(
                         "NWS ALERT-YES: %s  alert temp %.1f°F above strike"
                         "  (edge %.1f°F)",
                         opp.market_ticker, opp.data_value, opp.edge,
@@ -790,7 +790,7 @@ def _filter_weather_opportunities(
                         _mkt_date = _ticker_date(opp.market_ticker)
                         if _mkt_date == local_dt.date() and local_mins >= min_mins:
                             opp.peak_past = True
-                            logging.info(
+                            logging.debug(
                                 "%s LOCKED-NO: %s  observed %.1f°F < strike %.1f°F"
                                 ", peak confirmed past %02d:%02d  (edge %.1f°F)",
                                 opp.source.upper(), opp.market_ticker,
@@ -997,7 +997,7 @@ def _apply_forecast_consensus(
                         )
 
                     if _suppress:
-                        logging.info(
+                        logging.debug(
                             "KXLOWT obs-YES confirmation gate: suppressing %s YES %s"
                             " — %s",
                             ", ".join(o.source for o in _surviving_obs_yes),
@@ -1066,7 +1066,7 @@ def _apply_forecast_consensus(
             # Real-time sources must agree with each other first.
             rt_outcomes = {o.implied_outcome for o in realtime_fc}
             if len(rt_outcomes) > 1:
-                logging.info(
+                logging.debug(
                     "Consensus filter: real-time sources split on %s %s"
                     " — skipping (sources: %s)",
                     metric, ticker, {o.source for o in realtime_fc},
@@ -1078,7 +1078,7 @@ def _apply_forecast_consensus(
             # zone forecast) should not override nws_hourly+hrrr consensus.
             daily_oppose = [o for o in daily_fc if o.implied_outcome != forecast_outcome]
             if len(daily_oppose) == len(daily_fc) and len(daily_fc) >= 2:
-                logging.info(
+                logging.debug(
                     "Consensus filter: all daily sources %s oppose"
                     " real-time (%s) on %s %s — skipping",
                     {o.source for o in daily_oppose},
@@ -1112,14 +1112,14 @@ def _apply_forecast_consensus(
                 ext_oppose = [o for o in ext_fc if o.implied_outcome != forecast_outcome]
                 if ext_oppose and len(ext_oppose) == len(ext_fc) and len(ext_fc) >= 2:
                     # ALL external models unanimously oppose NWS → too uncertain.
-                    logging.info(
+                    logging.debug(
                         "Consensus filter: all external models %s oppose"
                         " NWS primary (%s) on %s %s — skipping",
                         {o.source for o in ext_oppose},
                         forecast_outcome, metric, ticker,
                     )
                     continue
-                logging.info(
+                logging.debug(
                     "Consensus filter: NWS primary (%s) on %s %s"
                     " — %d external validator(s) oppose but not unanimous; allowing",
                     forecast_outcome, metric, ticker, len(ext_oppose),
@@ -1129,7 +1129,7 @@ def _apply_forecast_consensus(
                 yes_count = sum(1 for o in forecasts if o.implied_outcome == "YES")
                 no_count = sum(1 for o in forecasts if o.implied_outcome == "NO")
                 if yes_count == no_count:
-                    logging.info(
+                    logging.debug(
                         "Consensus filter: forecasts tied on %s %s — skipping"
                         " (sources: %s yes=%d no=%d)",
                         metric, ticker,
@@ -1157,7 +1157,7 @@ def _apply_forecast_consensus(
             else:
                 obs_outcome = None
             if obs_outcome is not None and obs_outcome != forecast_outcome:
-                logging.info(
+                logging.debug(
                     "Consensus filter: noaa_observed (%.1f°F → %s) conflicts"
                     " with forecast (%s) on %s %s — suppressing forecast",
                     obs_val, obs_outcome, forecast_outcome, metric, ticker,
@@ -1190,7 +1190,7 @@ def _apply_forecast_consensus(
             gfs_only = not noaa_yes  # True when no NOAA/HRRR/obs_trajectory source is in YES set
             solo_unreliable = len(yes_sources) == 1 and yes_sources <= _SOLO_BLOCKED
             if (gfs_only or solo_unreliable) and len(yes_sources) < 2:
-                logging.info(
+                logging.debug(
                     "Corroboration gate: lone %s YES on %s %s — "
                     "unreliable source may not trade solo; suppressed",
                     ", ".join(yes_sources), metric, ticker,
@@ -1218,7 +1218,7 @@ def _apply_forecast_consensus(
             )
             if not gfs_only and not obs_traj_solo and _corr_min > 1:
                 if len(yes_sources) < _corr_min:
-                    logging.info(
+                    logging.debug(
                         "Corroboration gate: %s YES on %s %s"
                         " (need %d sources%s, have %d) — suppressed",
                         next(iter(yes_sources)), metric, ticker,
@@ -1251,7 +1251,7 @@ def _apply_forecast_consensus(
                 if any(s == p or s.startswith(p + "_") for p in _NOAA_FUTURE_PREFIXES)
             }
             if _noaa_future and not (yes_sources - _noaa_future):
-                logging.info(
+                logging.debug(
                     "Corroboration gate: day-ahead NOAA-only YES on %s %s"
                     " (%s) — no independent model confirms; suppressed",
                     metric, ticker, ", ".join(sorted(_noaa_future)),
@@ -1274,7 +1274,7 @@ def _apply_forecast_consensus(
             # A weatherapi-only NO on a future-day market is suppressed regardless
             # of FORECAST_CORROBORATION_MIN.
             if len(no_sources_fday) == 1 and no_sources_fday <= {"open_meteo", "weatherapi"}:
-                logging.info(
+                logging.debug(
                     "Corroboration gate: lone %s NO on future-day %s %s — "
                     "unreliable source may not trade solo; suppressed",
                     ", ".join(no_sources_fday), metric, ticker,
@@ -1288,7 +1288,7 @@ def _apply_forecast_consensus(
                 )
                 continue
             if len(no_sources_fday) < FORECAST_CORROBORATION_MIN:
-                logging.info(
+                logging.debug(
                     "Corroboration gate: lone %s NO on future-day %s %s"
                     " (need %d sources, have %d) — suppressed",
                     ", ".join(sorted(no_sources_fday)), metric, ticker,
@@ -1317,7 +1317,7 @@ def _apply_forecast_consensus(
                 above = [o for o in no_forecasts_fday if o.data_value > ref_opp.strike_hi]
                 below = [o for o in no_forecasts_fday if o.data_value < ref_opp.strike_lo]
                 if above and below:
-                    logging.info(
+                    logging.debug(
                         "Corroboration gate: contradictory NO on between %s %s"
                         " — sources disagree on which side of band"
                         " (above=%s, below=%s); suppressed",
@@ -1349,7 +1349,7 @@ def _apply_forecast_consensus(
                 rt_no and not daily_no and len(rt_no) < 2
                 and rt_no != frozenset({"hrrr"})  # HRRR alone is high-quality; exempt
             ):
-                logging.info(
+                logging.debug(
                     "Corroboration gate: lone real-time NO (%s) on same-day"
                     " %s %s with no daily-source agreement — suppressed",
                     rt_no, metric, ticker,
@@ -1367,7 +1367,7 @@ def _apply_forecast_consensus(
                 and daily_no <= _DAILY_UNRELIABLE
                 and len(daily_no) == 1
             ):
-                logging.info(
+                logging.debug(
                     "Corroboration gate: lone unreliable daily-model NO (%s)"
                     " on same-day %s %s — suppressed (no real-time corroboration)",
                     ", ".join(daily_no), metric, ticker,
