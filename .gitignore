@@ -38,12 +38,7 @@ data/
 .DS_Store
 .claudeignore
 .aiignore
+.mcp.json
 .claude/
 CLAUDE.md
-AI_MODEL_PLAN.md
-ROADMAP.md
-rules.md
-ARCHITECTURE.md
-CONTRIBUTING.md
-INTERNALS.md
-findings.md
+docs/

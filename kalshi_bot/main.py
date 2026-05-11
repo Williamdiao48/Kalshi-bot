@@ -4140,8 +4140,7 @@ async def _fast_loop(
 async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
     """Start the bot and poll indefinitely."""
     logging.info(
-        "Kalshi bot starting — interval=%ds  fed-agencies=%d  "
-        "numeric-sources=7  external-forecast-sources=3",
+        "Kalshi bot starting — interval=%ds  fed-agencies=%d",
         poll_interval,
         len(AGENCIES),
     )

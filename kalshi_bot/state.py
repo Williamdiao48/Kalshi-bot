@@ -30,6 +30,7 @@ class SeenDocuments:
         logging.debug("SeenDocuments store opened at %s", self._db_path)
 
     def _init_schema(self) -> None:
+        # Connection is autocommit (isolation_level=None); no commit() needed.
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS seen_documents (
@@ -39,7 +40,6 @@ class SeenDocuments:
             )
             """
         )
-        self._conn.commit()
 
     def contains(self, doc_id: str) -> bool:
         """Return True if this document ID has already been processed."""
@@ -54,15 +54,13 @@ class SeenDocuments:
             "INSERT OR IGNORE INTO seen_documents (doc_id, source) VALUES (?, ?)",
             (doc_id, source),
         )
-        self._conn.commit()
 
     def mark_many(self, doc_ids: list[str], source: str = "") -> None:
-        """Record multiple document IDs as processed in a single transaction."""
+        """Record multiple document IDs as processed."""
         self._conn.executemany(
             "INSERT OR IGNORE INTO seen_documents (doc_id, source) VALUES (?, ?)",
             [(doc_id, source) for doc_id in doc_ids],
         )
-        self._conn.commit()
 
     def filter_new(
         self, docs: list[dict], id_field: str = "document_number"
@@ -70,6 +68,7 @@ class SeenDocuments:
         """Return only documents whose ID has not been seen before.
 
         Uses a single batched SQL query instead of N individual lookups.
+        Documents missing the id_field are treated as new and logged as a warning.
 
         Args:
             docs:     List of document dicts.
@@ -80,16 +79,32 @@ class SeenDocuments:
         """
         if not docs:
             return []
-        ids = [str(d.get(id_field, "")) for d in docs]
-        placeholders = ",".join("?" * len(ids))
-        seen_ids = {
-            row[0]
-            for row in self._conn.execute(
-                f"SELECT doc_id FROM seen_documents WHERE doc_id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        }
-        return [d for d in docs if str(d.get(id_field, "")) not in seen_ids]
+        valid: list[tuple[dict, str]] = []
+        for d in docs:
+            raw = d.get(id_field)
+            doc_id = str(raw) if raw is not None else ""
+            if not doc_id:
+                logging.warning(
+                    "filter_new: document missing '%s' field — skipping dedup check, treating as new",
+                    id_field,
+                )
+                valid.append((d, ""))
+            else:
+                valid.append((d, doc_id))
+
+        ids_to_check = [doc_id for _, doc_id in valid if doc_id]
+        seen_ids: set[str] = set()
+        if ids_to_check:
+            placeholders = ",".join("?" * len(ids_to_check))
+            seen_ids = {
+                row[0]
+                for row in self._conn.execute(
+                    f"SELECT doc_id FROM seen_documents WHERE doc_id IN ({placeholders})",
+                    ids_to_check,
+                ).fetchall()
+            }
+
+        return [d for d, doc_id in valid if doc_id not in seen_ids]
 
     def close(self) -> None:
         self._conn.close()
