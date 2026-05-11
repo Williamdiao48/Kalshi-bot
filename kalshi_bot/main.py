@@ -21,14 +21,14 @@ import collections
 from datetime import datetime, timezone, timedelta, date
 import logging
 import os
-from .utils import env_bool, env_float, env_int, parse_iso_dt
+from .utils import env_float, env_int, parse_iso_dt
 from pathlib import Path
 import time
 
 import aiohttp
 
 from .markets import fetch_market_detail, fetch_markets_by_series, NUMERIC_SERIES, TEXT_SERIES
-from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC, ticker_date as _ticker_date
+from .market_parser import scan_unknown_series, parse_market, TICKER_TO_METRIC
 from .matcher import find_opportunities, Opportunity
 from .data import DataPoint
 from .numeric_matcher import find_numeric_opportunities, NumericOpportunity
@@ -40,7 +40,6 @@ from .arb_detector import (
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
 from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
-from .cities import CITY_TZ as _CITY_TZ
 from .news import federal_register
 from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
 from .news import polymarket, metaculus, manifold, edgar, predictit
@@ -57,7 +56,6 @@ from .scoring import (
     score_numeric_opportunity,
     score_poly_opportunity,
     METRIC_EDGE_SCALES,
-    resolve_min_edge as _resolve_min_edge,
 )
 from .release_schedule import is_within_release_window, next_release
 from .state import SeenDocuments
@@ -955,6 +953,14 @@ def _compute_trajectory_projections(
 
 
 
+_DAILY_CLOSE_PREFIXES: tuple[str, ...] = (
+    "KXBTCD", "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",
+)
+_EXEMPT_15M_PREFIXES: tuple[str, ...] = (
+    "KXDOGE15M", "KXADA15M", "KXAVAX15M", "KXLINK15M", "KXBNB15M",
+)
+
+
 def _is_daily_close_crypto(ticker: str) -> bool:
     """Return True if ticker is a daily-close crypto market (not a 15M market)."""
     if ticker.startswith(_EXEMPT_15M_PREFIXES):
@@ -1710,15 +1716,6 @@ async def _poll(
     #
     # Daily-close prefixes (no "15M" suffix): KXBTCD, KXDOGE, KXADA,
     # KXAVAX, KXLINK.  Note: KXDOGE15M / KXDOGE are distinguished by
-    # checking that the ticker segment after the prefix is a date (starts
-    # with a digit), not "15M".
-    _DAILY_CLOSE_PREFIXES: tuple[str, ...] = (
-        "KXBTCD", "KXDOGE", "KXADA", "KXAVAX", "KXLINK", "KXBNB",
-    )
-    _EXEMPT_15M_PREFIXES: tuple[str, ...] = (
-        "KXDOGE15M", "KXADA15M", "KXAVAX15M", "KXLINK15M", "KXBNB15M",
-    )
-
     if CRYPTO_DAILY_CLOSE_HOURS > 0 and numeric_opps:
         close_dt_index: dict[str, str | None] = {
             m.get("ticker", ""): m.get("close_time") or m.get("expiration_time")
