@@ -1754,36 +1754,11 @@ class TradeExecutor:
                     self.stats.filtered_score += 1
                     return
 
-        if self._is_category_tripped(opp.market_ticker):
-            logging.info(
-                "Trade skip (circuit breaker active for category %s): %s",
-                _ticker_category(opp.market_ticker), opp.market_ticker,
-            )
-            self.stats.filtered_circuit_break += 1
+        if self._circuit_breaker_tripped(opp.market_ticker, "Trade"):
             return
 
-        if MAX_TOTAL_EXPOSURE_CENTS > 0:
-            _exp_cap = self._effective_exposure_cap()
-            current_exposure = self._total_open_exposure_cents()
-            this_trade_cost  = count * cost_cents
-            if current_exposure + this_trade_cost > _exp_cap:
-                deficit = (current_exposure + this_trade_cost) - _exp_cap
-                freed = await self._recycle_capital(session, deficit)
-                current_exposure = self._total_open_exposure_cents()
-                if current_exposure + this_trade_cost > _exp_cap:
-                    logging.info(
-                        "Trade skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
-                        " recycled %d¢ but still insufficient): %s",
-                        current_exposure, this_trade_cost,
-                        _exp_cap, freed, opp.market_ticker,
-                    )
-                    self.stats.filtered_exposure += 1
-                    return
-                if freed > 0:
-                    logging.info(
-                        "CapitalRecycle: freed %d¢ — proceeding with %s",
-                        freed, opp.market_ticker,
-                    )
+        if await self._exposure_cap_exceeded(session, opp.market_ticker, count, cost_cents, "Trade"):
+            return
 
         logging.debug(
             "All filters passed — executing: %s %s %d×%d¢  p=%.3f  score=%.2f  src=%s",
@@ -1960,12 +1935,7 @@ class TradeExecutor:
                     self.stats.filtered_ticker_cool += 1
                     return
 
-        if self._is_category_tripped(opp.kalshi_ticker):
-            logging.info(
-                "Poly skip (circuit breaker active for category %s): %s",
-                _ticker_category(opp.kalshi_ticker), opp.kalshi_ticker,
-            )
-            self.stats.filtered_circuit_break += 1
+        if self._circuit_breaker_tripped(opp.kalshi_ticker, "Poly"):
             return
 
         self.stats.trades_attempted += 1
@@ -2514,11 +2484,7 @@ class TradeExecutor:
             )
 
         # Circuit breaker
-        if self._is_category_tripped(signal.ticker):
-            logging.info(
-                "BandArb skip (circuit breaker active for category %s): %s",
-                _ticker_category(signal.ticker), signal.ticker,
-            )
+        if self._circuit_breaker_tripped(signal.ticker, "BandArb"):
             return
 
         # Kelly sizing: use LOCKED_OBS parameters — this is near-certain observed data
@@ -2547,29 +2513,8 @@ class TradeExecutor:
             )
             return
 
-        if MAX_TOTAL_EXPOSURE_CENTS > 0:
-            _exp_cap = self._effective_exposure_cap()
-            cost_cents = signal.no_ask
-            current_exposure = self._total_open_exposure_cents()
-            this_trade_cost  = count * cost_cents
-            if current_exposure + this_trade_cost > _exp_cap:
-                deficit = (current_exposure + this_trade_cost) - _exp_cap
-                freed = await self._recycle_capital(session, deficit)
-                current_exposure = self._total_open_exposure_cents()
-                if current_exposure + this_trade_cost > _exp_cap:
-                    logging.info(
-                        "BandArb skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
-                        " recycled %d¢ but still insufficient): %s",
-                        current_exposure, this_trade_cost,
-                        _exp_cap, freed, signal.ticker,
-                    )
-                    self.stats.filtered_exposure += 1
-                    return
-                if freed > 0:
-                    logging.info(
-                        "CapitalRecycle: freed %d¢ — proceeding with BandArb %s",
-                        freed, signal.ticker,
-                    )
+        if await self._exposure_cap_exceeded(session, signal.ticker, count, signal.no_ask, "BandArb"):
+            return
 
         # Build corroborating sources list for this signal
         _band_corr: list[str] = ["metar"]
@@ -2663,11 +2608,7 @@ class TradeExecutor:
             )
 
         # Circuit breaker
-        if self._is_category_tripped(signal.ticker):
-            logging.info(
-                "BandArb YES skip (circuit breaker active for category %s): %s",
-                _ticker_category(signal.ticker), signal.ticker,
-            )
+        if self._circuit_breaker_tripped(signal.ticker, "BandArb YES"):
             return
 
         # Compute p_win and sizing parameters
@@ -2833,10 +2774,7 @@ class TradeExecutor:
             )
             return
 
-        if self._is_category_tripped(signal.ticker):
-            logging.info(
-                "ForecastNO skip (circuit breaker active): %s", signal.ticker,
-            )
+        if self._circuit_breaker_tripped(signal.ticker, "ForecastNO"):
             return
 
         count = kelly_contracts(
@@ -2861,20 +2799,8 @@ class TradeExecutor:
             )
             return
 
-        if MAX_TOTAL_EXPOSURE_CENTS > 0:
-            _exp_cap = self._effective_exposure_cap()
-            current_exposure = self._total_open_exposure_cents()
-            this_trade_cost  = count * signal.no_ask
-            if current_exposure + this_trade_cost > _exp_cap:
-                deficit = (current_exposure + this_trade_cost) - _exp_cap
-                freed = await self._recycle_capital(session, deficit)
-                current_exposure = self._total_open_exposure_cents()
-                if current_exposure + this_trade_cost > _exp_cap:
-                    logging.info(
-                        "ForecastNO skip (exposure cap): %s", signal.ticker,
-                    )
-                    self.stats.filtered_exposure += 1
-                    return
+        if await self._exposure_cap_exceeded(session, signal.ticker, count, signal.no_ask, "ForecastNO"):
+            return
 
         # Build note JSON for future analysis and signal invalidation checks
         _fno_note: dict = {
@@ -3144,6 +3070,48 @@ class TradeExecutor:
             tripped_until.strftime("%Y-%m-%d %H:%M"),
         )
         return True
+
+    def _circuit_breaker_tripped(self, ticker: str, label: str) -> bool:
+        """Return True (and log + count stat) if the circuit breaker is active for ticker."""
+        if self._is_category_tripped(ticker):
+            logging.info(
+                "%s skip (circuit breaker active for category %s): %s",
+                label, _ticker_category(ticker), ticker,
+            )
+            self.stats.filtered_circuit_break += 1
+            return True
+        return False
+
+    async def _exposure_cap_exceeded(
+        self,
+        session: aiohttp.ClientSession,
+        ticker: str,
+        count: int,
+        cost_cents: int,
+        label: str,
+    ) -> bool:
+        """Check exposure cap; attempt capital recycle. Returns True if trade should be skipped."""
+        if MAX_TOTAL_EXPOSURE_CENTS <= 0:
+            return False
+        _exp_cap = self._effective_exposure_cap()
+        current_exposure = self._total_open_exposure_cents()
+        this_trade_cost = count * cost_cents
+        if current_exposure + this_trade_cost <= _exp_cap:
+            return False
+        deficit = (current_exposure + this_trade_cost) - _exp_cap
+        freed = await self._recycle_capital(session, deficit)
+        current_exposure = self._total_open_exposure_cents()
+        if current_exposure + this_trade_cost > _exp_cap:
+            logging.info(
+                "%s skip (exposure cap: open=%d¢ + this=%d¢ > %d¢ limit,"
+                " recycled %d¢ but still insufficient): %s",
+                label, current_exposure, this_trade_cost, _exp_cap, freed, ticker,
+            )
+            self.stats.filtered_exposure += 1
+            return True
+        if freed > 0:
+            logging.info("CapitalRecycle: freed %d¢ — proceeding with %s", freed, ticker)
+        return False
 
     def _count_open_on_underlying(self, underlying_prefix: str) -> int:
         """Count open (not yet exited) trades on any strike of the given underlying prefix."""
