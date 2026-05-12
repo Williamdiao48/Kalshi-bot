@@ -410,16 +410,16 @@ def find_numeric_opportunities(
 
             outcome, raw_edge = _implied_outcome(dp.value, pm, pct_change)
 
-            # METAR KXLOWT between-YES: the running min can only fall, so only
-            # floor clearance matters for risk and sizing.  _implied_outcome
-            # returns min(floor_clearance, ceiling_clearance); for METAR the
-            # ceiling direction is irrelevant.  Forecast sources (hrrr,
+            # METAR/NWS-ASOS KXLOWT between-YES: the running min can only fall,
+            # so only floor clearance matters for risk and sizing.  _implied_outcome
+            # returns min(floor_clearance, ceiling_clearance); for observed sources
+            # the ceiling direction is irrelevant.  Forecast sources (hrrr,
             # open_meteo) have bi-directional error and correctly use the min.
             if (
                 outcome == "YES"
                 and pm.direction == "between"
                 and dp.metric.startswith("temp_low_")
-                and dp.source == "metar"
+                and dp.source in ("metar", "nws_asos")
                 and pm.strike_lo is not None
             ):
                 raw_edge = dp.value - (pm.strike_lo - 0.5)
@@ -428,12 +428,12 @@ def find_numeric_opportunities(
             if effective_edge < min_edge:
                 continue
 
-            # Overnight-low gap gate: for KXLOWT* NO signals from METAR,
+            # Overnight-low gap gate: for KXLOWT* NO signals from observed sources,
             # require current_temp - running_min >= METAR_LOW_MIN_GAP_F.
             # Blocks entries where the minimum hasn't been captured yet.
             if (
                 outcome == "NO"
-                and dp.source == "metar"
+                and dp.source in ("metar", "nws_asos")
                 and dp.metric.startswith("temp_low_")
             ):
                 _meta = dp.metadata or {}
@@ -467,8 +467,8 @@ def find_numeric_opportunities(
                     )
                     continue
 
-                # Clearance+hours gate (METAR only — backtest directly applies).
-                if dp.source == "metar":
+                # Clearance+hours gate (observed sources — backtest directly applies).
+                if dp.source in ("metar", "nws_asos"):
                     _floor_clearance = dp.value - (pm.strike_lo - 0.5)
                     _htc = close_time_by_ticker.get(pm.ticker)
                     if (

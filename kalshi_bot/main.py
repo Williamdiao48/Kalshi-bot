@@ -41,7 +41,7 @@ from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_
 from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import federal_register
-from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, wti_futures
+from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, manifold, edgar, predictit
 from .news import box_office
 from .box_office_matcher import match_box_office_to_kalshi
@@ -1067,6 +1067,7 @@ async def _poll(
         ("noaa",         noaa.fetch_city_forecasts(session)),
         ("nws_climo",    nws_climo.fetch_city_climo(session)),
         ("metar",        metar.fetch_city_forecasts(session)),
+        ("nws_asos",     nws_asos.fetch_city_observations(session)),
         ("nws_hourly",   nws_hourly.fetch_city_forecasts(session)),
         ("weatherapi",   weatherapi.fetch_city_forecasts(session)),
         ("open_meteo",        open_meteo.fetch_city_forecasts(session)),
@@ -1105,6 +1106,7 @@ async def _poll(
     noaa_result        = R["noaa"]
     nws_climo_result   = R["nws_climo"]
     metar_result       = R["metar"]
+    nws_asos_result    = R["nws_asos"]
     nws_hourly_result  = R["nws_hourly"]
     weatherapi_result  = R["weatherapi"]
     open_meteo_result        = R["open_meteo"]
@@ -1306,6 +1308,7 @@ async def _poll(
         ("NOAA",        noaa_result),
         ("NWS Climo",   nws_climo_result),
         ("METAR",       metar_result),
+        ("NWS ASOS",    nws_asos_result),
         ("NWS Hourly",  nws_hourly_result),
         ("WeatherAPI",  weatherapi_result),
         ("Open-Meteo",        open_meteo_result),
@@ -1383,7 +1386,7 @@ async def _poll(
         _obs_high: dict[str, float] = {}
         _obs_low:  dict[str, float] = {}
         for _dp in data_points:
-            if _dp.source not in ("noaa_observed", "metar"):
+            if _dp.source not in ("noaa_observed", "metar", "nws_asos"):
                 continue
             if _dp.metric.startswith("temp_high_"):
                 if _dp.metric not in _obs_high or _dp.value > _obs_high[_dp.metric]:
@@ -2011,7 +2014,7 @@ async def _poll(
     # 93¢ still yields a real 7¢ profit per contract once the day's high is
     # confirmed locked.  The market floor gate (8¢ minimum on our side) already
     # prevents entry above ~92¢, providing the upper bound.
-    _CONTRARIAN_EXEMPT = frozenset({"noaa_observed", "metar", "nws_climo", "nws_alert"})
+    _CONTRARIAN_EXEMPT = frozenset({"noaa_observed", "metar", "nws_asos", "nws_climo", "nws_alert"})
     if CONTRARIAN_MAX_ENTRY_CENTS > 0 and numeric_opps:
         before_ct = len(numeric_opps)
         passed_ct: list[NumericOpportunity] = []
@@ -2110,7 +2113,7 @@ async def _poll(
     # direction=between is included because the station-mismatch risk is identical:
     # the official settlement station could read outside the band even when our
     # ASOS station is inside it.
-    _OBS_OVER_SRCS = frozenset({"noaa_observed", "metar"})
+    _OBS_OVER_SRCS = frozenset({"noaa_observed", "metar", "nws_asos"})
     if NOAA_OBS_OVER_MAX_ENTRY_CENTS > 0 and numeric_opps:
         before_oo = len(numeric_opps)
         passed_oo: list[NumericOpportunity] = []
@@ -2363,6 +2366,17 @@ async def _poll(
                 _ld = (_dp.metadata or {}).get("local_date")
                 if _ld:
                     _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+    # Merge NWS ASOS (5-min cadence) into obs_early: ASOS wins only if higher for highs.
+    # temp_low is excluded (ASOS limit=12 only covers ~1hr; METAR 24hr lookback is correct for lows).
+    if not isinstance(nws_asos_result, Exception) and nws_asos_result:
+        for _dp in nws_asos_result:
+            if _dp.metric.startswith("temp_high_") and _dp.value is not None:
+                _existing = _band_arb_obs_early.get(_dp.metric)
+                if _existing is None or _dp.value > _existing:
+                    _band_arb_obs_early[_dp.metric] = _dp.value
+                    _ld = (_dp.metadata or {}).get("local_date")
+                    if _ld:
+                        _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
     # Staleness filter: only accept noaa_observed DataPoints whose as_of UTC date
     # matches today's UTC date.  At midnight the previous poll's noaa_observed value
     # (e.g. April 17 data) may still be in data_points; without this guard it can
@@ -2754,6 +2768,30 @@ async def _fast_loop(
             _ld = (_dp.metadata or {}).get("local_date")
             if _ld:
                 _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+
+    # NWS ASOS fetch — 5-min cadence; force-refresh at :53 to catch the
+    # synchronized NWS observation aligned with the METAR publication cycle.
+    try:
+        _asos_force = nws_asos.should_force_refresh()
+        _asos_points = await nws_asos.fetch_city_observations(session, force=_asos_force)
+        for _dp in _asos_points:
+            if _dp.metric.startswith("temp_high_") and _dp.value is not None:
+                _existing = obs_values.get(_dp.metric)
+                if _existing is None or _dp.value > _existing:
+                    obs_values[_dp.metric] = _dp.value
+                    _ld = (_dp.metadata or {}).get("local_date")
+                    if _ld:
+                        _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+            elif _dp.metric.startswith("temp_low_") and _dp.value is not None:
+                _existing = obs_values.get(_dp.metric)
+                if _existing is None or _dp.value < _existing:
+                    obs_values[_dp.metric] = _dp.value
+                    _ld = (_dp.metadata or {}).get("local_date")
+                    if _ld:
+                        _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+    except Exception as exc:
+        logging.debug("Fast loop: NWS ASOS fetch failed: %s", exc)
+
     if not obs_values:
         return
 

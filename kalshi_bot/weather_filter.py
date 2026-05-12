@@ -229,7 +229,7 @@ TEMP_LOW_YES_REQUIRE_FORECAST_AFTER_LOCAL_HOUR: int = int(
 # Source-tier constants
 # ---------------------------------------------------------------------------
 
-_OBS_CONFIRMED = frozenset({"noaa_observed", "nws_climo", "metar"})
+_OBS_CONFIRMED = frozenset({"noaa_observed", "nws_climo", "metar", "nws_asos"})
 # High-confidence tier that also includes NWS alert signals.
 # Used as the pass-through set in _filter_weather_opportunities and
 # _apply_forecast_consensus — these sources bypass the forecast consensus
@@ -277,7 +277,7 @@ def _gate_date_alignment(
                 return False
         except (ValueError, AttributeError):
             pass
-    elif opp.source in ("noaa_observed", "metar", "nws_climo"):
+    elif opp.source in ("noaa_observed", "metar", "nws_asos", "nws_climo"):
         _city_tz_dg = _CITY_TZ.get(opp.metric)
         if _city_tz_dg is not None:
             _local_date_dg = now.astimezone(_city_tz_dg).date()
@@ -828,9 +828,9 @@ def _apply_forecast_consensus(
     # so we can detect conflicts even when the observed opp was filtered out.
     _obs_value: dict[str, float] = {}
     for _dp in data_points:
-        if _dp.source in ("noaa_observed", "metar") and _dp.metric.startswith(("temp_high", "temp_low")):
-            # metar updates faster — prefer it over noaa_observed when both present
-            if _dp.source == "metar" or _dp.metric not in _obs_value:
+        if _dp.source in ("noaa_observed", "metar", "nws_asos") and _dp.metric.startswith(("temp_high", "temp_low")):
+            # metar/nws_asos update faster — prefer over noaa_observed when both present
+            if _dp.source in ("metar", "nws_asos") or _dp.metric not in _obs_value:
                 _obs_value[_dp.metric] = _dp.value
 
     # Forecast low per temp_low metric from all model sources.
@@ -908,7 +908,7 @@ def _apply_forecast_consensus(
             _obs_yes = [
                 o for o in observed
                 if o.implied_outcome == "YES"
-                and o.source in ("noaa_observed", "metar")
+                and o.source in ("noaa_observed", "metar", "nws_asos")
             ]
             if _obs_yes:
                 _strike = min(
@@ -955,7 +955,7 @@ def _apply_forecast_consensus(
             _surviving_obs_yes = [
                 o for o in observed
                 if o.implied_outcome == "YES"
-                and o.source in ("noaa_observed", "metar")
+                and o.source in ("noaa_observed", "metar", "nws_asos")
             ]
             if _surviving_obs_yes:
                 _confirm_strike = min(

@@ -1183,15 +1183,14 @@ def find_forecast_nos(
         if existing is None or dp.value < existing:
             obs_low_values[dp.metric] = dp.value
 
-    # Build observed-maximum lookup from metar DataPoints (temp_high_*).
+    # Build observed-maximum lookup from metar/nws_asos DataPoints (temp_high_*).
     # Used to veto HIGH-market signals where the running daily maximum has
     # already crossed the strike — at that point band_arb handles the signal
     # and forecast_no would be a duplicate at a worse price.
-    # We use metar only (noaa_observed for temp_high queries the full day,
-    # not just overnight, so it reliably represents the running daytime max).
+    # nws_asos (5-min cadence) supplements METAR (20–60 min cadence).
     obs_high_values: dict[str, float] = {}
     for dp in data_points:
-        if dp.source != "metar":
+        if dp.source not in ("metar", "nws_asos"):
             continue
         if not dp.metric.startswith("temp_high"):
             continue
