@@ -133,6 +133,8 @@ async def _fetch_station(
                 return []
             resp.raise_for_status()
             data = await resp.json(content_type=None)
+        # Wall-clock time the HTTP response was fully received.
+        fetch_wall_utc = datetime.now(timezone.utc)
     except aiohttp.ClientResponseError as exc:
         logging.debug("NWS ASOS HTTP %s for %s: %s", exc.status, icao, exc.message)
         return []
@@ -209,9 +211,20 @@ async def _fetch_station(
     as_of = datetime.combine(local_today, _dtime(12, 0), tzinfo=lst).isoformat()
     date_str = local_today.strftime("%Y-%m-%d")
 
+    # Log the most recent observation timestamp (what the API claims) and the
+    # wall-clock delivery time (when we actually received the HTTP response).
+    # The gap between the two is real API ingest/delivery latency.
+    if latest_ts:
+        try:
+            _asos_obs_ts = latest_ts[:16].replace("T", " ").rstrip("+").rstrip("0") + "Z"
+        except Exception:
+            _asos_obs_ts = latest_ts[:16]
+    else:
+        _asos_obs_ts = "?"
     logging.debug(
-        "NWS ASOS %s (%s): high=%.1f°F  low=%.1f°F  obs=%d",
-        icao, city_name, daily_max_f, daily_min_f if daily_min_f is not None else 0.0, obs_count,
+        "NWS ASOS %s (%s): high=%.1f°F  obs=%d  [obs=%s delivered=%s]",
+        icao, city_name, daily_max_f, obs_count,
+        _asos_obs_ts, fetch_wall_utc.strftime("%H:%M:%SZ"),
     )
 
     # Only emit temp_high_* DataPoints.  With limit=12 (~60 min of history) the

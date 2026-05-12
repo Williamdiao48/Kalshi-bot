@@ -147,6 +147,9 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         ) as resp:
             resp.raise_for_status()
             records: list[dict] = await resp.json()
+        # Wall-clock time the HTTP response was fully received — this is when
+        # the bot actually had the data, regardless of what obsTime says.
+        fetch_wall_utc = datetime.now(timezone.utc)
     except Exception as exc:
         logging.warning("METAR fetch failed: %s", exc)
         if _cache_points:
@@ -244,7 +247,20 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         as_of = datetime.combine(local_today, _dtime(12, 0), tzinfo=lst).isoformat()
         date_str = local_today.strftime("%Y-%m-%d")
 
-        summary_parts.append(f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo)")
+        # Log the most recent observation timestamp (what the API claims) AND
+        # the wall-clock time we received the HTTP response (when we actually
+        # had the data).  The gap between the two is FAA ADDS ingest delay —
+        # e.g. "obs=22:53Z delivered=23:54Z" would have flagged trade #117.
+        _latest_epoch = obs_today[-1][0] if obs_today else None
+        if _latest_epoch is not None:
+            _latest_dt = datetime.fromtimestamp(_latest_epoch, tz=timezone.utc)
+            _obs_label = (
+                f"obs={_latest_dt.strftime('%H:%MZ')}"
+                f" delivered={fetch_wall_utc.strftime('%H:%M:%SZ')}"
+            )
+        else:
+            _obs_label = "obs=? delivered=?"
+        summary_parts.append(f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo) [{_obs_label}]")
 
         points.append(DataPoint(
             source="metar",
