@@ -2526,6 +2526,7 @@ class TradeExecutor:
 
         # Encode signal snapshot as JSON note for future analysis
         _note_data: dict = {
+            "metric":        signal.metric,
             "observed_f":    round(signal.observed_max, 1),
             "band_ceil_f":   round(signal.band_ceil,   1),
             "margin_f":      round(signal.observed_max - signal.band_ceil, 2),

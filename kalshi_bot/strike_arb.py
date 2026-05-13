@@ -129,6 +129,13 @@ BAND_ARB_NOAA_NONE_MAX_NO_ASK: int = env_int("BAND_ARB_NOAA_NONE_MAX_NO_ASK", 40
 # low back inside the band (e.g. METAR 24.4°F rounds to 24°F, but 24.6°F
 # rounds to 25°F which is still inside [25–26]).
 BAND_ARB_LOW_BUFFER_F: float = env_float("BAND_ARB_LOW_BUFFER_F", 0.5)
+# Warm-side NO: minimum clearance (°F) between the METAR running daily min and the
+# band ceiling before firing a daytime NO signal on KXLOWT "between" markets.
+# Backtest optimal: 1.0°F; 3°F+ causes EV to go negative (NO too expensive).
+BAND_ARB_LOW_CEIL_BUFFER_F: float = env_float("BAND_ARB_LOW_CEIL_BUFFER_F", 1.0)
+# Earliest local hour at which the warm-side NO signal may fire.
+# P75 of daily low occurrence in May is 6–9 AM; 9 AM is safe for most cities.
+BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 9)
 # Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
 # data gap, or the midnight-to-1 AM window before the first QC obs arrives).
 # During this window only METAR and the market-price cap protect against
@@ -738,6 +745,7 @@ def find_band_arbs(
             continue
 
         is_definitive_no = False
+        is_warm_no = False
         band_ceil = 0.0
 
         if not is_low_market:
@@ -791,6 +799,30 @@ def find_band_arbs(
                 if parsed.strike_lo is not None and observed_max <= parsed.strike_lo - BAND_ARB_LOW_BUFFER_F:
                     is_definitive_no = True
                     band_ceil = parsed.strike_lo  # the floor that was breached
+                elif (
+                    BAND_ARB_LOW_CEIL_BUFFER_F > 0
+                    and parsed.strike_hi is not None
+                    and observed_max >= parsed.strike_hi + BAND_ARB_LOW_CEIL_BUFFER_F
+                ):
+                    # Warm-side NO: running daily min is already above the band ceiling.
+                    # Only fire after the overnight low is typically set (local hour gate)
+                    # and for same-day markets (hours_to_close < 20).
+                    _low_tz_key = parsed.metric.replace("temp_low_", "temp_high_")
+                    _low_tz_info = CITIES.get(_low_tz_key)
+                    _low_local_hour = (
+                        datetime.now(_low_tz_info[3]).hour
+                        if _low_tz_info is not None
+                        else datetime.now().hour
+                    )
+                    _close_time_str_warm = mkt.get("close_time") or mkt.get("expiration_time", "")
+                    _warm_htc = _hours_to_close(_close_time_str_warm)
+                    if (
+                        _warm_htc is not None
+                        and _warm_htc < 20
+                        and _low_local_hour >= BAND_ARB_LOW_CEIL_MIN_HOUR
+                    ):
+                        is_warm_no = True
+                        band_ceil = parsed.strike_hi
 
             elif parsed.direction == "over":
                 # "Over X°F": resolves NO when official low ≤ X.
@@ -821,6 +853,40 @@ def find_band_arbs(
                 is_definitive_no = False
 
         if not is_definitive_no:
+            # --- Warm-side NO: running daily min confirmed above band ceiling ---
+            if is_warm_no:
+                _noaa_warm = (noaa_obs_values or {}).get(parsed.metric)
+                _warm_corr = "metar_warm_confirmed"
+                if _noaa_warm is not None and _noaa_warm < band_ceil + BAND_ARB_LOW_CEIL_BUFFER_F:
+                    logging.debug(
+                        "KXLOWT warm-NO %s: NOAA obs %.1f°F below ceiling %.1f°F — "
+                        "METAR running min %.1f°F takes precedence",
+                        ticker, _noaa_warm, band_ceil, observed_max,
+                    )
+                    _warm_corr = "metar_warm_noaa_low"
+                _warm_city = mkt.get("subtitle", "") or ticker
+                signals.append(BandArbSignal(
+                    metric=parsed.metric,
+                    ticker=ticker,
+                    yes_bid=yes_bid,
+                    no_ask=no_ask,
+                    observed_max=observed_max,
+                    band_ceil=band_ceil,
+                    direction=parsed.direction,
+                    city=_warm_city,
+                    side="no",
+                    hours_to_close=_warm_htc or 0.0,
+                    strike_lo=band_ceil,
+                    corr_status=_warm_corr,
+                ))
+                logging.info(
+                    "BandArb warm-NO %s: running_min=%.1f°F >= ceil=%.1f°F+%.1f°F"
+                    " (local_hour=%d, htc=%.1fh) — daytime KXLOWT NO signal",
+                    ticker, observed_max, band_ceil,
+                    BAND_ARB_LOW_CEIL_BUFFER_F, _low_local_hour, _warm_htc or 0.0,
+                )
+                continue
+
             # --- YES signal: temperature inside band -----------------------
             if not BAND_ARB_YES_ENABLED:
                 continue
