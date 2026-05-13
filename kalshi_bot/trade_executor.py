@@ -199,10 +199,11 @@ NOAA_DAY2_MIN_SCORE: float = float(os.environ.get("NOAA_DAY2_MIN_SCORE", "0.90")
 NOAA_MIN_SCORE: float = env_float("NOAA_MIN_SCORE", 0.8)
 NOAA_OBSERVED_MIN_SCORE: float = env_float("NOAA_OBSERVED_MIN_SCORE", 0.8)
 
-# Block noaa_observed YES trades when the market prices YES at less than this
-# number of cents (i.e., market is ≥95% NO).  When YES ask < 5¢ the market has
-# already priced in near-certainty of NO; our p_estimate=1.0 always loses.
-NOAA_OBSERVED_MIN_YES_ASK: int = env_int("NOAA_OBSERVED_MIN_YES_ASK", 5)
+# Block noaa_observed YES trades when the market prices YES below this threshold.
+# Mirrors the NUMERIC_BETWEEN_YES_MIN_CENTS=60 gate for between-markets.
+# Historical data: noaa_observed YES on over/under markets below 60¢ win ~38%
+# (negative EV); band_arb covers the same domain with 92% win rate.
+NOAA_OBSERVED_MIN_YES_ASK: int = env_int("NOAA_OBSERVED_MIN_YES_ASK", 60)
 
 # Minimum YES ask for numeric YES trades.  When the market prices YES below this
 # threshold, the crowd is near-certain YES loses — thin signal edges (e.g. 0.5°F
@@ -2808,7 +2809,7 @@ class TradeExecutor:
         # Build note JSON for future analysis and signal invalidation checks
         _fno_note: dict = {
             "min_edge_f":    round(signal.min_edge_f, 1),
-            "max_edge_f":    round(max(e for _, _v, e in signal.source_details), 1) if signal.source_details else None,
+            "max_edge_f":    round(max(e for *_, e in signal.source_details), 1) if signal.source_details else None,
             "source_count":  signal.source_count,
             "sources_detail": [[s, round(v, 1), round(e, 1)] for s, v, e in signal.source_details],
             # Direction/strike fields used by exit_manager.check_forecast_no_invalidation()

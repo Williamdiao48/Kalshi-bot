@@ -452,7 +452,7 @@ EXIT_STOP_LOSS_MAX_SPREAD: int = int(
 # immediately regardless of the percentage gain.
 # Set to 0 to disable (falls back to the standard EXIT_SOURCE_PROFIT_TAKE logic).
 BAND_ARB_NO_EXIT_PRICE_CENTS: int = int(
-    os.environ.get("BAND_ARB_NO_EXIT_PRICE_CENTS", "95")
+    os.environ.get("BAND_ARB_NO_EXIT_PRICE_CENTS", "99")
 )
 
 # Absolute YES-bid threshold for band_arb:yes positions.  When yes_bid reaches
@@ -463,7 +463,7 @@ BAND_ARB_NO_EXIT_PRICE_CENTS: int = int(
 # so this gate is the primary exit trigger for most band_arb YES trades.
 # Set to 0 to disable.
 BAND_ARB_YES_EXIT_PRICE_CENTS: int = int(
-    os.environ.get("BAND_ARB_YES_EXIT_PRICE_CENTS", "95")
+    os.environ.get("BAND_ARB_YES_EXIT_PRICE_CENTS", "99")
 )
 
 # Hours past market close_time before a still-pending trade is treated as stale.
