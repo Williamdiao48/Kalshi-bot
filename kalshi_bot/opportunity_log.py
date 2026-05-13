@@ -390,6 +390,43 @@ class OpportunityLog:
                 rows,
             )
 
+    def log_asos_obs(self, asos_points: "list") -> None:
+        """Log NWS ASOS temperature observations to raw_forecasts as source 'nws_asos'.
+
+        Provides a 5-minute-cadence audit trail of what the ASOS stations were
+        reporting at each poll cycle — separate from the hourly METAR running
+        max/min so inter-hour temperature extremes are auditable post-hoc.
+        For temp_high_*: logs precise_max_f (decimal °F from Celsius conversion).
+        For temp_low_*: logs dp.value (running daily minimum).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for dp in asos_points:
+            if isinstance(dp, Exception):
+                continue
+            meta = dp.metadata or {}
+            if dp.metric.startswith("temp_high"):
+                val = meta.get("precise_max_f")
+                if val is None and dp.value is not None:
+                    val = dp.value
+            elif dp.metric.startswith("temp_low") and dp.value is not None:
+                val = dp.value
+            else:
+                continue
+            if val is None:
+                continue
+            rows.append((now, "nws_asos", dp.metric, dp.metric, float(val),
+                         None, None, None, None))
+        if rows:
+            self._conn.executemany(
+                """
+                INSERT INTO raw_forecasts
+                    (logged_at, source, metric, ticker, data_value, strike, direction, edge, yes_bid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
     def log_forecast_no_sources(self, signals: "list") -> None:
         """Log per-source qualifying details for forecast_no signals to raw_forecasts.
 

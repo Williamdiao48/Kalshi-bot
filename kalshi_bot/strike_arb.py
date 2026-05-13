@@ -195,6 +195,15 @@ BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = env_int("BAND_ARB_YES_LOCK_LOCAL_MINUTE", 
 # Synoptic Celsius band arb (5-minute NWS updates via integer-°C range math)
 SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = env_bool("SYNOPTIC_BAND_ARB_NO_ENABLED", True)
 
+# --- Band-arb YES for KXLOWT (symmetric to KXHIGHT YES) --------------------
+# Fires when the METAR running daily min + NOAA observed both confirm the low
+# is inside the band after the morning lock (BAND_ARB_LOW_CEIL_MIN_HOUR).
+# Min YES ask lower than KXHIGHT (10¢ vs 50¢) because overnight lows are
+# often mispriced — market assigns low probability even when observation is clear.
+BAND_ARB_LOW_YES_ENABLED: bool = env_bool("BAND_ARB_LOW_YES_ENABLED", True)
+BAND_ARB_LOW_YES_MIN_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MIN_YES_ASK", 10)
+BAND_ARB_LOW_YES_MAX_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MAX_YES_ASK", 85)
+
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
 # Minimum forecast-to-strike edge (°F) for a source's value to count toward
@@ -925,6 +934,88 @@ def find_band_arbs(
                     BAND_ARB_LOW_CEIL_BUFFER_F, _noaa_warm, _low_local_hour, _warm_htc or 0.0,
                 )
                 continue
+
+            # --- KXLOWT YES: running daily min inside the band --------------
+            # Symmetric to KXHIGHT YES: buy YES when observation confirms the
+            # low is already sitting inside the [strike_lo, strike_hi] band
+            # and the morning lock has passed (P75 of daily lows set by 9 AM).
+            if (
+                BAND_ARB_LOW_YES_ENABLED
+                and is_low_market
+                and parsed.direction == "between"
+                and parsed.strike_lo is not None
+                and parsed.strike_hi is not None
+            ):
+                in_band_low = parsed.strike_lo <= observed_max <= parsed.strike_hi
+                if in_band_low:
+                    _low_yes_tz_key = parsed.metric.replace("temp_low_", "temp_high_")
+                    _low_yes_tz_info = CITIES.get(_low_yes_tz_key)
+                    _low_yes_local_hour = (
+                        datetime.now(_low_yes_tz_info[3]).hour
+                        if _low_yes_tz_info is not None else datetime.now().hour
+                    )
+                    _low_yes_locked = _low_yes_local_hour >= BAND_ARB_LOW_CEIL_MIN_HOUR
+                    _low_yes_close_str = mkt.get("close_time") or mkt.get("expiration_time", "")
+                    _low_yes_htc = _hours_to_close(_low_yes_close_str)
+                    if _low_yes_htc is not None and _low_yes_htc < 20 and _low_yes_locked:
+                        _low_yes_ask_raw = mkt.get("yes_ask")
+                        if _low_yes_ask_raw is not None:
+                            _low_yes_ask = int(_low_yes_ask_raw)
+                            if BAND_ARB_LOW_YES_MIN_YES_ASK <= _low_yes_ask <= BAND_ARB_LOW_YES_MAX_YES_ASK:
+                                noaa_val_low = (noaa_obs_values or {}).get(parsed.metric)
+                                if noaa_val_low is None:
+                                    logging.debug(
+                                        "BandArb LOW-YES skip: %s — NOAA absent (required)", ticker
+                                    )
+                                elif abs(observed_max - noaa_val_low) > BAND_ARB_YES_MAX_DIVERGENCE_F:
+                                    logging.warning(
+                                        "BandArb LOW-YES skip: %s sensor mismatch"
+                                        " METAR_min=%.1f NOAA=%.1f diff=%.1f°F > %.1f°F",
+                                        ticker, observed_max, noaa_val_low,
+                                        abs(observed_max - noaa_val_low),
+                                        BAND_ARB_YES_MAX_DIVERGENCE_F,
+                                    )
+                                elif not (parsed.strike_lo - 0.5 <= noaa_val_low <= parsed.strike_hi + 0.5):
+                                    logging.debug(
+                                        "BandArb LOW-YES skip: %s — NOAA=%.1f°F outside band"
+                                        " [%.1f–%.1f] with rounding buffer",
+                                        ticker, noaa_val_low, parsed.strike_lo, parsed.strike_hi,
+                                    )
+                                else:
+                                    _ly_lb, _ = _noaa_obs_bounds(noaa_val_low)
+                                    _ly_corr = (
+                                        "metar_noaa_corroborated"
+                                        if _ly_lb >= parsed.strike_lo
+                                        else "metar_noaa_lagging"
+                                    )
+                                    logging.info(
+                                        "BandArb LOW-YES (LOCKED): %s  obs_min=%.1f°F"
+                                        " in [%.1f–%.1f]  NOAA=%.1f°F"
+                                        "  YES_ask=%d¢  %.1fh to close",
+                                        ticker, observed_max,
+                                        parsed.strike_lo, parsed.strike_hi,
+                                        noaa_val_low, _low_yes_ask, _low_yes_htc,
+                                    )
+                                    signals.append(BandArbSignal(
+                                        metric=parsed.metric,
+                                        ticker=ticker,
+                                        yes_bid=yes_bid,
+                                        no_ask=no_ask,
+                                        observed_max=observed_max,
+                                        band_ceil=parsed.strike_hi,
+                                        direction=parsed.direction,
+                                        city=mkt.get("subtitle", "") or ticker,
+                                        side="yes",
+                                        yes_ask=_low_yes_ask,
+                                        hours_to_close=_low_yes_htc,
+                                        is_locked=True,
+                                        strike_lo=parsed.strike_lo,
+                                        noaa_val=noaa_val_low,
+                                        hrrr_val=(hrrr_values or {}).get(parsed.metric),
+                                        corr_status=_ly_corr,
+                                        yes_ask_entry=_low_yes_ask,
+                                    ))
+                                    continue
 
             # --- YES signal: temperature inside band -----------------------
             if not BAND_ARB_YES_ENABLED:
