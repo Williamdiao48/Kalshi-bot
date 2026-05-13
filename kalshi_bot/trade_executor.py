@@ -403,7 +403,7 @@ MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 15000)
 # Default 20: EUR/USD 37¢ arb at 20 pairs = $12.60 invested, $7.40 guaranteed.
 # Bracket arb default is lower (ARB_MAX_CONTRACTS // 2) because it places N
 # legs simultaneously and the per-event cost multiplies by bracket count.
-ARB_MAX_CONTRACTS: int = env_int("ARB_MAX_CONTRACTS", 20)
+ARB_MAX_CONTRACTS: int = env_int("ARB_MAX_CONTRACTS", 50)
 
 # Score-weighted position sizing.  When enabled, the Kelly count is multiplied
 # by a score-derived factor that scales linearly from SCORE_WEIGHT_MIN_FACTOR
