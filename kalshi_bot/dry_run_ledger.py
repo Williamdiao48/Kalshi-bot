@@ -448,6 +448,26 @@ class DryRunLedger:
         candidates.sort(key=lambda t: t.current_mid, reverse=True)  # type: ignore[arg-type]
         return candidates
 
+    def total_capital_cents(self) -> int:
+        """Return starting capital + realized P&L (does NOT subtract open exposure).
+
+        Used by the exposure cap check in trade_executor so that the cap is
+        compared against total_open_exposure directly without double-counting.
+        Using available_cash_cents() (which already subtracts open_exposure) as
+        the cap causes 2×open_exposure to appear in the inequality, halving the
+        effective ceiling regardless of starting capital.
+        """
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(exit_pnl_cents), 0)
+            FROM trades
+            WHERE status NOT IN ('rejected', 'error')
+              AND (exited_at IS NOT NULL OR outcome IS NOT NULL)
+            """
+        ).fetchone()
+        realized = int(row[0]) if row else 0
+        return self._starting_capital + realized
+
     def available_cash_cents(self) -> int:
         """Return available paper cash = starting capital + realized P&L − open exposure.
 

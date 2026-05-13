@@ -394,7 +394,7 @@ BAND_ARB_YES_LOCKED_P: float = env_float("BAND_ARB_YES_LOCKED_P", 0.88)
 # it can compare the exact cost of the proposed trade against the live total.
 # Default $150 (15000¢) — allows ~6 locked-obs trades at ~$23 each, or ~15
 # standard trades at ~$10 each.  Set to 0 to disable.
-MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 15000)
+MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 20000)
 
 # Maximum contracts per leg for guaranteed-profit arb trades.
 # Arb sizing is not Kelly-based (P(win)=1.0 by construction) — it is capped
@@ -3264,9 +3264,9 @@ class TradeExecutor:
         """
         if MAX_TOTAL_EXPOSURE_CENTS <= 0:
             return MAX_TOTAL_EXPOSURE_CENTS
-        if self._ledger is not None and hasattr(self._ledger, "available_cash_cents"):
-            available = self._ledger.available_cash_cents()
-            return min(MAX_TOTAL_EXPOSURE_CENTS, max(0, available))
+        if self._ledger is not None and hasattr(self._ledger, "total_capital_cents"):
+            total = self._ledger.total_capital_cents()
+            return min(MAX_TOTAL_EXPOSURE_CENTS, max(0, total))
         return MAX_TOTAL_EXPOSURE_CENTS
 
     def _total_open_exposure_cents(self) -> int:
