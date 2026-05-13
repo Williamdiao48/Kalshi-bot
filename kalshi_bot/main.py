@@ -2845,6 +2845,21 @@ async def _fast_loop(
             _ld = (_dp.metadata or {}).get("local_date")
             if _ld:
                 _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+            # Incorporate 6-hour synoptic max/min: these sample continuously between
+            # hourly obs and can catch temperature extremes the hourly running max/min
+            # misses (e.g. a 4 AM dip that fell between hourly METAR readings).
+            # HIGH: take higher of running max and 6-hr synoptic max.
+            # LOW:  take lower  of running min and 6-hr synoptic min (more conservative
+            #       for warm-NO — if 6-hr min dipped toward ceiling, trust that reading).
+            _meta = _dp.metadata or {}
+            if _dp.metric.startswith("temp_high_"):
+                _six_max = _meta.get("six_hr_max_f")
+                if _six_max is not None and _six_max > obs_values[_dp.metric]:
+                    obs_values[_dp.metric] = _six_max
+            elif _dp.metric.startswith("temp_low_"):
+                _six_min = _meta.get("six_hr_min_f")
+                if _six_min is not None and _six_min < obs_values[_dp.metric]:
+                    obs_values[_dp.metric] = _six_min
 
     # NWS ASOS fetch — 5-min cadence; force-refresh at :53 to catch the
     # synchronized NWS observation aligned with the METAR publication cycle.
