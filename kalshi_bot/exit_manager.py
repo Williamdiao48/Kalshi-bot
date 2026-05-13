@@ -494,6 +494,10 @@ _LOCKED_STOP_LOSS_ONLY: frozenset[str] = frozenset({
     "noaa_observed", "metar", "nws_climo", "nws_alert",
     # band_arb: temperature physically recorded above ceiling — most locked signal.
     "band_arb",
+    # crossed_book_arb: both YES and NO legs held simultaneously — fully hedged.
+    # Profit-taking one leg independently unhedges the position (the remaining
+    # leg becomes a naked directional bet).  Hold both legs to settlement.
+    "crossed_book_arb",
 })
 
 # Forecast and trajectory sources — profit-take ENABLED for YES side.
