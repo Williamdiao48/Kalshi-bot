@@ -602,6 +602,12 @@ CONTRARIAN_MAX_ENTRY_CENTS: int = env_int("CONTRARIAN_MAX_ENTRY_CENTS", 65)
 #   not a real arbitrage opportunity.
 MARKET_MIN_PRICE_CENTS: int = env_int("MARKET_MIN_PRICE_CENTS", 10)
 
+# Minimum yes_ask for numeric YES direction=between entries.
+# When the market prices YES low on a "between" signal, it's telling us the
+# value is likely to leave the band before close.  Historical data: between-YES
+# entries below 60¢ win ~27% vs 80%+ at ≥60¢.  Set to 0 to disable.
+NUMERIC_BETWEEN_YES_MIN_CENTS: int = env_int("NUMERIC_BETWEEN_YES_MIN_CENTS", 60)
+
 # Maximum yes_ask for noaa_observed YES direction=over entries.
 # When the observed temperature ALREADY exceeds the strike (direction=over), the
 # market should agree (high yes price).  Entering at a very high price has
@@ -2099,6 +2105,39 @@ async def _poll(
                 "Market floor gate: suppressed %d opportunity(ies) where"
                 " market prices our side below %d¢.",
                 dropped_mp, MARKET_MIN_PRICE_CENTS,
+            )
+
+    # ---- Numeric YES "between" direction minimum price gate -------------------
+    # A low yes_ask on a between-direction signal means the market expects the
+    # value to leave the band before close.  Only enter when the market already
+    # prices YES >= NUMERIC_BETWEEN_YES_MIN_CENTS (default 60¢).
+    if NUMERIC_BETWEEN_YES_MIN_CENTS > 0 and numeric_opps:
+        before_bym = len(numeric_opps)
+        passed_bym: list[NumericOpportunity] = []
+        for opp in numeric_opps:
+            if opp.implied_outcome != "YES" or opp.direction != "between":
+                passed_bym.append(opp)
+                continue
+            detail = ticker_detail.get(opp.market_ticker)
+            if not detail:
+                passed_bym.append(opp)
+                continue
+            ask = detail.get("yes_ask")
+            if ask is None or ask >= NUMERIC_BETWEEN_YES_MIN_CENTS:
+                passed_bym.append(opp)
+            else:
+                logging.info(
+                    "Between-YES floor gate: suppressed %s — yes_ask %d¢ < %d¢"
+                    " (market skeptical; low win rate at cheap between-YES entries)",
+                    opp.market_ticker, ask, NUMERIC_BETWEEN_YES_MIN_CENTS,
+                )
+        numeric_opps = passed_bym
+        dropped_bym = before_bym - len(numeric_opps)
+        if dropped_bym:
+            logging.info(
+                "Between-YES floor gate: blocked %d opportunity(ies)"
+                " (numeric between-YES with yes_ask < %d¢).",
+                dropped_bym, NUMERIC_BETWEEN_YES_MIN_CENTS,
             )
 
     # Max-entry-price gate for noaa_observed direction=over/between YES signals.
