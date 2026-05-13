@@ -855,15 +855,54 @@ def find_band_arbs(
         if not is_definitive_no:
             # --- Warm-side NO: running daily min confirmed above band ceiling ---
             if is_warm_no:
+                _warm_ceil_nws = band_ceil + 0.5  # NWS rounds to nearest integer; ceil+0.5 is the safe threshold
+
+                # NOAA hard gate (required, same as band_arb YES):
+                # The METAR station and NWS settlement station can differ.  NOAA
+                # observed must also show the running min above the NWS-adjusted
+                # ceiling so we know the settlement value can't round back into band.
                 _noaa_warm = (noaa_obs_values or {}).get(parsed.metric)
-                _warm_corr = "metar_warm_confirmed"
-                if _noaa_warm is not None and _noaa_warm < band_ceil + BAND_ARB_LOW_CEIL_BUFFER_F:
-                    logging.debug(
-                        "KXLOWT warm-NO %s: NOAA obs %.1f°F below ceiling %.1f°F — "
-                        "METAR running min %.1f°F takes precedence",
-                        ticker, _noaa_warm, band_ceil, observed_max,
+                if _noaa_warm is None or _noaa_warm < _warm_ceil_nws:
+                    logging.warning(
+                        "BandArb warm-NO skip: %s — NOAA obs %s < ceil+0.5=%.1f°F"
+                        " (NOAA corroboration required; METAR station may differ from settlement)",
+                        ticker,
+                        f"{_noaa_warm:.1f}°F" if _noaa_warm is not None else "absent",
+                        _warm_ceil_nws,
                     )
-                    _warm_corr = "metar_warm_noaa_low"
+                    continue
+
+                # HRRR veto: if HRRR forecasts the low dropping to/below the
+                # NWS-adjusted ceiling, the temperature hasn't locked yet — block.
+                if hrrr_values is not None:
+                    _hrrr_warm = hrrr_values.get(parsed.metric)
+                    if _hrrr_warm is not None and _hrrr_warm < _warm_ceil_nws:
+                        logging.warning(
+                            "BandArb warm-NO skip (HRRR veto): %s —"
+                            " HRRR=%.1f°F < ceil+0.5=%.1f°F"
+                            " (HRRR predicts low will drop into band ceiling)",
+                            ticker, _hrrr_warm, _warm_ceil_nws,
+                        )
+                        continue
+
+                # NWS CLI veto: if the settlement source already published today's
+                # preliminary low and it's at/below the ceiling, block.
+                if BAND_ARB_NWS_CLIMO_VETO and nws_climo_values is not None:
+                    _climo_warm = nws_climo_values.get(parsed.metric)
+                    if _climo_warm is not None and _climo_warm <= band_ceil:
+                        logging.warning(
+                            "BandArb warm-NO skip (nws_climo veto): %s —"
+                            " CLI=%.1f°F <= ceil=%.1f°F (settlement source in band)",
+                            ticker, _climo_warm, band_ceil,
+                        )
+                        continue
+
+                # All gates passed — emit warm-NO signal
+                _warm_corr = (
+                    "metar_warm_noaa_corroborated"
+                    if _noaa_warm >= _warm_ceil_nws + 1.0
+                    else "metar_warm_confirmed"
+                )
                 _warm_city = mkt.get("subtitle", "") or ticker
                 signals.append(BandArbSignal(
                     metric=parsed.metric,
@@ -881,9 +920,9 @@ def find_band_arbs(
                 ))
                 logging.info(
                     "BandArb warm-NO %s: running_min=%.1f°F >= ceil=%.1f°F+%.1f°F"
-                    " (local_hour=%d, htc=%.1fh) — daytime KXLOWT NO signal",
+                    ", NOAA=%.1f°F (local_hour=%d, htc=%.1fh) — daytime KXLOWT NO",
                     ticker, observed_max, band_ceil,
-                    BAND_ARB_LOW_CEIL_BUFFER_F, _low_local_hour, _warm_htc or 0.0,
+                    BAND_ARB_LOW_CEIL_BUFFER_F, _noaa_warm, _low_local_hour, _warm_htc or 0.0,
                 )
                 continue
 
