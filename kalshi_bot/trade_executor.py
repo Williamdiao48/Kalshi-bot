@@ -2683,6 +2683,7 @@ class TradeExecutor:
 
         # Signal snapshot note
         _yes_note: dict = {
+            "metric":      signal.metric,
             "observed_f":  round(signal.observed_max, 1),
             "band_lo_f":   round(signal.strike_lo,    1),
             "band_ceil_f": round(signal.band_ceil,    1),

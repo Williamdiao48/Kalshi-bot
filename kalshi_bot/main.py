@@ -2255,6 +2255,9 @@ async def _poll(
     # trade in the local DB.  This prevents the bot from re-entering the same
     # market every poll cycle while a dry-run position is still live.
     dry_run_held: set[str] = set()
+    # Maps ticker → (source, side) for open positions — used to allow counter-
+    # direction band_arb entries when the held position is an opposite-side forecast.
+    dry_run_held_info: dict[str, tuple[str, str]] = {}
     if TRADE_DRY_RUN and ledger is not None:
         set_drawdown_factors(ledger.current_drawdown_factors())
         for src, stats in ledger.source_performance_summary().items():
@@ -2263,7 +2266,8 @@ async def _poll(
                     "Source %s: last-20 win rate %.0f%%, P&L $%.2f — consider blocking it.",
                     src, stats["win_rate"] * 100, stats["net_pnl_cents"] / 100,
                 )
-        dry_run_held = ledger.open_tickers()
+        dry_run_held_info = ledger.open_positions_info()
+        dry_run_held = set(dry_run_held_info.keys())
         if dry_run_held:
             logging.info(
                 "Position dedup: %d open dry-run position(s) will block re-entry.",
@@ -2366,17 +2370,22 @@ async def _poll(
                 _ld = (_dp.metadata or {}).get("local_date")
                 if _ld:
                     _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
-    # Merge NWS ASOS (5-min cadence) into obs_early: ASOS wins only if higher for highs.
-    # temp_low is excluded (ASOS limit=12 only covers ~1hr; METAR 24hr lookback is correct for lows).
+    # Merge NWS ASOS (5-min cadence) into obs_early — only for decimal-precision readings.
+    # Integer Celsius (5-min automated, ±0.9°F) flows through _synoptic_celsius instead
+    # so find_band_arbs uses the correct F_low = (C−0.5)×1.8+32 bound rather than the
+    # center value, preventing false NO signals near band ceilings.
+    # temp_low is excluded (ASOS limit=12 only covers ~1hr; METAR 24hr lookback is correct).
     if not isinstance(nws_asos_result, Exception) and nws_asos_result:
         for _dp in nws_asos_result:
             if _dp.metric.startswith("temp_high_") and _dp.value is not None:
-                _existing = _band_arb_obs_early.get(_dp.metric)
-                if _existing is None or _dp.value > _existing:
-                    _band_arb_obs_early[_dp.metric] = _dp.value
-                    _ld = (_dp.metadata or {}).get("local_date")
-                    if _ld:
-                        _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+                _precise_f = (_dp.metadata or {}).get("precise_max_f")
+                if _precise_f is not None:
+                    _existing = _band_arb_obs_early.get(_dp.metric)
+                    if _existing is None or _precise_f > _existing:
+                        _band_arb_obs_early[_dp.metric] = _precise_f
+                        _ld = (_dp.metadata or {}).get("local_date")
+                        if _ld:
+                            _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
     # Staleness filter: only accept noaa_observed DataPoints whose as_of UTC date
     # matches today's UTC date.  At midnight the previous poll's noaa_observed value
     # (e.g. April 17 data) may still be in data_points; without this guard it can
@@ -2397,9 +2406,11 @@ async def _poll(
             _ld = (_dp.metadata or {}).get("local_date")
             if _ld:
                 _band_arb_noaa_obs_dates[_dp.metric] = date.fromisoformat(_ld)
-    # Synoptic Celsius running max from noaa_observed metadata (5-minute NWS updates).
-    # Used by find_band_arbs to generate faster NO signals and YES signals for specific
+    # Synoptic Celsius running max from noaa_observed and nws_asos metadata.
+    # Used by find_band_arbs to generate faster NO signals and YES signals for
     # integer °C values where the ±0.9°F uncertainty interval fits within a 2°F band.
+    # ASOS integer readings are also routed here (not obs_values) to avoid false
+    # NO signals from the ±0.9°F Celsius-rounding uncertainty.
     _synoptic_celsius: dict[str, int | None] = {}
     for _dp in data_points:
         if (
@@ -2411,6 +2422,14 @@ async def _poll(
             _syn_c = (_dp.metadata or {}).get("synoptic_celsius")
             if _syn_c is not None:
                 _synoptic_celsius[_dp.metric] = int(_syn_c)
+    # Merge ASOS integer Celsius maxima — takes precedence when higher.
+    for _dp in data_points:
+        if _dp.source == "nws_asos" and _dp.metric.startswith("temp_high_"):
+            _syn_c = (_dp.metadata or {}).get("synoptic_celsius_max")
+            if _syn_c is not None:
+                _existing = _synoptic_celsius.get(_dp.metric)
+                if _existing is None or int(_syn_c) > _existing:
+                    _synoptic_celsius[_dp.metric] = int(_syn_c)
 
     # NOAA day-1 forecast values — used as a veto signal in find_band_arbs
     # when noaa_observed is absent or stale (see BAND_ARB_NOAA_DAY1_VETO).
@@ -2451,11 +2470,30 @@ async def _poll(
             )
             for _barb in _early_band_arb_signals:
                 if _barb.ticker in dry_run_held:
-                    logging.info(
-                        "BandArb skip: %s in re-entry cooldown / held position.",
-                        _barb.ticker,
+                    _held_src, _held_side = dry_run_held_info.get(_barb.ticker, ("", ""))
+                    # Allow band_arb YES through when the held position is an
+                    # opposite-side forecast (e.g. forecast_no NO).  The obs
+                    # confirmation physically contradicts the forecast — this is a
+                    # genuine counter-signal, not a duplicate entry.
+                    _is_counter = (
+                        _barb.side == "yes"
+                        and _held_side == "no"
+                        and _held_src in ("forecast_no", "noaa", "noaa_day1", "noaa_day2",
+                                          "nws_hourly", "hrrr", "open_meteo")
                     )
-                    continue
+                    if not _is_counter:
+                        logging.info(
+                            "BandArb skip: %s in re-entry cooldown / held position.",
+                            _barb.ticker,
+                        )
+                        continue
+                    logging.info(
+                        "BandArb counter-entry: %s has open %s %s — "
+                        "band_arb YES obs-confirmed; allowing entry and triggering contra-exit.",
+                        _barb.ticker, _held_src, _held_side.upper(),
+                    )
+                    if ledger is not None:
+                        ledger.request_force_exit(_barb.ticker, "band_arb_obs_contra")
                 # Block band_arb:no on KXLOWT when only METAR corroborates.
                 # METAR (airport spot temp) can diverge from the NWS station used
                 # for KXLOWT settlement.  Require NWS confirmation to avoid
@@ -2771,17 +2809,35 @@ async def _fast_loop(
 
     # NWS ASOS fetch — 5-min cadence; force-refresh at :53 to catch the
     # synchronized NWS observation aligned with the METAR publication cycle.
+    #
+    # Celsius precision routing:
+    #   Integer °C (5-min automated) → synoptic_celsius dict: find_band_arbs
+    #     applies F_low = (C−0.5)×1.8+32 to account for ±0.9°F uncertainty,
+    #     preventing false NO signals when the true temp could be below the ceiling.
+    #   Decimal °C (:53 METAR-synced) → obs_values: 0.1°C precision is safe
+    #     for the direct ±0.5°F comparison used in the obs_values NO path.
+    _asos_syn_celsius_fast: dict[str, int] = {}
     try:
         _asos_force = nws_asos.should_force_refresh()
         _asos_points = await nws_asos.fetch_city_observations(session, force=_asos_force)
         for _dp in _asos_points:
             if _dp.metric.startswith("temp_high_") and _dp.value is not None:
-                _existing = obs_values.get(_dp.metric)
-                if _existing is None or _dp.value > _existing:
-                    obs_values[_dp.metric] = _dp.value
-                    _ld = (_dp.metadata or {}).get("local_date")
-                    if _ld:
-                        _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+                _meta = _dp.metadata or {}
+                _ld = _meta.get("local_date")
+                # Integer Celsius max → synoptic_celsius path (handles ±0.9°F uncertainty)
+                _syn_c = _meta.get("synoptic_celsius_max")
+                if _syn_c is not None:
+                    _existing_syn = _asos_syn_celsius_fast.get(_dp.metric)
+                    if _existing_syn is None or _syn_c > _existing_syn:
+                        _asos_syn_celsius_fast[_dp.metric] = int(_syn_c)
+                # Decimal Celsius max → obs_values (sufficiently precise for ±0.5°F gate)
+                _precise_f = _meta.get("precise_max_f")
+                if _precise_f is not None:
+                    _existing = obs_values.get(_dp.metric)
+                    if _existing is None or _precise_f > _existing:
+                        obs_values[_dp.metric] = _precise_f
+                        if _ld:
+                            _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
             elif _dp.metric.startswith("temp_low_") and _dp.value is not None:
                 _existing = obs_values.get(_dp.metric)
                 if _existing is None or _dp.value < _existing:
@@ -2791,6 +2847,46 @@ async def _fast_loop(
                         _fast_obs_dates[_dp.metric] = date.fromisoformat(_ld)
     except Exception as exc:
         logging.debug("Fast loop: NWS ASOS fetch failed: %s", exc)
+
+    # ASOS ceiling-breach exit: if the observed temperature for a city has
+    # exceeded the band ceiling of an open band_arb YES position, the market
+    # has definitively moved against us.  Force-exit immediately rather than
+    # waiting for the slower price-based stop-loss (which may be suppressed by
+    # the spread gate on thin books, or never fire if the bot is briefly offline).
+    if TRADE_DRY_RUN and ledger is not None and obs_values:
+        try:
+            import json as _json
+            _band_yes_rows = ledger._conn.execute(
+                """
+                SELECT id, ticker, note FROM trades
+                WHERE mode = 'dry_run'
+                  AND source = 'band_arb'
+                  AND side = 'yes'
+                  AND outcome IS NULL
+                  AND exited_at IS NULL
+                """
+            ).fetchall()
+            for _row_id, _row_ticker, _row_note in _band_yes_rows:
+                try:
+                    _note = _json.loads(_row_note) if _row_note else {}
+                except Exception:
+                    continue
+                _band_ceil = _note.get("band_ceil_f")
+                _metric = _note.get("metric") or _note.get("series")
+                if _band_ceil is None or _metric is None:
+                    continue
+                _cur_obs = obs_values.get(_metric)
+                if _cur_obs is None:
+                    continue
+                if _cur_obs >= _band_ceil:
+                    logging.warning(
+                        "[asos-breach] trade #%d %s: obs=%.1f°F ≥ band_ceil=%.1f°F"
+                        " — ceiling breached, queuing force-exit.",
+                        _row_id, _row_ticker, _cur_obs, _band_ceil,
+                    )
+                    ledger.request_force_exit(_row_ticker, f"asos_ceiling_breach@{_cur_obs:.1f}F")
+        except Exception as _exc:
+            logging.debug("Fast loop: ASOS ceiling-breach check failed: %s", _exc)
 
     if not obs_values:
         return
@@ -2839,6 +2935,14 @@ async def _fast_loop(
         if _last_hrrr_highs and _hrrr_age < NOAA_OBS_MAX_AGE_S
         else None
     )
+    # Merge ASOS integer-Celsius maxima with the cached slow-loop synoptic dict.
+    # ASOS wins when it has a higher integer Celsius reading for the same city.
+    _fast_syn_celsius: dict[str, int | None] = dict(_last_synoptic_celsius)
+    for _m, _sc in _asos_syn_celsius_fast.items():
+        _ex = _fast_syn_celsius.get(_m)
+        if _ex is None or _sc > _ex:
+            _fast_syn_celsius[_m] = _sc
+
     signals = find_band_arbs(
         fresh_markets,
         obs_values,
@@ -2847,24 +2951,41 @@ async def _fast_loop(
         noaa_day1_values=_last_noaa_day1 or None,
         hrrr_values=_hrrr_for_arb,
         nws_climo_values=_last_nws_climo or None,
-        synoptic_celsius=_last_synoptic_celsius or None,
+        synoptic_celsius=_fast_syn_celsius or None,
     )
     if signals:
         logging.debug("Fast loop: %d band_arb signal(s) found.", len(signals))
 
     fast_held: set[str] = set()
+    _fast_held_info: dict[str, tuple[str, str]] = {}
     if TRADE_DRY_RUN and ledger is not None:
-        fast_held = ledger.open_tickers()
+        _fast_held_info = ledger.open_positions_info()
+        fast_held = set(_fast_held_info.keys())
         if EXIT_REENTRY_COOLDOWN_MINUTES > 0:
             fast_held |= ledger.recently_exited_tickers(EXIT_REENTRY_COOLDOWN_MINUTES)
 
     for signal in signals:
         if signal.ticker in fast_held:
-            logging.debug(
-                "Fast loop BandArb skip: %s in re-entry cooldown / held position.",
-                signal.ticker,
+            _fh_src, _fh_side = _fast_held_info.get(signal.ticker, ("", ""))
+            _fh_counter = (
+                signal.side == "yes"
+                and _fh_side == "no"
+                and _fh_src in ("forecast_no", "noaa", "noaa_day1", "noaa_day2",
+                                "nws_hourly", "hrrr", "open_meteo")
             )
-            continue
+            if not _fh_counter:
+                logging.debug(
+                    "Fast loop BandArb skip: %s in re-entry cooldown / held position.",
+                    signal.ticker,
+                )
+                continue
+            logging.info(
+                "Fast loop BandArb counter-entry: %s has open %s %s — "
+                "band_arb YES obs-confirmed; allowing entry and queuing contra-exit.",
+                signal.ticker, _fh_src, _fh_side.upper(),
+            )
+            if ledger is not None:
+                ledger.request_force_exit(signal.ticker, "band_arb_obs_contra")
         await executor.maybe_trade_band_arb(session, signal)
 
 
@@ -2914,7 +3035,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                         logging.error("Win-rate tracker error: %s", exc)
 
                 _sleep = _adaptive_poll_interval(datetime.now(timezone.utc))
-                logging.debug("Next poll in %ds …", _sleep)
+                logging.info("— cycle #%d done — next poll in %ds —", cycle, _sleep)
                 # Interleave fast band-arb loops during the sleep window
                 _elapsed = 0.0
                 while _elapsed + FAST_LOOP_INTERVAL < _sleep:

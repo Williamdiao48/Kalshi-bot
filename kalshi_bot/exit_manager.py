@@ -509,6 +509,10 @@ _FORECAST_PROFIT_TAKE_SOURCES: frozenset[str] = frozenset({
     # Enter YES when slope × parabolic model says peak > strike; profit-take
     # when the market catches up to the trajectory projection (~30% gain).
     "obs_trajectory",
+    # forecast_no: the signal-type name stored in trades.source for positions
+    # opened by find_forecast_nos().  Must be here so FORECAST_NO_STOP_LOSS
+    # and FORECAST_NO_PROFIT_TAKE are actually applied (is_forecast_no check).
+    "forecast_no",
 })
 
 _ORDERS_PATH = "/trade-api/v2/orders"
@@ -589,6 +593,9 @@ class ExitManager:
     def __init__(self, conn: "sqlite3.Connection", dry_run: bool = True) -> None:
         self._conn    = conn
         self._dry_run = dry_run
+        # Tickers queued for forced exit on the next check_exits call.
+        # Maps ticker → exit_reason_detail string.  Consumed (cleared) on use.
+        self._pending_force_exits: dict[str, str] = {}
         self._migrate_schema()
         if EXIT_TRAILING_DRAWDOWN > 0:
             if EXIT_TRAILING_NEARCLOSE_HOURS > 0:
@@ -650,6 +657,15 @@ class ExitManager:
     # Public API
     # -----------------------------------------------------------------------
 
+    def request_force_exit(self, ticker: str, detail: str = "force_exit") -> None:
+        """Queue a forced exit for ``ticker`` on the next ``check_exits`` call.
+
+        The exit fires regardless of profit-take / stop-loss thresholds and
+        suppression gates.  Intended for observation-confirmed contra-signals
+        (e.g. band_arb YES obs confirming the counter of an open forecast_no NO).
+        """
+        self._pending_force_exits[ticker] = detail
+
     async def check_exits(
         self,
         session: aiohttp.ClientSession,
@@ -709,6 +725,23 @@ class ExitManager:
             if trade.settled or trade.current_mid is None:
                 continue
             if trade.trade_id in exited_ids:
+                continue
+
+            # Forced exit: band_arb obs-confirmed contra-signal (or other caller).
+            # Bypasses all threshold / suppression gates — exit immediately.
+            _force_detail = self._pending_force_exits.pop(getattr(trade, "ticker", ""), None)
+            if _force_detail is not None:
+                _force_pnl = trade._unrealized_cents()
+                logging.info(
+                    "[force-exit] trade #%d %s %s: %s — exiting at %.0f¢ (pnl %.0f¢)",
+                    trade.trade_id, getattr(trade, "ticker", "?"),
+                    getattr(trade, "side", "?").upper(),
+                    _force_detail,
+                    trade.current_mid or 0, _force_pnl,
+                )
+                event = await self._execute_exit(session, trade, _force_pnl, "stop_loss", _force_detail)
+                events.append(event)
+                exited_ids.add(trade.trade_id)
                 continue
 
             # Skip trades that haven't been held long enough yet.

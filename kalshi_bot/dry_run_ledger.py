@@ -506,6 +506,39 @@ class DryRunLedger:
         except Exception:
             return set()
 
+    def request_force_exit(self, ticker: str, detail: str = "force_exit") -> None:
+        """Queue a forced exit for ``ticker`` on the next refresh cycle.
+
+        Delegates to ExitManager.request_force_exit so callers in main.py
+        don't need to reach into the private _exit_manager attribute.
+        """
+        self._exit_manager.request_force_exit(ticker, detail)
+
+    def open_positions_info(self) -> dict[str, tuple[str, str]]:
+        """Return {ticker: (source, side)} for all open (unsettled, unexited) dry-run positions.
+
+        Used by the execution layer to distinguish same-side duplicates from
+        counter-direction entries (e.g. existing forecast_no NO vs incoming
+        band_arb YES on the same ticker).
+        """
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT ticker, source, side FROM trades
+                WHERE mode = 'dry_run'
+                  AND outcome IS NULL
+                  AND exited_at IS NULL
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            # Last open position per ticker wins (most recent is authoritative).
+            result: dict[str, tuple[str, str]] = {}
+            for ticker, source, side in rows:
+                result[ticker] = (source or "", side or "")
+            return result
+        except Exception:
+            return {}
+
     def _compute_risk_metrics(self, trades: list["_Trade"]) -> dict:
         """Compute risk-adjusted return metrics over resolved (settled + exited) trades.
 

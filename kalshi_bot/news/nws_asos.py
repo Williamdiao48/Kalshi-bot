@@ -158,6 +158,13 @@ async def _fetch_station(
     six_hr_max_f: float | None = None
     six_hr_min_f: float | None = None
     obs_count = 0
+    # Track integer-Celsius and precise-Celsius maxima separately.
+    # 5-minute automated readings return whole-number Celsius (±0.5°C = ±0.9°F
+    # uncertainty).  The :53 METAR-synced reading uses 0.1°C precision.
+    # Integer readings must go through the synoptic_celsius path in find_band_arbs
+    # rather than obs_values to avoid false NO signals near band ceilings.
+    daily_max_celsius_int: int | None = None   # running max from integer °C readings
+    daily_max_f_precise: float | None = None   # running max from decimal °C readings
 
     for feat in features:
         props = feat.get("properties", {})
@@ -177,7 +184,8 @@ async def _fetch_station(
         if temp_c is None:
             continue
 
-        temp_f = _c_to_f(float(temp_c))
+        temp_c_f = float(temp_c)
+        temp_f = _c_to_f(temp_c_f)
         obs_count += 1
 
         if latest_ts is None:
@@ -187,6 +195,15 @@ async def _fetch_station(
             daily_max_f = temp_f
         if daily_min_f is None or temp_f < daily_min_f:
             daily_min_f = temp_f
+
+        # Classify: integer Celsius (5-min automated) vs decimal (METAR-synced :53)
+        if abs(temp_c_f - round(temp_c_f)) < 0.01:
+            int_c = round(temp_c_f)
+            if daily_max_celsius_int is None or int_c > daily_max_celsius_int:
+                daily_max_celsius_int = int_c
+        else:
+            if daily_max_f_precise is None or temp_f > daily_max_f_precise:
+                daily_max_f_precise = temp_f
 
         # Synoptic 6-hour extremes (populated at the :00 mark of certain hours)
         max6_obj = props.get("maxTemperatureLast6Hours") or {}
@@ -234,6 +251,14 @@ async def _fetch_station(
     # But an inflated temp_low DataPoint in the slow loop (numeric_matcher path)
     # could generate wrong NO signals.  METAR (24-hr lookback) is the correct
     # source for daily running minimums; nws_asos supplements only HIGH peaks.
+    #
+    # Celsius precision metadata:
+    #   synoptic_celsius_max — integer °C running max (from 5-min automated readings).
+    #     Callers must route this through the synoptic_celsius path in find_band_arbs
+    #     (which uses F_low = (C−0.5)×1.8+32 to account for ±0.9°F uncertainty)
+    #     rather than obs_values, to avoid false NO signals near band ceilings.
+    #   precise_max_f — running max from 0.1°C-precision readings (:53 METAR-synced).
+    #     Safe to add to obs_values directly.  None when only integer readings exist.
     return [
         DataPoint(
             source="nws_asos",
@@ -242,12 +267,14 @@ async def _fetch_station(
             unit="°F",
             as_of=as_of,
             metadata={
-                "city":         city_name,
-                "station":      icao,
-                "observed_max": daily_max_f,
-                "local_date":   date_str,
-                "obs_count":    obs_count,
-                "six_hr_max_f": six_hr_max_f,
+                "city":                 city_name,
+                "station":              icao,
+                "observed_max":         daily_max_f,
+                "local_date":           date_str,
+                "obs_count":            obs_count,
+                "six_hr_max_f":         six_hr_max_f,
+                "synoptic_celsius_max": daily_max_celsius_int,
+                "precise_max_f":        daily_max_f_precise,
             },
         )
     ]
