@@ -223,11 +223,23 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         # These cover temperature extremes between hourly METAR readings — more
         # accurate than the running max for cases where a peak occurs mid-hour.
         # Only populated on synoptic-hour observations (00, 06, 12, 18 UTC).
+        #
+        # IMPORTANT: Each synoptic report's maxT/minT covers the *prior* 6 hours
+        # (period = [obsTime−6h, obsTime]).  The first report whose obsTime is
+        # "local today" has a period that starts in yesterday evening local time
+        # (e.g. 12:00 UTC → 04:00 PST "today", but period starts at 06:00 UTC =
+        # 22:00 PST yesterday).  Including that report's maxT would import a stale
+        # high from the previous evening — exactly what triggered trade #154
+        # (KXHIGHTSEA T59: Seattle was 59°F at 10 PM May 12; that maxT appeared
+        # in the 12Z report and overrode the 4 AM running max of 52°F).
+        # Fix: require BOTH obsTime and (obsTime − 6 h) to fall on local_today,
+        # so only fully-intraday synoptic periods are used.
         six_hr_highs_f = [
             round(float(obs["maxT"]) * 9 / 5 + 32, 2)
             for obs in obs_list
             if obs.get("maxT") is not None
             and datetime.fromtimestamp(obs["obsTime"], tz=timezone.utc).astimezone(lst).date() == local_today
+            and datetime.fromtimestamp(obs["obsTime"] - 6 * 3600, tz=timezone.utc).astimezone(lst).date() == local_today
         ]
         six_hr_max_f: float | None = max(six_hr_highs_f) if six_hr_highs_f else None
 
@@ -236,6 +248,7 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             for obs in obs_list
             if obs.get("minT") is not None
             and datetime.fromtimestamp(obs["obsTime"], tz=timezone.utc).astimezone(lst).date() == local_today
+            and datetime.fromtimestamp(obs["obsTime"] - 6 * 3600, tz=timezone.utc).astimezone(lst).date() == local_today
         ]
         six_hr_min_f: float | None = min(six_hr_lows_f) if six_hr_lows_f else None
 
