@@ -278,12 +278,26 @@ _FORECAST_NO_SOURCES: frozenset[str] = frozenset({
 FORECAST_NO_OVERNIGHT_LOCK_HOUR: int = int(
     os.environ.get("FORECAST_NO_OVERNIGHT_LOCK_HOUR", "6")
 )
-# Require at least one near-term model (hrrr or nws_hourly) in the qualifying sources.
-# Day-ahead models (open_meteo, noaa) have 4-5°F MAE vs 2-3°F for HRRR/NWS.
-# When neither near-term model confirms the edge, signal confidence is too low.
-FORECAST_NO_REQUIRE_NEAR_TERM: bool = os.environ.get(
-    "FORECAST_NO_REQUIRE_NEAR_TERM", "true"
+# Require at least one Open-Meteo ensemble model in the qualifying sources.
+# Live P&L analysis (134 trades): open_meteo family wins 65-68% vs 53-57% for
+# NOAA/HRRR/NWS.  Root cause: NWS and HRRR are the most widely consumed US
+# forecasts — Kalshi market-makers already price them in.  Open-Meteo's
+# international ensembles (ECMWF, GEM, ICON) are less followed and still carry
+# genuine information alpha.  "bad_only" signals (no open_meteo) win 14% daytime
+# and 0% overnight — reliably wrong, block entirely.
+FORECAST_NO_REQUIRE_OPEN_METEO: bool = os.environ.get(
+    "FORECAST_NO_REQUIRE_OPEN_METEO", "true"
 ).lower() != "false"
+
+# Earliest local hour at which a pure open_meteo-only signal may fire.
+# When no NOAA/HRRR/NWS model corroborates, overnight signals (before 7 AM local)
+# win at 50% — the temperature hasn't developed yet and all models are uncertain.
+# Mixed signals (open_meteo + NOAA/HRRR both agree) are exempt: cross-family
+# consensus at any hour is a genuinely stronger signal (71% win rate overnight).
+# Set to 0 to disable.
+FORECAST_NO_OPEN_METEO_DAYTIME_HOUR: int = int(
+    os.environ.get("FORECAST_NO_OPEN_METEO_DAYTIME_HOUR", "7")
+)
 # For LOW "under" markets (NO wins if overnight low stays above strike), block
 # entries after this local hour.  Afternoon cooling begins ~15:00 and forecast
 # model accuracy for overnight minimums degrades sharply past this point.
@@ -391,7 +405,15 @@ FORECAST_NO_HRRR_SPREAD_F: float = float(
 # blocking genuinely chaotic convective-day signals (>10°F).
 # Set to 0 to disable.
 FORECAST_NO_MODEL_SPREAD_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "9.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "6.0")
+)
+# Minimum model spread (°F) required to fire a forecast_no signal.
+# Live data: < 3°F spread → 56% win rate (tight consensus already priced in);
+# 3–6°F → 74% win rate (genuine alpha); > 6°F → 51% (too much disagreement).
+# Note: the upper bound above already handles the > 9°F case.
+# Set to 0 to disable.
+FORECAST_NO_MODEL_SPREAD_MIN_F: float = float(
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "3.0")
 )
 
 
@@ -1752,18 +1774,25 @@ def find_forecast_nos(
         # single signal — block regardless of which direction the market faces.
         # This catches band/"between" markets that the HRRR-specific spread veto
         # (which only runs for direction=="under") would otherwise miss.
-        if FORECAST_NO_MODEL_SPREAD_F > 0:
+        if FORECAST_NO_MODEL_SPREAD_F > 0 or FORECAST_NO_MODEL_SPREAD_MIN_F > 0:
             _spread_sources = _FORECAST_NO_SOURCES
             _spread_vals = [v for s, v in corr_sources_map if s in _spread_sources]
             if len(_spread_vals) >= 2:
                 _model_spread = max(_spread_vals) - min(_spread_vals)
-                if _model_spread > FORECAST_NO_MODEL_SPREAD_F:
+                if FORECAST_NO_MODEL_SPREAD_F > 0 and _model_spread > FORECAST_NO_MODEL_SPREAD_F:
                     logging.warning(
-                        "ForecastNO skip (model spread): %s —"
+                        "ForecastNO skip (model spread too wide): %s —"
                         " spread=%.1f°F > %.1f°F across %d models"
                         " (forecast uncertainty too high)",
                         ticker, _model_spread, FORECAST_NO_MODEL_SPREAD_F,
                         len(_spread_vals),
+                    )
+                    continue
+                if FORECAST_NO_MODEL_SPREAD_MIN_F > 0 and _model_spread < FORECAST_NO_MODEL_SPREAD_MIN_F:
+                    logging.debug(
+                        "ForecastNO skip (model spread too tight): %s —"
+                        " spread=%.1f°F < %.1f°F (consensus already priced in)",
+                        ticker, _model_spread, FORECAST_NO_MODEL_SPREAD_MIN_F,
                     )
                     continue
 
@@ -1857,18 +1886,44 @@ def find_forecast_nos(
             )
             continue
 
-        # Anchor model gate: require at least one high-confidence source.
-        # open_meteo_gfs is included because backtest shows 95.6% NO_HIGH win rate —
-        # comparable to HRRR and sufficient to anchor a global-model consensus signal.
-        if FORECAST_NO_REQUIRE_NEAR_TERM:
-            _anchor_sources = {"hrrr", "nws_hourly", "open_meteo_gfs"}
-            if not any(s in _anchor_sources for s, _, _, _ in qualifying):
+        # Require at least one Open-Meteo ensemble model.
+        # NOAA/HRRR/NWS forecasts are already priced in by Kalshi market-makers;
+        # signals with none of the international ensemble models carry no alpha.
+        _open_meteo_family = {
+            "open_meteo", "open_meteo_gfs", "open_meteo_ecmwf",
+            "open_meteo_icon", "open_meteo_gem",
+        }
+        _qualifying_sources = {s for s, _, _, _ in qualifying}
+        if FORECAST_NO_REQUIRE_OPEN_METEO:
+            if not (_qualifying_sources & _open_meteo_family):
                 logging.debug(
-                    "ForecastNO skip: %s — no anchor model in qualifying sources %s"
-                    " (need hrrr, nws_hourly, or open_meteo_gfs)",
-                    ticker, [s for s, _, _, _ in qualifying],
+                    "ForecastNO skip: %s — no open_meteo model in qualifying"
+                    " sources %s (NOAA/HRRR/NWS already priced in by market)",
+                    ticker, sorted(_qualifying_sources),
                 )
                 continue
+
+        # Daytime gate for pure open_meteo-only signals.
+        # Before 7 AM local, open_meteo-only signals win 50% (coin flip) — the
+        # temperature hasn't developed and all models are equally uncertain.
+        # Mixed signals (open_meteo + NOAA/HRRR both agree) are exempt: 71% overnight.
+        if FORECAST_NO_OPEN_METEO_DAYTIME_HOUR > 0:
+            _trad_sources = {"hrrr", "nws_hourly", "noaa"}
+            _is_open_meteo_only = bool(_qualifying_sources & _open_meteo_family) and not bool(_qualifying_sources & _trad_sources)
+            if _is_open_meteo_only:
+                _fno_lookup = parsed.metric.replace("temp_low_", "temp_high_")
+                _fno_city_info = CITIES.get(_fno_lookup)
+                _fno_local_hour = (
+                    datetime.now(_fno_city_info[3]).hour
+                    if _fno_city_info is not None else datetime.now().hour
+                )
+                if _fno_local_hour < FORECAST_NO_OPEN_METEO_DAYTIME_HOUR:
+                    logging.debug(
+                        "ForecastNO skip: %s — open_meteo-only at local hour %d"
+                        " < %d (daytime gate; mixed signals exempt)",
+                        ticker, _fno_local_hour, FORECAST_NO_OPEN_METEO_DAYTIME_HOUR,
+                    )
+                    continue
 
         min_edge = min(e for _, _v, e, _ in qualifying)
         source_names = [s for s, _, _, _ in qualifying]
