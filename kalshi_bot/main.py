@@ -2862,8 +2862,23 @@ async def _fast_loop(
                     obs_values[_dp.metric] = _six_max
             elif _dp.metric.startswith("temp_low_"):
                 _six_min = _meta.get("six_hr_min_f")
-                if _six_min is not None and _six_min < obs_values[_dp.metric]:
-                    obs_values[_dp.metric] = _six_min
+                if _six_min is not None:
+                    if _six_min < obs_values[_dp.metric]:
+                        logging.debug(
+                            "METAR 6hr-min override %s: %.1f°F → %.1f°F (synoptic dip below hourly min)",
+                            _dp.metric, obs_values[_dp.metric], _six_min,
+                        )
+                        obs_values[_dp.metric] = _six_min
+                    else:
+                        logging.debug(
+                            "METAR 6hr-min %s: %.1f°F (no override, hourly min %.1f°F is lower)",
+                            _dp.metric, _six_min, obs_values[_dp.metric],
+                        )
+                else:
+                    logging.debug(
+                        "METAR 6hr-min %s: not in API response — using hourly running min %.1f°F",
+                        _dp.metric, obs_values[_dp.metric],
+                    )
 
     # NWS ASOS fetch — 5-min cadence; force-refresh at :53 to catch the
     # synchronized NWS observation aligned with the METAR publication cycle.

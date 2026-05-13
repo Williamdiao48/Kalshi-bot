@@ -273,7 +273,12 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             )
         else:
             _obs_label = "obs=? delivered=?"
-        summary_parts.append(f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo) [{_obs_label}]")
+        _six_max_label = f"6hrHi={six_hr_max_f:.1f}°F" if six_hr_max_f is not None else "6hrHi=none"
+        _six_min_label = f"6hrLo={six_hr_min_f:.1f}°F" if six_hr_min_f is not None else "6hrLo=none"
+        summary_parts.append(
+            f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo)"
+            f" {_six_max_label} {_six_min_label} [{_obs_label}]"
+        )
 
         points.append(DataPoint(
             source="metar",
