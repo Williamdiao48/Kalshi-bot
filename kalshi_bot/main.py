@@ -154,6 +154,7 @@ _last_synoptic_celsius: dict[str, int | None] = {}
 # previous day's METAR peak is still in memory at midnight).
 _last_hrrr_highs: dict[str, float] = {}
 _last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
+_last_hrrr_lows: dict[str, float] = {}  # temp_low_* HRRR values, cached alongside highs
 
 
 def _update_fast_loop_cache(
@@ -178,11 +179,12 @@ def _update_fast_loop_cache(
     _last_synoptic_celsius = synoptic_celsius
 
 
-def _update_hrrr_cache(highs: dict[str, float]) -> None:
+def _update_hrrr_cache(highs: dict[str, float], lows: dict[str, float] | None = None) -> None:
     """Replace the HRRR shared state in one synchronous block."""
-    global _last_hrrr_highs, _last_hrrr_highs_time
+    global _last_hrrr_highs, _last_hrrr_highs_time, _last_hrrr_lows
     _last_hrrr_highs      = highs
     _last_hrrr_highs_time = time.monotonic()
+    _last_hrrr_lows       = lows or {}
 
 # Maximum age (seconds) of the cached NOAA observed values before the fast loop
 # treats them as absent (falls back to NOAA-None mode).  After a poll gap > 30 min
@@ -1277,7 +1279,7 @@ async def _poll(
         logging.warning("HRRR fetch error: %s", hrrr_result)
     elif hrrr_result:
         hrrr_hourly_highs, hrrr_hourly_lows = hrrr_result  # type: ignore[misc]
-        _update_hrrr_cache(hrrr_hourly_highs)
+        _update_hrrr_cache(hrrr_hourly_highs, hrrr_hourly_lows)
 
     # ---- numeric matching (NOAA, Binance, Frankfurter, BLS, FRED, EIA) ------
     # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
@@ -2500,7 +2502,7 @@ async def _poll(
             obs_dates=_band_arb_obs_dates or None,
             noaa_obs_dates=_band_arb_noaa_obs_dates or None,
             noaa_day1_values=_band_arb_noaa_day1 or None,
-            hrrr_values=hrrr_hourly_highs or None,
+            hrrr_values={**hrrr_hourly_highs, **hrrr_hourly_lows} or None,
             nws_climo_values=_band_arb_nws_climo or None,
             synoptic_celsius=_synoptic_celsius or None,
         )
@@ -3071,7 +3073,7 @@ async def _fast_loop(
     # the HRRR contradiction veto (blocks stale METAR carry at midnight).
     _hrrr_age = time.monotonic() - _last_hrrr_highs_time
     _hrrr_for_arb = (
-        _last_hrrr_highs
+        {**_last_hrrr_highs, **_last_hrrr_lows}
         if _last_hrrr_highs and _hrrr_age < NOAA_OBS_MAX_AGE_S
         else None
     )
