@@ -2948,6 +2948,11 @@ async def _fast_loop(
                 _metric = _note.get("metric") or _note.get("series")
                 if _band_ceil is None or _metric is None:
                     continue
+                # KXLOWT YES: obs_values holds running daily *minimum* which can only
+                # decrease — ceiling breach is impossible; floor breach is the real risk
+                # and is handled by the price-based stop-loss. Skip this check entirely.
+                if _row_ticker.startswith("KXLOWT"):
+                    continue
                 _cur_obs = obs_values.get(_metric)
                 if _cur_obs is None:
                     continue
@@ -2960,6 +2965,45 @@ async def _fast_loop(
                     ledger.request_force_exit(_row_ticker, f"asos_ceiling_breach@{_cur_obs:.1f}F")
         except Exception as _exc:
             logging.debug("Fast loop: ASOS ceiling-breach check failed: %s", _exc)
+
+    # Floor-breach exit for KXLOWT YES positions:
+    # If the running daily min drops below band_lo_f - 0.5°F, the official low
+    # will round below the band floor and YES cannot win — exit immediately.
+    if TRADE_DRY_RUN and ledger is not None and obs_values:
+        try:
+            import json as _json
+            _lowt_yes_rows = ledger._conn.execute(
+                """
+                SELECT id, ticker, note FROM trades
+                WHERE mode = 'dry_run'
+                  AND source = 'band_arb'
+                  AND side = 'yes'
+                  AND ticker LIKE 'KXLOWT%'
+                  AND outcome IS NULL
+                  AND exited_at IS NULL
+                """
+            ).fetchall()
+            for _row_id, _row_ticker, _row_note in _lowt_yes_rows:
+                try:
+                    _note = _json.loads(_row_note) if _row_note else {}
+                except Exception:
+                    continue
+                _band_lo = _note.get("band_lo_f")
+                _metric  = _note.get("metric")
+                if _band_lo is None or _metric is None:
+                    continue
+                _cur_min = obs_values.get(_metric)
+                if _cur_min is None:
+                    continue
+                if _cur_min <= _band_lo - 0.5:
+                    logging.warning(
+                        "[lowt-floor-breach] trade #%d %s: obs_min=%.1f°F ≤ floor=%.1f°F-0.5"
+                        " — floor breached, queuing force-exit.",
+                        _row_id, _row_ticker, _cur_min, _band_lo,
+                    )
+                    ledger.request_force_exit(_row_ticker, f"lowt_floor_breach@{_cur_min:.1f}F")
+        except Exception as _exc:
+            logging.debug("Fast loop: KXLOWT YES floor-breach check failed: %s", _exc)
 
     # Observation-based exit for KXLOWT warm-NO positions:
     # If the running daily min has fallen to or below the band ceiling,
