@@ -136,6 +136,9 @@ BAND_ARB_LOW_CEIL_BUFFER_F: float = env_float("BAND_ARB_LOW_CEIL_BUFFER_F", 1.0)
 # Earliest local hour at which the warm-side NO signal may fire.
 # P75 of daily low occurrence in May is 6–9 AM; 9 AM is safe for most cities.
 BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 9)
+# Maximum NO ask for warm-side KXLOWT NO entries.
+# Above 90¢ only 5–10¢ upside remains — risk/reward not worth it.
+BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 90)
 # Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
 # data gap, or the midnight-to-1 AM window before the first QC obs arrives).
 # During this window only METAR and the market-price cap protect against
@@ -927,6 +930,14 @@ def find_band_arbs(
                             ticker, _climo_warm, band_ceil,
                         )
                         continue
+
+                # Cap: above 90¢ only 5–10¢ upside remains — skip.
+                if no_ask > BAND_ARB_LOW_CEIL_MAX_NO_ASK:
+                    logging.debug(
+                        "BandArb warm-NO skip %s: no_ask=%d¢ > max=%d¢",
+                        ticker, no_ask, BAND_ARB_LOW_CEIL_MAX_NO_ASK,
+                    )
+                    continue
 
                 # All gates passed — emit warm-NO signal
                 _warm_corr = (

@@ -958,12 +958,21 @@ class DryRunLedger:
             if status in ("settled", "finalized") and result_field in ("yes", "no"):
                 trade.settled = True
                 trade.result  = result_field
-                # Persist outcome to DB immediately so SQL queries and
-                # win_rate_tracker see it without waiting for the hourly pass.
                 outcome_val = "won" if trade.result == trade.side else "lost"
+                # Settlement exit price: 99 if we won, 1 if we lost.
+                settle_exit_p = 99 if outcome_val == "won" else 1
+                settle_pnl    = trade._realized_cents()
                 self._conn.execute(
-                    "UPDATE trades SET outcome = ? WHERE id = ? AND outcome IS NULL",
-                    (outcome_val, trade.trade_id),
+                    """UPDATE trades
+                       SET outcome          = ?,
+                           exited_at        = COALESCE(exited_at, ?),
+                           exit_price_cents = COALESCE(exit_price_cents, ?),
+                           exit_pnl_cents   = COALESCE(exit_pnl_cents, ?),
+                           exit_reason      = COALESCE(exit_reason, 'settlement'),
+                           exit_reason_detail = COALESCE(exit_reason_detail, 'market_settled')
+                       WHERE id = ?""",
+                    (outcome_val, datetime.now(timezone.utc).isoformat(),
+                     settle_exit_p, settle_pnl, trade.trade_id),
                 )
             else:
                 bid = mkt.get("yes_bid")
