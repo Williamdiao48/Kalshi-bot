@@ -395,7 +395,7 @@ BAND_ARB_YES_LOCKED_P: float = env_float("BAND_ARB_YES_LOCKED_P", 0.88)
 # it can compare the exact cost of the proposed trade against the live total.
 # Default $150 (15000¢) — allows ~6 locked-obs trades at ~$23 each, or ~15
 # standard trades at ~$10 each.  Set to 0 to disable.
-MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 40000)
+MAX_TOTAL_EXPOSURE_CENTS: int = env_int("MAX_TOTAL_EXPOSURE_CENTS", 50000)
 
 # Maximum contracts per leg for guaranteed-profit arb trades.
 # Arb sizing is not Kelly-based (P(win)=1.0 by construction) — it is capped
@@ -1163,7 +1163,7 @@ class TradeExecutor:
 
         # Kelly sizing (standard path — no locked-obs boost for text signals)
         entry_cost = ask if side == "yes" else (100 - bid)
-        pos_max    = max(1, int(MAX_POSITION_CENTS * _dd_factor))
+        pos_max    = min(max(1, int(MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents())
         count = kelly_contracts(
             win_prob=p_yes if side == "yes" else (1.0 - p_yes),
             cost_cents=entry_cost,
@@ -1570,7 +1570,7 @@ class TradeExecutor:
         # Use per-category drawdown factor: a bad day on Boston temps should not
         # suppress Dallas or crypto sizing.
         _cat_dd_factor = _get_dd_factor(opp.metric)
-        pos_max_cents  = max(1, int(pos_max_cents * _cat_dd_factor))
+        pos_max_cents  = min(max(1, int(pos_max_cents * _cat_dd_factor)), self._remaining_exposure_cents())
 
         count = kelly_contracts(
             win_prob=win_prob,
@@ -1912,7 +1912,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=win_prob,
             cost_cents=cost_cents,
-            max_cents=max(1, int(MAX_POSITION_CENTS * _dd_factor)),
+            max_cents=min(max(1, int(MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents()),
             kelly_fraction=KELLY_FRACTION,  # poly trades use standard fraction (no score tiering)
             hard_cap=TRADE_MAX_CONTRACTS,
         )
@@ -2495,7 +2495,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=p_win,
             cost_cents=signal.no_ask,
-            max_cents=max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor)),
+            max_cents=min(max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents()),
             kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
             hard_cap=LOCKED_OBS_MAX_CONTRACTS,
         )
@@ -2638,7 +2638,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=p_win,
             cost_cents=signal.yes_ask,
-            max_cents=max_cents,
+            max_cents=min(max_cents, self._remaining_exposure_cents()),
             kelly_fraction=kelly_frac,
             hard_cap=hard_cap,
         )
@@ -2784,7 +2784,7 @@ class TradeExecutor:
         count = kelly_contracts(
             win_prob=signal.p_estimate,
             cost_cents=signal.no_ask,
-            max_cents=max(1, int(MAX_POSITION_CENTS * _dd_factor)),
+            max_cents=min(max(1, int(MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents()),
             kelly_fraction=KELLY_FRACTION,
             hard_cap=TRADE_MAX_CONTRACTS,
         )
@@ -3295,6 +3295,18 @@ class TradeExecutor:
             """
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def _remaining_exposure_cents(self) -> int:
+        """Remaining capital available for new trades in cents.
+
+        Returns max(0, effective_cap - current_open_exposure).  Passing this as
+        an upper bound on max_cents in kelly_contracts makes Kelly naturally scale
+        down as the cap fills — no hard block needed.
+        """
+        cap = self._effective_exposure_cap()
+        if cap <= 0:
+            return 0
+        return max(0, cap - self._total_open_exposure_cents())
 
     def _open_positions_on_underlying(self, ticker: str) -> int:
         """Count open (not yet exited) positions on the same underlying prefix.
