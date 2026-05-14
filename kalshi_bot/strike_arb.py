@@ -946,6 +946,7 @@ def find_band_arbs(
                     else "metar_warm_confirmed"
                 )
                 _warm_city = mkt.get("subtitle", "") or ticker
+                _hrrr_warm_val = (hrrr_values or {}).get(parsed.metric)
                 signals.append(BandArbSignal(
                     metric=parsed.metric,
                     ticker=ticker,
@@ -959,12 +960,15 @@ def find_band_arbs(
                     hours_to_close=_warm_htc or 0.0,
                     strike_lo=band_ceil,
                     corr_status=_warm_corr,
+                    hrrr_val=_hrrr_warm_val,
                 ))
                 logging.info(
                     "BandArb warm-NO %s: running_min=%.1f°F >= ceil=%.1f°F+%.1f°F"
-                    ", NOAA=%.1f°F (local_hour=%d, htc=%.1fh) — daytime KXLOWT NO",
+                    ", NOAA=%.1f°F HRRR=%s (local_hour=%d, htc=%.1fh) — daytime KXLOWT NO",
                     ticker, observed_max, band_ceil,
-                    BAND_ARB_LOW_CEIL_BUFFER_F, _noaa_warm, _low_local_hour, _warm_htc or 0.0,
+                    BAND_ARB_LOW_CEIL_BUFFER_F, _noaa_warm,
+                    f"{_hrrr_warm_val:.1f}°F" if _hrrr_warm_val is not None else "absent",
+                    _low_local_hour, _warm_htc or 0.0,
                 )
                 continue
 
