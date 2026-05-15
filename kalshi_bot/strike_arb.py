@@ -211,7 +211,7 @@ SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = env_bool("SYNOPTIC_BAND_ARB_NO_ENABLED", T
 # is inside the band after the morning lock (BAND_ARB_LOW_CEIL_MIN_HOUR).
 # Min YES ask lower than KXHIGHT (10¢ vs 50¢) because overnight lows are
 # often mispriced — market assigns low probability even when observation is clear.
-BAND_ARB_LOW_YES_ENABLED: bool = env_bool("BAND_ARB_LOW_YES_ENABLED", True)
+BAND_ARB_LOW_YES_ENABLED: bool = env_bool("BAND_ARB_LOW_YES_ENABLED", False)
 BAND_ARB_LOW_YES_MIN_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MIN_YES_ASK", 10)
 BAND_ARB_LOW_YES_MAX_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MAX_YES_ASK", 85)
 # Max hours-to-close for KXLOWT YES entries. Unlike KXHIGHT (running max only rises),
