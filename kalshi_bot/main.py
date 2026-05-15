@@ -2956,9 +2956,9 @@ async def _fast_loop(
                 _cur_obs = obs_values.get(_metric)
                 if _cur_obs is None:
                     continue
-                if _cur_obs >= _band_ceil:
+                if _cur_obs >= _band_ceil + 0.5:
                     logging.warning(
-                        "[asos-breach] trade #%d %s: obs=%.1f°F ≥ band_ceil=%.1f°F"
+                        "[asos-breach] trade #%d %s: obs=%.1f°F ≥ band_ceil=%.1f°F+0.5"
                         " — ceiling breached, queuing force-exit.",
                         _row_id, _row_ticker, _cur_obs, _band_ceil,
                     )
@@ -3036,9 +3036,9 @@ async def _fast_loop(
                 _cur_min = obs_values.get(_metric)
                 if _cur_min is None:
                     continue
-                if _cur_min <= _strike_hi:
+                if _cur_min <= _strike_hi - 0.5:
                     logging.warning(
-                        "[lowt-breach] trade #%d %s: obs_min=%.1f°F ≤ ceil=%.1f°F"
+                        "[lowt-breach] trade #%d %s: obs_min=%.1f°F ≤ ceil=%.1f°F-0.5"
                         " — band breached from above, queuing force-exit.",
                         _row_id, _row_ticker, _cur_min, _strike_hi,
                     )
