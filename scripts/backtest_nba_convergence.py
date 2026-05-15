@@ -26,6 +26,7 @@ from kalshi_bot.markets import KALSHI_API_BASE
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MIN_GAP_THRESHOLD = 0.03    # minimum |DK prob - Kalshi mid| (fraction) to trade
+EXIT_THRESHOLD    = 0.02    # exit when Kalshi mid is within 2¢ of DK's price
 MAX_SPREAD        = 0.15    # maximum (ask - bid) allowed at entry — excludes stub-bid opens
 MIN_BID           = 0.05    # minimum yes_bid at entry — excludes markets with no buyers yet
 CANDLE_INTERVAL   = 60      # minutes (hourly candles)
@@ -363,30 +364,59 @@ async def _run() -> None:
                 below_threshold += 1
                 continue
 
+            # Scan forward for the first candle where Kalshi mid reaches DK's level
+            exit_idx = None
+            for idx in range(1, len(valid)):
+                _, b, a = valid[idx]
+                m = (b + a) / 2
+                if gap > 0 and m >= dk_home_prob - EXIT_THRESHOLD:
+                    exit_idx = idx
+                    break
+                elif gap < 0 and m <= dk_home_prob + EXIT_THRESHOLD:
+                    exit_idx = idx
+                    break
+
+            if exit_idx is not None:
+                _, exit_bid, exit_ask = valid[exit_idx]
+                did_converge = True
+                candles_held = exit_idx
+            else:
+                _, exit_bid, exit_ask = valid[-1]
+                did_converge = False
+                candles_held = len(valid) - 1
+
+            exit_mid = (exit_bid + exit_ask) / 2
+
             if gap > 0:
                 entry  = first_ask          # buy YES: pay yes_ask
-                exit_  = last_bid           # sell YES: receive yes_bid
+                exit_  = exit_bid           # sell YES: receive yes_bid
             else:
                 entry  = 1.0 - first_bid    # buy NO: pay (1 - yes_bid)
-                exit_  = 1.0 - last_ask     # sell NO: receive (1 - yes_ask)
+                exit_  = 1.0 - exit_ask     # sell NO: receive (1 - yes_ask)
 
             pnl_cents = (exit_ - entry) * 100
-            converged = (gap > 0 and last_mid > first_mid) or (gap < 0 and last_mid < first_mid)
+            exit_settled = exit_mid > 0.95 or exit_mid < 0.05
 
             away_abbrev = next(iter(teams_set - {home_abbrev}), "?") if home_abbrev in teams_set else "?"
+            dk_close_prob, _ = _devig(odds["home_close"], odds["away_close"])
             results.append({
-                "ticker":       home_ticker,
-                "date":         f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}",
-                "home":         home_abbrev,
-                "away":         away_abbrev,
-                "dk_open_prob": round(dk_home_prob * 100, 1),
-                "dk_close_prob": round(_devig(odds["home_close"], odds["away_close"])[0] * 100, 1),
-                "kalshi_mid":   round(first_mid * 100, 1),
-                "kalshi_close": round(last_mid * 100, 1),
-                "gap":          round(gap * 100, 1),
-                "pnl":          round(pnl_cents, 1),
-                "converged":    converged,
-                "n_candles":    len(valid),
+                "ticker":        home_ticker,
+                "date":          f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}",
+                "home":          home_abbrev,
+                "away":          away_abbrev,
+                "dk_open_prob":  round(dk_home_prob * 100, 1),
+                "dk_close_prob": round(dk_close_prob * 100, 1),
+                "dk_moved":      round((dk_close_prob - dk_home_prob) * 100, 1),
+                "kalshi_mid":    round(first_mid * 100, 1),
+                "kalshi_exit":   round(exit_mid * 100, 1),
+                "open_spread":   round((first_ask - first_bid) * 100, 1),
+                "gap":           round(gap * 100, 1),
+                "side":          "YES" if gap > 0 else "NO",
+                "pnl":           round(pnl_cents, 1),
+                "did_converge":  did_converge,
+                "exit_settled":  exit_settled,
+                "candles_held":  candles_held,
+                "n_candles":     len(valid),
             })
 
             if (i + 1) % 25 == 0:
@@ -412,62 +442,142 @@ async def _run() -> None:
     wins = [r for r in results if r["pnl"] > 0]
     losses = [r for r in results if r["pnl"] <= 0]
     total_pnl = sum(r["pnl"] for r in results)
-    conv_n = sum(1 for r in results if r["converged"])
     avg_gap = sum(abs(r["gap"]) for r in results) / n
-    avg_move = sum(r["kalshi_close"] - r["kalshi_mid"] for r in results) / n
+
+    conv_results   = [r for r in results if r["did_converge"]]
+    noconv_results = [r for r in results if not r["did_converge"]]
+    conv_settled   = [r for r in conv_results if r["exit_settled"]]
+    conv_live      = [r for r in conv_results if not r["exit_settled"]]
 
     print(f"\n── CONVERGENCE SUMMARY {'─'*56}")
-    print(f"Games with signal:           {n}")
-    print(f"Converged (mid moved toward DK): {conv_n} / {n}  ({conv_n/n*100:.1f}%)")
-    print(f"Avg |DK-open gap| (vs mid):  {avg_gap:+.1f}¢")
-    print(f"Avg Kalshi mid movement:     {avg_move:+.1f}¢")
-    print(f"(Mid = (bid+ask)/2; spread filter: bid≥{MIN_BID*100:.0f}¢, spread≤{MAX_SPREAD*100:.0f}¢)")
+    print(f"Trades with signal:          {n}")
+    print(f"Converged to DK (±{EXIT_THRESHOLD*100:.0f}¢):     {len(conv_results)} / {n}  ({len(conv_results)/n*100:.1f}%)")
+    if conv_results:
+        avg_ch = sum(r["candles_held"] for r in conv_results) / len(conv_results)
+        print(f"  Avg candles to convergence:  {avg_ch:.1f}h")
+        print(f"  Exited at settlement price:  {len(conv_settled)} ({len(conv_settled)/len(conv_results)*100:.0f}% of converged)")
+        print(f"  Exited while still live:     {len(conv_live)}  ({len(conv_live)/len(conv_results)*100:.0f}% of converged)")
+    print(f"Never converged (exit at last candle): {len(noconv_results)}")
+    print(f"Avg |DK-Kalshi gap| at entry: {avg_gap:+.1f}¢")
+    print(f"(Exit threshold: ±{EXIT_THRESHOLD*100:.0f}¢ of DK price  |  entry filter: bid≥{MIN_BID*100:.0f}¢, spread≤{MAX_SPREAD*100:.0f}¢)")
 
-    print(f"\n── SIMULATED P&L (enter at open yes_ask, exit at last yes_bid) {'─'*14}")
-    print(f"Total P&L:      {total_pnl:+.0f}¢  ({n} trades, 1 contract each)")
-    print(f"Win rate:       {len(wins)/n*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
-    print(f"Avg P&L/trade:  {total_pnl/n:+.1f}¢")
+    def _pnl_stats(sub: list[dict], label: str) -> None:
+        if not sub:
+            print(f"  {label}: —")
+            return
+        w = sum(1 for r in sub if r["pnl"] > 0)
+        avg = sum(r["pnl"] for r in sub) / len(sub)
+        tot = sum(r["pnl"] for r in sub)
+        print(f"  {label:<42}  N={len(sub):>3}  win={w/len(sub)*100:>4.0f}%  avg={avg:>+6.1f}¢  total={tot:>+7.0f}¢")
+
+    print(f"\n── P&L BY CONVERGENCE OUTCOME {'─'*49}")
+    _pnl_stats(conv_live,      "Converged while live (true pre-game signal)")
+    _pnl_stats(conv_settled,   "Converged at settlement (game outcome)")
+    _pnl_stats(noconv_results, "Never converged (held to last candle)")
+    _pnl_stats(results,        "ALL trades")
 
     print(f"\n── BY GAP BUCKET {'─'*63}")
-    print(f"  {'Bucket':<10}  {'N':>4}  {'Converged':>9}  {'Win rate':>9}  {'Avg P&L':>8}")
+    print(f"  {'Bucket':<10}  {'N':>4}  {'Converged':>9}  {'Conv-live':>9}  {'Win rate':>9}  {'Avg P&L':>8}")
     for label, lo, hi in [("3–5¢", 3, 5), ("5–10¢", 5, 10), ("10–20¢", 10, 20), ("20¢+", 20, 999)]:
         sub = [r for r in results if lo <= abs(r["gap"]) < hi]
         if not sub:
             continue
         w = sum(1 for r in sub if r["pnl"] > 0)
         avg = sum(r["pnl"] for r in sub) / len(sub)
-        conv = sum(1 for r in sub if r["converged"])
+        conv = sum(1 for r in sub if r["did_converge"])
+        conv_l = sum(1 for r in sub if r["did_converge"] and not r["exit_settled"])
         print(
             f"  {label:<10}  {len(sub):>4}  {conv/len(sub)*100:>8.0f}%"
+            f"  {conv_l/len(sub)*100:>8.0f}%"
             f"  {w/len(sub)*100:>8.0f}%  {avg:>+7.1f}¢"
         )
 
-    hdr = f"  {'Ticker':<42}  {'Date':<10}  {'Home':>4}  {'Away':>4}  {'DK%':>5}  {'KMid':>5}  {'→':>1}  {'KClose':>6}  {'Gap':>5}  {'P&L':>6}"
+    def _bucket_stats(sub: list[dict]) -> str:
+        if not sub:
+            return "  —"
+        w = sum(1 for r in sub if r["pnl"] > 0)
+        avg = sum(r["pnl"] for r in sub) / len(sub)
+        conv_l = sum(1 for r in sub if r["did_converge"] and not r["exit_settled"])
+        return (f"  N={len(sub):>3}  conv-live={conv_l/len(sub)*100:>4.0f}%"
+                f"  win={w/len(sub)*100:>4.0f}%  avg={avg:>+6.1f}¢")
+
+    # ── BY SIDE ───────────────────────────────────────────────────────────────
+    print(f"\n── BY TRADE SIDE {'─'*62}")
+    for label in ("YES", "NO"):
+        sub = [r for r in results if r["side"] == label]
+        print(f"  Buy {label}: {_bucket_stats(sub)}")
+
+    # ── BY DK LINE MOVEMENT ───────────────────────────────────────────────────
+    print(f"\n── BY DK LINE MOVEMENT (open→close) {'─'*43}")
+    sub_our     = [r for r in results if (r["gap"] > 0 and r["dk_moved"] > 3) or (r["gap"] < 0 and r["dk_moved"] < -3)]
+    sub_flat    = [r for r in results if abs(r["dk_moved"]) <= 3]
+    sub_against = [r for r in results if (r["gap"] > 0 and r["dk_moved"] < -3) or (r["gap"] < 0 and r["dk_moved"] > 3)]
+    print(f"  DK confirmed our direction (>3¢): {_bucket_stats(sub_our)}")
+    print(f"  DK flat (±3¢):                    {_bucket_stats(sub_flat)}")
+    print(f"  DK moved against us (>3¢):        {_bucket_stats(sub_against)}")
+
+    # ── BY OPEN SPREAD ────────────────────────────────────────────────────────
+    print(f"\n── BY OPEN SPREAD (bid-ask width at entry) {'─'*36}")
+    for label, lo, hi in [("<5¢", 0, 5), ("5–10¢", 5, 10), ("10–15¢", 10, 15)]:
+        sub = [r for r in results if lo <= r["open_spread"] < hi]
+        print(f"  Spread {label:<8}: {_bucket_stats(sub)}")
+
+    # ── GAP × SPREAD MATRIX ───────────────────────────────────────────────────
+    gap_buckets    = [("3–5¢",   3,  5), ("5–10¢",  5, 10), ("10–20¢", 10, 20), ("20¢+", 20, 999)]
+    spread_buckets = [("<5¢",    0,  5), ("5–10¢",  5, 10), ("10–15¢", 10, 15)]
+    print(f"\n── GAP × SPREAD MATRIX {'─'*57}")
+    col_w = 30
+    header = f"  {'Gap \\ Spread':<12}" + "".join(f"  {s[0]:^{col_w}}" for s in spread_buckets)
+    print(header)
+    for glabel, glo, ghi in gap_buckets:
+        row = f"  {glabel:<12}"
+        for slabel, slo, shi in spread_buckets:
+            sub = [r for r in results if glo <= abs(r["gap"]) < ghi and slo <= r["open_spread"] < shi]
+            if not sub:
+                cell = "—"
+            else:
+                w = sum(1 for r in sub if r["pnl"] > 0)
+                avg = sum(r["pnl"] for r in sub) / len(sub)
+                cell = f"N={len(sub)} win={w/len(sub)*100:.0f}% avg={avg:+.1f}¢"
+            row += f"  {cell:^{col_w}}"
+        print(row)
+
+    # ── BY DK FAVORITE STRENGTH ───────────────────────────────────────────────
+    print(f"\n── BY DK FAVORITE STRENGTH (home win prob) {'─'*35}")
+    for label, lo, hi in [("Toss-up (45–55%)", 45, 55), ("Mild fav (55–65%)", 55, 65),
+                           ("Strong fav (65–75%)", 65, 75), ("Heavy fav (75%+)", 75, 101)]:
+        sub = [r for r in results if lo <= r["dk_open_prob"] < hi]
+        print(f"  {label:<22}: {_bucket_stats(sub)}")
+
+    hdr = f"  {'Ticker':<42}  {'Date':<10}  {'Home':>4}  {'Away':>4}  {'DK%':>5}  {'KOpen':>5}  {'KExit':>5}  {'Gap':>5}  {'P&L':>6}  Conv"
     print(f"\n── TOP GAPS (sorted by |gap|, top 20) {'─'*41}")
     print(hdr)
     for r in sorted(results, key=lambda r: abs(r["gap"]), reverse=True)[:20]:
+        flag = "✓live" if r["did_converge"] and not r["exit_settled"] else ("✓setl" if r["exit_settled"] else "✗")
         print(
             f"  {r['ticker']:<42}  {r['date']:<10}  {r['home']:>4}  {r['away']:>4}"
-            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  →"
-            f"  {r['kalshi_close']:>6.1f}  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢"
+            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  {r['kalshi_exit']:>5.1f}"
+            f"  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢  {flag}"
         )
 
     print(f"\n── LOSSES ({len(losses)}) {'─'*67}")
     print(hdr)
     for r in sorted(losses, key=lambda r: r["pnl"])[:20]:
+        flag = "✓live" if r["did_converge"] and not r["exit_settled"] else ("✓setl" if r["exit_settled"] else "✗")
         print(
             f"  {r['ticker']:<42}  {r['date']:<10}  {r['home']:>4}  {r['away']:>4}"
-            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  →"
-            f"  {r['kalshi_close']:>6.1f}  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢"
+            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  {r['kalshi_exit']:>5.1f}"
+            f"  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢  {flag}"
         )
 
     print(f"\n── TOP WINS ({len(wins)}) {'─'*66}")
     print(hdr)
     for r in sorted(wins, key=lambda r: r["pnl"], reverse=True)[:20]:
+        flag = "✓live" if r["did_converge"] and not r["exit_settled"] else ("✓setl" if r["exit_settled"] else "✗")
         print(
             f"  {r['ticker']:<42}  {r['date']:<10}  {r['home']:>4}  {r['away']:>4}"
-            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  →"
-            f"  {r['kalshi_close']:>6.1f}  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢"
+            f"  {r['dk_open_prob']:>5.1f}  {r['kalshi_mid']:>5.1f}  {r['kalshi_exit']:>5.1f}"
+            f"  {r['gap']:>+5.1f}  {r['pnl']:>+6.1f}¢  {flag}"
         )
 
     print()
