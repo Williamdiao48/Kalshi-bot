@@ -101,3 +101,29 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(2)")
         logging.info("DB schema migration V2 applied (nba_snapshots).")
+
+    if current < 3:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_band_arb (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at    TEXT    NOT NULL,
+                ticker       TEXT    NOT NULL,
+                side         TEXT    NOT NULL,
+                limit_price  INTEGER NOT NULL,
+                contracts    INTEGER NOT NULL,
+                city         TEXT,
+                observed_f   REAL,
+                band_ceil_f  REAL,
+                margin_f     REAL,
+                corr_status  TEXT,
+                hrrr_val_f   REAL,
+                outcome      TEXT,
+                pnl_cents    REAL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shadow_band_arb_ticker
+                ON shadow_band_arb (ticker, logged_at)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(3)")
+        logging.info("DB schema migration V3 applied (shadow_band_arb).")

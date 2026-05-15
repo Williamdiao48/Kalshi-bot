@@ -2450,6 +2450,10 @@ class TradeExecutor:
             await self._maybe_trade_band_arb_yes(session, signal)
             return
 
+        if getattr(signal, "shadow", False):
+            self._log_shadow_band_arb(signal)
+            return
+
         logging.info(
             "BandArb: %s  obs=%.1f°F > ceil=%.1f°F  NO_ask=%d¢  (%s)",
             signal.ticker, signal.observed_max, signal.band_ceil,
@@ -2840,6 +2844,59 @@ class TradeExecutor:
             yes_bid=opp.kalshi_bid,
             yes_ask=opp.kalshi_ask,
             note=f"pinnacle_target={opp.target_bid:.1f}",
+        )
+
+    def _log_shadow_band_arb(self, signal: "BandArbSignal") -> None:
+        """Log a warm-NO band_arb signal that was blocked by the city whitelist.
+
+        Records to shadow_band_arb with a hypothetical contract count so we can
+        track win/loss patterns for cities outside the whitelist without risking
+        capital.  Deduplicates: one open shadow row per ticker at a time.
+        """
+        existing = self._conn.execute(
+            "SELECT id FROM shadow_band_arb WHERE ticker = ? AND outcome IS NULL",
+            (signal.ticker,),
+        ).fetchone()
+        if existing:
+            return
+
+        entry_cost = signal.no_ask
+        if entry_cost <= 0:
+            return
+        from math import floor
+        contracts = min(floor(MAX_POSITION_CENTS / entry_cost), TRADE_MAX_CONTRACTS)
+        if contracts < 1:
+            return
+
+        note_data = {
+            "observed_f":  signal.observed_max,
+            "band_ceil_f": signal.band_ceil,
+            "margin_f":    round(signal.observed_max - signal.band_ceil, 2),
+            "corr_status": signal.corr_status,
+        }
+        if signal.hrrr_val is not None:
+            note_data["hrrr_val_f"] = signal.hrrr_val
+
+        from datetime import datetime, timezone
+        import json
+        self._conn.execute(
+            """INSERT INTO shadow_band_arb
+               (logged_at, ticker, side, limit_price, contracts, city,
+                observed_f, band_ceil_f, margin_f, corr_status, hrrr_val_f)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                signal.ticker, signal.side, entry_cost, contracts,
+                signal.city, signal.observed_max, signal.band_ceil,
+                note_data["margin_f"], signal.corr_status,
+                signal.hrrr_val,
+            ),
+        )
+        logging.info(
+            "BandArb shadow logged: %s  obs=%.1f°F > ceil=%.1f°F  NO_ask=%d¢"
+            "  (hypothetical %d contracts)",
+            signal.ticker, signal.observed_max, signal.band_ceil,
+            entry_cost, contracts,
         )
 
     async def maybe_trade_forecast_no(

@@ -524,6 +524,7 @@ class BandArbSignal:
     nws_climo_val: float | None = None  # NWS CLI value if available (settlement source)
     corr_status: str = ""               # "metar_only" | "metar_noaa_corroborated" | "metar_noaa_lagging"
     yes_ask_entry: int = 0              # YES ask at entry (enables spread + market_p logging)
+    shadow: bool = False                # True = blocked by whitelist; log only, do not execute
 
 
 @dataclass
@@ -905,9 +906,24 @@ def find_band_arbs(
                     _warm_suffix = parsed.metric.replace("temp_low_", "")
                     if _warm_suffix not in BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES:
                         logging.debug(
-                            "BandArb warm-NO skip: %s — city '%s' not in whitelist %s",
-                            ticker, _warm_suffix, sorted(BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES),
+                            "BandArb warm-NO shadow: %s — city '%s' not in whitelist, tracking only",
+                            ticker, _warm_suffix,
                         )
+                        _warm_city_shadow = mkt.get("subtitle", "") or ticker
+                        signals.append(BandArbSignal(
+                            metric=parsed.metric,
+                            ticker=ticker,
+                            yes_bid=yes_bid,
+                            no_ask=no_ask,
+                            observed_max=observed_max,
+                            band_ceil=parsed.strike_hi,
+                            direction=parsed.direction,
+                            city=_warm_city_shadow,
+                            side="no",
+                            hours_to_close=_warm_htc or 0.0,
+                            strike_lo=parsed.strike_hi,
+                            shadow=True,
+                        ))
                         continue
 
                 _warm_ceil_nws = band_ceil + 0.5  # NWS rounds to nearest integer; ceil+0.5 is the safe threshold
@@ -1963,7 +1979,7 @@ def find_forecast_nos(
                     )
                     continue
 
-        min_edge = min(e for _, _v, e, _ in qualifying)
+        min_edge = min(e for _, _, e, _ in qualifying)
         source_names = [s for s, _, _, _ in qualifying]
 
         # Score: blend of source count and edge magnitude, capped at 0.95.

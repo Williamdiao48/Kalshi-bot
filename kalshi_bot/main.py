@@ -3180,6 +3180,47 @@ async def _fast_loop(
                 ledger.request_force_exit(signal.ticker, "band_arb_obs_contra")
         await executor.maybe_trade_band_arb(session, signal)
 
+    await _settle_shadow_band_arbs(conn=executor._conn, session=session)
+
+
+async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> None:
+    """Check open shadow_band_arb rows against live market data and record outcome."""
+    from .markets import KALSHI_API_BASE
+    rows = conn.execute(
+        "SELECT id, ticker, side, limit_price, contracts FROM shadow_band_arb WHERE outcome IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    for row_id, ticker, side, limit_price, contracts in rows:
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/markets/{ticker}",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception:
+            continue
+        mkt = data.get("market", data)
+        status = mkt.get("status", "")
+        result = mkt.get("result", "")
+        if status not in ("settled", "finalized") or result not in ("yes", "no"):
+            continue
+        outcome = "won" if result == side else "lost"
+        if outcome == "won":
+            pnl = limit_price * contracts
+        else:
+            pnl = -(100 - limit_price) * contracts
+        conn.execute(
+            "UPDATE shadow_band_arb SET outcome = ?, pnl_cents = ? WHERE id = ?",
+            (outcome, pnl, row_id),
+        )
+        logging.info(
+            "Shadow band_arb settled: %s %s → %s  pnl=%.0f¢ ($%.2f)",
+            ticker, side.upper(), outcome.upper(), pnl, pnl / 100,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Entry point
