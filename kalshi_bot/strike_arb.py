@@ -139,6 +139,14 @@ BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 9)
 # Maximum NO ask for warm-side KXLOWT NO entries.
 # Above 90¢ only 5–10¢ upside remains — risk/reward not worth it.
 BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 90)
+# Whitelist of city suffixes allowed to generate warm-side NO signals.
+# Only cities with stable overnight lows (desert/coastal) belong here.
+# Empty string = allow all cities.  Default: "lax,las" (LA and Las Vegas only).
+BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES: frozenset[str] = frozenset(
+    c.strip().lower()
+    for c in os.environ.get("BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES", "lax,las").split(",")
+    if c.strip()
+)
 # Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
 # data gap, or the midnight-to-1 AM window before the first QC obs arrives).
 # During this window only METAR and the market-price cap protect against
@@ -206,6 +214,10 @@ SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = env_bool("SYNOPTIC_BAND_ARB_NO_ENABLED", T
 BAND_ARB_LOW_YES_ENABLED: bool = env_bool("BAND_ARB_LOW_YES_ENABLED", True)
 BAND_ARB_LOW_YES_MIN_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MIN_YES_ASK", 10)
 BAND_ARB_LOW_YES_MAX_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MAX_YES_ASK", 85)
+# Max hours-to-close for KXLOWT YES entries. Unlike KXHIGHT (running max only rises),
+# the overnight low can still drop with a cold front after the morning minimum is set.
+# Only enter when the overnight risk window has substantially closed (~6 PM local).
+BAND_ARB_LOW_YES_MAX_HTC: float = env_float("BAND_ARB_LOW_YES_MAX_HTC", 6.0)
 
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
@@ -889,6 +901,15 @@ def find_band_arbs(
         if not is_definitive_no:
             # --- Warm-side NO: running daily min confirmed above band ceiling ---
             if is_warm_no:
+                if BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES:
+                    _warm_suffix = parsed.metric.replace("temp_low_", "")
+                    if _warm_suffix not in BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES:
+                        logging.debug(
+                            "BandArb warm-NO skip: %s — city '%s' not in whitelist %s",
+                            ticker, _warm_suffix, sorted(BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES),
+                        )
+                        continue
+
                 _warm_ceil_nws = band_ceil + 0.5  # NWS rounds to nearest integer; ceil+0.5 is the safe threshold
 
                 # NOAA hard gate (required, same as band_arb YES):
@@ -973,9 +994,11 @@ def find_band_arbs(
                 continue
 
             # --- KXLOWT YES: running daily min inside the band --------------
-            # Symmetric to KXHIGHT YES: buy YES when observation confirms the
-            # low is already sitting inside the [strike_lo, strike_hi] band
-            # and the morning lock has passed (P75 of daily lows set by 9 AM).
+            # Buy YES when METAR + NOAA confirm the running min is inside the
+            # band. NOT symmetric to KXHIGHT: unlike the daily high (which can
+            # only rise), the overnight low can still drop with a cold front.
+            # Entry only allowed within BAND_ARB_LOW_YES_MAX_HTC hours of close
+            # (overnight risk window substantially passed) and is_locked=False.
             if (
                 BAND_ARB_LOW_YES_ENABLED
                 and is_low_market
@@ -994,7 +1017,7 @@ def find_band_arbs(
                     _low_yes_locked = _low_yes_local_hour >= BAND_ARB_LOW_CEIL_MIN_HOUR
                     _low_yes_close_str = mkt.get("close_time") or mkt.get("expiration_time", "")
                     _low_yes_htc = _hours_to_close(_low_yes_close_str)
-                    if _low_yes_htc is not None and _low_yes_htc < 20 and _low_yes_locked:
+                    if _low_yes_htc is not None and _low_yes_htc < BAND_ARB_LOW_YES_MAX_HTC and _low_yes_locked:
                         _low_yes_ask_raw = mkt.get("yes_ask")
                         if _low_yes_ask_raw is not None:
                             _low_yes_ask = int(_low_yes_ask_raw)
@@ -1026,7 +1049,7 @@ def find_band_arbs(
                                         else "metar_noaa_lagging"
                                     )
                                     logging.info(
-                                        "BandArb LOW-YES (LOCKED): %s  obs_min=%.1f°F"
+                                        "BandArb LOW-YES: %s  obs_min=%.1f°F"
                                         " in [%.1f–%.1f]  NOAA=%.1f°F"
                                         "  YES_ask=%d¢  %.1fh to close",
                                         ticker, observed_max,
@@ -1045,7 +1068,7 @@ def find_band_arbs(
                                         side="yes",
                                         yes_ask=_low_yes_ask,
                                         hours_to_close=_low_yes_htc,
-                                        is_locked=True,
+                                        is_locked=False,
                                         strike_lo=parsed.strike_lo,
                                         noaa_val=noaa_val_low,
                                         hrrr_val=(hrrr_values or {}).get(parsed.metric),
