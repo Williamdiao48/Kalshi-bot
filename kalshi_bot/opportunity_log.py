@@ -630,6 +630,46 @@ class OpportunityLog:
             ),
         )
 
+    def log_nba_convergence(self, opp: "NBAConvergenceOpportunity", score: float) -> None:
+        """Persist an NBA Pinnacle convergence opportunity to the log.
+
+        Stored as kind='nba_convergence' with:
+          signal_key = "pinnacle_{ticker}" for per-ticker deduplication.
+          data_value = pinnacle_prob × 100 (probability as 0–100 scale).
+          strike     = kalshi_mid (the Kalshi mid-price Pinnacle disagrees with).
+          edge       = |gap| in cents.
+        """
+        from .nba_convergence import NBAConvergenceOpportunity as _NBAConv  # noqa: F401
+
+        self._conn.execute(
+            """
+            INSERT INTO opportunities (
+                logged_at, kind, ticker, signal_key, market_title, score,
+                yes_bid, yes_ask, volume, days_to_close, source,
+                doc_title,
+                data_value, unit, direction, strike,
+                implied_outcome, edge
+            ) VALUES (?, 'numeric', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                opp.kalshi_ticker,
+                f"pinnacle_{opp.kalshi_ticker}",
+                f"{opp.home_team} vs {opp.away_team} ({opp.game_date})",
+                score,
+                opp.kalshi_bid,
+                opp.kalshi_ask,
+                opp.source,
+                f"Pinnacle {opp.home_team} vs {opp.away_team}",
+                round(opp.pinnacle_prob * 100, 2),
+                "%",
+                "over" if opp.gap > 0 else "under",
+                opp.kalshi_mid,
+                opp.side,
+                abs(opp.gap),
+            ),
+        )
+
     def log_suppression(
         self,
         ticker: str,

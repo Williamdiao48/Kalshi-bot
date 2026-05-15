@@ -96,6 +96,7 @@ After settlement, compare captured vs. hypothetical hold P&L:
 import json
 import logging
 import os
+import re
 from .utils import env_bool, env_float, env_int, parse_iso_dt
 import uuid
 from datetime import datetime, timezone
@@ -1032,6 +1033,46 @@ class ExitManager:
                 )
                 reason = "profit_take"
                 detail = "profit_take:band_arb_abs_price"
+
+            # ---- NBA Pinnacle convergence exits --------------------------------
+            # Applied before standard profit-take so the convergence target is
+            # the primary exit, not the percentage-based profit-take threshold.
+            _opp_kind_str = getattr(trade, "opportunity_kind", "") or ""
+            if reason is None and _opp_kind_str == "nba_convergence":
+                _note_str = getattr(trade, "note", None) or ""
+                _pt_m = re.search(r"pinnacle_target=([\d.]+)", _note_str)
+                _pt_target = float(_pt_m.group(1)) if _pt_m else None
+
+                if _pt_target is not None and trade.current_mid is not None:
+                    # current_mid is yes_bid (YES positions) or 100−yes_ask (NO).
+                    # In both cases convergence means current_mid ≥ target − 1.
+                    if trade.current_mid >= _pt_target - 1:
+                        logging.info(
+                            "[NBA-conv-PT] trade #%d %s: current=%.0f¢ ≥ target=%.1f¢ − 1¢",
+                            trade.trade_id, getattr(trade, "ticker", "?"),
+                            trade.current_mid, _pt_target,
+                        )
+                        reason = "profit_take"
+                        detail = "profit_take:pinnacle_convergence"
+
+                # Time stop: NBA game is about to start — in-game price movement
+                # is score-driven, not convergence-driven. Exit 2h before tip-off
+                # by checking hours_to_close on the Kalshi market.
+                if reason is None and hours_to_close is not None and 0 <= hours_to_close < 2:
+                    _pnl_ts = trade._unrealized_cents()
+                    logging.info(
+                        "[NBA-conv-time-stop] trade #%d %s: %.1fh to close — exiting (game imminent)",
+                        trade.trade_id, getattr(trade, "ticker", "?"), hours_to_close,
+                    )
+                    reason = "stop_loss"
+                    detail = "stop_loss:nba_time_stop"
+
+                # Tighter stop-loss for convergence trades: -50% vs global -70%.
+                # Bounded upside means losses compound faster relative to potential
+                # profit; cut losses at -50% rather than letting them run to -70%.
+                if stop_loss_thresh > 0.50:
+                    stop_loss_thresh = 0.50
+                    _sl_detail = "stop_loss:nba_convergence"
 
             if reason is None and is_forecast_no and FORECAST_NO_PROFIT_TAKE > 0 and pct >= FORECAST_NO_PROFIT_TAKE:
                 reason = "profit_take"

@@ -63,11 +63,13 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import datetime, timezone
 from .utils import env_float
 
 from .matcher import Opportunity
 from .numeric_matcher import NumericOpportunity
 from .polymarket_matcher import PolyOpportunity
+from .nba_convergence import NBAConvergenceOpportunity
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +177,7 @@ _SOURCE_SCORES: dict[str, float] = {
                              # the NWS CLI station Kalshi uses for settlement
     "nws_alert":     0.95,   # NWS official warning/alert — high-confidence
     "cme_fedwatch":  0.90,   # CME FedWatch futures-implied FOMC probabilities
+    "pinnacle":      0.90,   # real-money sportsbook, sharp de-vigged lines
     "polymarket":    0.90,   # real-money global prediction market
     "binance":       0.85,   # real-time exchange spot price
     "adp":           0.75,   # ADP Employment Report (60-70% corr. with BLS NFP)
@@ -492,6 +495,41 @@ def score_poly_opportunity(
         + NUM_WEIGHT_EDGE        * s_edge
         + NUM_WEIGHT_SOURCE      * s_source
     )
+
+
+def score_nba_convergence(opp: NBAConvergenceOpportunity) -> float:
+    """Compute a composite score in [0.0, 1.0] for an NBA Pinnacle convergence trade.
+
+    Four equal sub-scores (0.25 each):
+      spread    — lower spread = more profit retained
+      gap       — larger gap = more room to profit after spread cost
+      win_prob  — backtested win rate, centred at 50%
+      temporal  — prefer entries further from tip-off (convergence needs time)
+    """
+    spread = opp.open_spread
+    gap_abs = abs(opp.gap)
+
+    s_spread   = max(0.0, 1.0 - spread / 15.0)          # 0¢→1.0, 15¢→0.0
+    s_gap      = min(1.0, gap_abs / 20.0)               # 20¢ gap → full score
+    s_win_prob = max(0.0, (opp.win_probability - 0.5) / 0.5)  # 50%→0.0, 100%→1.0
+
+    # Temporal: estimate hours until game.
+    try:
+        game_dt = datetime.strptime(opp.game_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        days_diff = (game_dt.date() - now_utc.date()).days
+        if days_diff == 0:
+            hours_to_game = 12.0
+        elif days_diff > 0:
+            hours_to_game = days_diff * 24.0
+        else:
+            hours_to_game = 0.0
+    except (ValueError, AttributeError):
+        hours_to_game = 12.0
+
+    s_temporal = 1.0 / (1.0 + hours_to_game / 24.0)
+
+    return (s_spread + s_gap + s_win_prob + s_temporal) / 4.0
 
 
 # ---------------------------------------------------------------------------

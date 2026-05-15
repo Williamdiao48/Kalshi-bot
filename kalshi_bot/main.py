@@ -55,8 +55,10 @@ from .scoring import (
     score_text_opportunity,
     score_numeric_opportunity,
     score_poly_opportunity,
+    score_nba_convergence,
     METRIC_EDGE_SCALES,
 )
+from . import nba_convergence
 from .release_schedule import is_within_release_window, next_release
 from .state import SeenDocuments
 from .win_rate_tracker import WinRateTracker, WIN_RATE_REPORT_INTERVAL
@@ -2714,6 +2716,15 @@ async def _poll(
     if not isinstance(pinnacle_result, Exception) \
             and not isinstance(nba_markets_result, Exception):
         _log_nba_snapshots(opp_log._conn, pinnacle_result, nba_markets_result)
+
+        # ---- NBA Pinnacle convergence signal generation ----------------------
+        nba_conv_opps = nba_convergence.find_opportunities(
+            pinnacle_result, nba_markets_result
+        )
+        for conv_opp in nba_conv_opps:
+            conv_score = score_nba_convergence(conv_opp)
+            opp_log.log_nba_convergence(conv_opp, conv_score)
+            await executor.execute_nba_convergence(session, conv_opp, conv_score)
 
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast

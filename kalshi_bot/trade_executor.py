@@ -126,6 +126,7 @@ from .arb_detector import (
 )
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
 from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
+from .nba_convergence import NBAConvergenceOpportunity
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +229,10 @@ POLY_MAX_OPEN_PER_UNDERLYING: int = int(
 # even with POLY_MIN_SCORE=0.82.  The text-similarity matching introduces too
 # much noise.  Re-enable with POLY_ENABLED=true once matching quality improves.
 POLY_ENABLED: bool = env_bool("POLY_ENABLED", False)
+
+# Minimum composite score for NBA Pinnacle convergence trades.
+# Set to 0 to fall back to TRADE_MIN_SCORE.
+NBA_CONVERGENCE_MIN_SCORE: float = env_float("NBA_CONVERGENCE_MIN_SCORE", 0.0)
 
 # Metrics to skip entirely, regardless of score or edge.
 # Comma-separated.  Based on observed 0% win rate across all dry-run trades.
@@ -2719,6 +2724,122 @@ class TradeExecutor:
             peak_past=signal.is_locked,
             corroborating_sources=_yes_corr,
             note=json.dumps(_yes_note),
+        )
+
+    async def execute_nba_convergence(
+        self,
+        session: aiohttp.ClientSession,
+        opp: NBAConvergenceOpportunity,
+        score: float,
+    ) -> None:
+        """Evaluate and optionally execute a Pinnacle→Kalshi NBA convergence trade.
+
+        Uses a bounded-profit Kelly formula: standard Kelly assumes a 100¢ payout
+        but convergence trades exit once Kalshi's bid reaches Pinnacle's level,
+        giving a bounded expected profit (target_bid − entry_ask in cents).
+
+        Guards:
+          1. score >= TRADE_MIN_SCORE (global)
+          2. score >= NBA_CONVERGENCE_MIN_SCORE (per-type gate, default 0 = disabled)
+          3. Kelly sizing yields >= 1 contract
+          4. Ticker cooldown not active
+          5. Circuit breaker clear
+        """
+        self.stats.seen += 1
+
+        effective_min = max(TRADE_MIN_SCORE, NBA_CONVERGENCE_MIN_SCORE)
+        if score < effective_min:
+            logging.debug(
+                "NBA convergence skip (score %.2f < min %.2f): %s",
+                score, effective_min, opp.kalshi_ticker,
+            )
+            self.stats.filtered_score += 1
+            return
+
+        if TRADE_TICKER_COOLDOWN_MINUTES > 0:
+            last = self._last_trade_time(opp.kalshi_ticker)
+            if last is not None:
+                age_min = (datetime.now(timezone.utc) - last).total_seconds() / 60
+                if age_min < TRADE_TICKER_COOLDOWN_MINUTES:
+                    logging.info(
+                        "NBA convergence skip (ticker cooldown %.0f min): %s",
+                        TRADE_TICKER_COOLDOWN_MINUTES - age_min, opp.kalshi_ticker,
+                    )
+                    self.stats.filtered_ticker_cool += 1
+                    return
+
+        if self._circuit_breaker_tripped(opp.kalshi_ticker, "NBA convergence"):
+            return
+
+        # Bounded-profit Kelly: reward = target_bid − entry_ask
+        # reward_to_risk = expected_profit / entry_cost
+        # kelly_f = win_prob − (1−win_prob) / reward_to_risk  (bounded version)
+        if opp.side == "YES":
+            entry_ask  = opp.kalshi_ask
+            entry_cost = opp.kalshi_ask
+        else:
+            # NO side: we buy NO at (100 − yes_bid)
+            entry_ask  = 100 - opp.kalshi_bid
+            entry_cost = 100 - opp.kalshi_bid
+
+        expected_profit = max(0.0, opp.target_bid - entry_ask)
+        if entry_ask <= 0 or expected_profit <= 0:
+            logging.debug(
+                "NBA convergence skip (no positive expected profit): %s", opp.kalshi_ticker
+            )
+            self.stats.filtered_kelly += 1
+            return
+
+        reward_to_risk = expected_profit / entry_ask
+        kelly_f = opp.win_probability - (1.0 - opp.win_probability) / max(reward_to_risk, 0.01)
+        kelly_f = max(kelly_f, 0.0)
+
+        if kelly_f <= 0:
+            logging.debug(
+                "NBA convergence skip (kelly_f=0 at p=%.2f r/r=%.2f): %s",
+                opp.win_probability, reward_to_risk, opp.kalshi_ticker,
+            )
+            self.stats.filtered_kelly += 1
+            return
+
+        available = min(max(1, int(MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents())
+        count = min(
+            math.floor(KELLY_FRACTION * kelly_f * available / entry_cost),
+            TRADE_MAX_CONTRACTS,
+        )
+        if count < 1:
+            logging.debug(
+                "NBA convergence skip (count=0): %s  kelly_f=%.3f  entry=%d¢",
+                opp.kalshi_ticker, kelly_f, entry_cost,
+            )
+            self.stats.filtered_kelly += 1
+            return
+
+        side_lower = opp.side.lower()
+        limit_price = entry_ask if side_lower == "yes" else (100 - entry_cost)
+
+        logging.info(
+            "NBA convergence: %s %s  gap=%.1f¢  spread=%.0f¢  win=%.0f%%"
+            "  target=%.1f¢  kelly_f=%.3f  count=%d  score=%.2f",
+            opp.kalshi_ticker, opp.side,
+            opp.gap, opp.open_spread, opp.win_probability * 100,
+            opp.target_bid, kelly_f, count, score,
+        )
+
+        self.stats.trades_attempted += 1
+        await self._execute(
+            session=session,
+            ticker=opp.kalshi_ticker,
+            side=side_lower,
+            count=count,
+            limit_price=limit_price,
+            opportunity_kind="nba_convergence",
+            score=score,
+            p_estimate=opp.win_probability,
+            source=opp.source,
+            yes_bid=opp.kalshi_bid,
+            yes_ask=opp.kalshi_ask,
+            note=f"pinnacle_target={opp.target_bid:.1f}",
         )
 
     async def maybe_trade_forecast_no(
