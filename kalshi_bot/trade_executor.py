@@ -637,6 +637,8 @@ CIRCUIT_BREAKER_MAX_OPEN: int = int(
 _KELLY_METRIC_PRIORS_DEFAULT: dict[str, float] = {
     # temp_low YES win rate = 32% across 34 resolved trades; 0.40 adds margin of safety.
     "temp_low": 0.40,
+    # BTC daily-close: backtest May 1-14 (margin>$100, entry≥55¢) = 70% win rate.
+    "price_btc_usd": 0.70,
 }
 _priors_raw = os.environ.get("KELLY_METRIC_PRIORS", "")
 try:

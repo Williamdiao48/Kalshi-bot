@@ -563,6 +563,15 @@ FOREX_CLOSE_HOURS: float = env_float("FOREX_CLOSE_HOURS", 2.0)
 # close_time.  Set to 0 to disable.  Default: 2.0
 CRYPTO_DAILY_CLOSE_HOURS: float = env_float("CRYPTO_DAILY_CLOSE_HOURS", 6.0)
 
+# Minimum BTC distance (USD) between spot price and strike for a crypto signal
+# to pass.  Backtest (May 1–14, 514 tickers): margin >$100 lifts win rate from
+# 60% to 69–71% and avg P&L from +0.6¢ to +6–7¢.
+CRYPTO_MIN_MARGIN_USD: float = env_float("CRYPTO_MIN_MARGIN_USD", 100.0)
+
+# Minimum entry cost (¢) for crypto signals.  Cheap entries (<55¢) have 45%
+# win rate and negative EV; entries ≥55¢ have 62–66% win rate.
+CRYPTO_MIN_ENTRY_CENTS: int = env_int("CRYPTO_MIN_ENTRY_CENTS", 55)
+
 # CONTRARIAN_MAX_ENTRY_CENTS — (Option E) Maximum cost (in cents) to enter a
 #   numeric position.  For a YES trade this is yes_ask; for a NO trade it is
 #   100 − yes_bid.  Only trades where the market currently disagrees with the
@@ -1666,6 +1675,9 @@ async def _poll(
             m.get("ticker", ""): m.get("close_time") or m.get("expiration_time")
             for m in (markets or [])
         }
+        _mkt_by_ticker: dict[str, dict] = {
+            m.get("ticker", ""): m for m in (markets or [])
+        }
         now_utc = datetime.now(timezone.utc)
         before_cc = len(numeric_opps)
         passed_cc: list[NumericOpportunity] = []
@@ -1679,6 +1691,38 @@ async def _poll(
                     close_dt = parse_iso_dt(ct_str)
                     hours_to_close = (close_dt - now_utc).total_seconds() / 3600
                     if hours_to_close <= CRYPTO_DAILY_CLOSE_HOURS:
+                        # Margin filter: BTC must be >$100 from strike
+                        if (
+                            CRYPTO_MIN_MARGIN_USD > 0
+                            and opp.strike is not None
+                            and opp.data_value is not None
+                        ):
+                            _margin = abs(opp.data_value - opp.strike)
+                            if _margin < CRYPTO_MIN_MARGIN_USD:
+                                opp_log.log_suppression(
+                                    ticker=opp.market_ticker, source=opp.source,
+                                    gate="crypto_margin", metric=opp.metric,
+                                    edge_f=opp.edge, value=opp.data_value,
+                                    strike=opp.strike,
+                                    note=f"margin={_margin:.0f} < {CRYPTO_MIN_MARGIN_USD:.0f}",
+                                )
+                                continue
+                        # Entry cost filter: market must agree (≥55¢ entry)
+                        if CRYPTO_MIN_ENTRY_CENTS > 0:
+                            _mkt = _mkt_by_ticker.get(opp.market_ticker, {})
+                            if opp.implied_outcome == "YES":
+                                _entry = _mkt.get("yes_ask", 0)
+                            else:
+                                _entry = 100 - (_mkt.get("yes_bid") or 0)
+                            if isinstance(_entry, (int, float)) and _entry < CRYPTO_MIN_ENTRY_CENTS:
+                                opp_log.log_suppression(
+                                    ticker=opp.market_ticker, source=opp.source,
+                                    gate="crypto_entry_cost", metric=opp.metric,
+                                    edge_f=opp.edge, value=opp.data_value,
+                                    strike=opp.strike,
+                                    note=f"entry={_entry}¢ < {CRYPTO_MIN_ENTRY_CENTS}¢",
+                                )
+                                continue
                         passed_cc.append(opp)
                     else:
                         logging.debug(
