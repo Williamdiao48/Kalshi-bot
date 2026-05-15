@@ -39,10 +39,9 @@ from .arb_detector import (
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
 from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
-from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_manifold_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
-from .news import federal_register
-from .news import noaa, open_meteo, nws_hourly, weatherapi, binance, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, adp, chicago_pmi, metar, nws_asos, wti_futures
-from .news import polymarket, metaculus, manifold, edgar, predictit
+from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
+from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
+from .news import polymarket, metaculus, edgar, predictit
 from .news import box_office
 from .box_office_matcher import match_box_office_to_kalshi
 from .display import print_text_opportunity as _print_text_opportunity, print_numeric_opportunity as _print_numeric_opportunity, print_poly_opportunity as _print_poly_opportunity
@@ -225,19 +224,6 @@ if _MARKET_REFRESH_OVERRIDE is not None:
 # Federal Register agencies to monitor.
 # Each slug maps to an agency's Federal Register publication stream.
 # Documents from all agencies are routed to the politics_economics source group.
-AGENCIES: list[str] = [
-    "environmental-protection-agency",          # EPA — climate, emissions, env rules
-    "food-and-drug-administration",             # FDA — drug approvals, recalls, guidance
-    "federal-trade-commission",                 # FTC — antitrust, consumer protection
-    "commodity-futures-trading-commission",     # CFTC — derivatives, crypto regulation
-    "department-of-the-treasury",              # Treasury — sanctions, debt, tax rules
-    "department-of-health-and-human-services", # HHS — Medicare, Medicaid, drug pricing
-    "securities-and-exchange-commission",       # SEC — earnings, disclosures, IPOs
-    "consumer-financial-protection-bureau",     # CFPB — consumer finance rules
-    "department-of-labor",                      # DOL — jobs, wages, OSHA
-    "federal-communications-commission",        # FCC — telecom, broadband rules
-]
-
 # ---------------------------------------------------------------------------
 # Source-scoped topic groups
 #
@@ -332,7 +318,7 @@ _SOURCE_GROUPS: list[dict] = [
             "politico_congress", "politico_healthcare", "politico_defense",
             "politico_economy", "politico_energy", "politico_politics",
             "thehill", "npr", "bbc", "ap_top", "ap_politics", "reuters",
-            "federal_register",
+
             "cnbc_top", "marketwatch",
         },
         "topics": [
@@ -667,20 +653,6 @@ EXIT_REENTRY_COOLDOWN_MINUTES: int = env_int("EXIT_REENTRY_COOLDOWN_MINUTES", 24
 # already hold a meaningful position. Set to 0 to always surface all markets
 # regardless of existing exposure.
 POSITION_SKIP_CONTRACTS: int = env_int("POSITION_SKIP_CONTRACTS", 5)
-
-# Manifold consensus gate.  Manifold-only signals with divergence above this
-# threshold are blocked unless Polymarket or Metaculus independently agrees on
-# the same Kalshi ticker.  Real-money platforms rarely sustain 50%+ divergences
-# — if only Manifold shows it, it is almost certainly stale/frozen data.
-# Set to 0 to disable.
-MANI_MAX_SOLO_DIVERGENCE: float = env_float("MANI_MAX_SOLO_DIVERGENCE", 0.5)
-
-# Manifold hard cap.  Manifold opportunities with divergence above this threshold
-# are ALWAYS blocked, even if Polymarket or Metaculus corroborates.  A 40%+
-# divergence (Manifold 85%, Kalshi 45%) is almost certainly a stale Manifold
-# market or a matching error — legitimate Kalshi mispricings rarely exceed 30–35pp.
-# Set to 0 to disable.
-MANI_HARD_CAP_DIVERGENCE: float = env_float("MANI_HARD_CAP_DIVERGENCE", 0.4)
 
 # Maximum number of simultaneously open temperature (KXHIGH*) positions.
 # When this many temperature positions are already open, new temperature numeric
@@ -1065,8 +1037,6 @@ async def _poll(
     # To add a source: append a ("name", coroutine) pair and unpack by name below.
     _tasks: list[tuple[str, object]] = [
         ("markets",      _get_markets(session)),
-        *[(f"fed_{a}",   federal_register.fetch_documents(session, agency_slug=a))
-          for a in AGENCIES],
         ("rss",          rss.fetch_all_feeds(session)),
         ("nws",          nws_alerts.fetch_alerts(session)),
         ("nws_signals",  nws_alerts.fetch_city_alert_signals(session)),
@@ -1081,7 +1051,6 @@ async def _poll(
         ("open_meteo",        open_meteo.fetch_city_forecasts(session)),
         ("open_meteo_models", open_meteo.fetch_model_forecasts(session)),
         ("equity_index",  equity_index.fetch_prices(session)),
-        ("binance",      binance.fetch_prices(session)),
         ("coinbase",     coinbase.fetch_prices(session)),
         ("frankfurter",  frankfurter.fetch_rates(session)),
         ("yahoo_forex",  yahoo_forex.fetch_rates(session)),
@@ -1090,12 +1059,9 @@ async def _poll(
         ("eia",          eia.fetch_prices(session)),
         ("wti_futures",  wti_futures.fetch_futures(session)),
         ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),
-        ("adp",          adp.fetch_datapoints(session)),
-        ("chicago_pmi",  chicago_pmi.fetch_datapoints(session)),
         ("box_office",   box_office.fetch_weekend_chart(session, seen)),
         ("polymarket",   polymarket.fetch_markets(session)),
         ("metaculus",    metaculus.fetch_questions(session)),
-        ("manifold",     manifold.fetch_markets(session)),
         ("predictit",    predictit.fetch_contracts(session)),
         ("positions",    fetch_positions(session)),
     ]
@@ -1105,7 +1071,6 @@ async def _poll(
 
     # ---- unpack by name ----------------------------------------------------
     markets_result     = R["markets"]
-    fed_results        = [R[f"fed_{a}"] for a in AGENCIES]
     rss_result         = R["rss"]
     nws_result         = R["nws"]
     nws_signals_result = R["nws_signals"]
@@ -1120,7 +1085,6 @@ async def _poll(
     open_meteo_result        = R["open_meteo"]
     open_meteo_models_result = R["open_meteo_models"]
     equity_index_result  = R["equity_index"]
-    binance_result     = R["binance"]
     coinbase_result    = R["coinbase"]
     frankfurter_result = R["frankfurter"]
     yahoo_forex_result = R["yahoo_forex"]
@@ -1129,12 +1093,9 @@ async def _poll(
     eia_result         = R["eia"]
     wti_futures_result = R["wti_futures"]
     fedwatch_result    = R["fedwatch"]
-    adp_result         = R["adp"]
-    chicago_pmi_result  = R["chicago_pmi"]
     box_office_result   = R["box_office"]
     poly_result         = R["polymarket"]
     metaculus_result   = R["metaculus"]
-    manifold_result    = R["manifold"]
     predictit_result   = R["predictit"]
     positions_result   = R["positions"]
 
@@ -1172,20 +1133,6 @@ async def _poll(
 
     # ---- collect new text documents from all text sources ------------------
     all_new_docs: list[dict] = []
-
-    # Federal Register
-    for agency, doc_result in zip(AGENCIES, fed_results):
-        if isinstance(doc_result, Exception):
-            logging.error("Federal Register error [%s]: %s", agency, doc_result)
-            continue
-        _drain_text_source(
-            f"Federal Register [{agency}]",
-            doc_result,
-            seen,
-            id_field="document_number",
-            source_tag="federal_register",
-            accumulator=all_new_docs,
-        )
 
     # RSS feeds
     if isinstance(rss_result, Exception):
@@ -1322,7 +1269,6 @@ async def _poll(
         ("Open-Meteo",        open_meteo_result),
         ("Open-Meteo Models", open_meteo_models_result),
         ("Equity",      equity_index_result),
-        ("Binance",     binance_result),
         ("Coinbase",    coinbase_result),
         ("Frankfurter", frankfurter_result),
         ("Yahoo Forex", yahoo_forex_result),
@@ -1346,18 +1292,6 @@ async def _poll(
     # implied prices are computed from the same fresh spot the filter approves.
     # (Previously extracted from raw eia_result before filtering, which allowed
     # stale 2022-era WTI prints to slip through and produce wildly wrong signals.)
-
-    # ADP Employment Report — pre-signal for KXNFP (Wed before BLS Friday).
-    if isinstance(adp_result, Exception):
-        logging.error("ADP fetch error: %s", adp_result)
-    elif adp_result:
-        data_points.extend(adp_result)
-
-    # Chicago PMI — leading indicator for KXISMMFG (last biz day of month).
-    if isinstance(chicago_pmi_result, Exception):
-        logging.error("Chicago PMI fetch error: %s", chicago_pmi_result)
-    elif chicago_pmi_result:
-        data_points.extend(chicago_pmi_result)
 
     # Box office — weekend gross estimates from The Numbers chart.
     if isinstance(box_office_result, Exception):
@@ -1696,9 +1630,7 @@ async def _poll(
             # These sources are leading indicators / proxies, not the actual
             # scheduled releases, so they are exempt from the release window gate.
             #   cme_fedwatch — continuous FOMC probability signal
-            #   adp           — Wednesday pre-signal for Friday BLS NFP
-            #   chicago_pmi   — last-biz-day pre-signal for ISM Manufacturing
-            if opp.source in ("cme_fedwatch", "adp", "chicago_pmi", "yahoo_wti_futures"):
+            if opp.source in ("cme_fedwatch", "yahoo_wti_futures"):
                 passed_rw.append(opp)
                 continue
             if is_within_release_window(opp.metric, now_utc, RELEASE_WINDOW_MINUTES):
@@ -1841,14 +1773,6 @@ async def _poll(
             logging.info("Metaculus: %d divergence(s) found vs Kalshi.", len(opps))
         poly_opps.extend(opps)
 
-    if isinstance(manifold_result, Exception):
-        logging.error("Manifold fetch error: %s", manifold_result)
-    elif manifold_result and markets:
-        opps = match_manifold_to_kalshi(manifold_result, markets)
-        if opps:
-            logging.info("Manifold: %d divergence(s) found vs Kalshi.", len(opps))
-        poly_opps.extend(opps)
-
     if isinstance(predictit_result, Exception):
         logging.error("PredictIt fetch error: %s", predictit_result)
     elif predictit_result and markets:
@@ -1875,54 +1799,6 @@ async def _poll(
                 "Poly series gate: blocked %d match(es) on numeric price-series tickers.",
                 _n_series_blocked,
             )
-
-    # ---- Manifold quality gates --------------------------------------------
-    # Two-tier filter applied to all Manifold opportunities:
-    #
-    #   Hard cap  (MANI_HARD_CAP_DIVERGENCE, default 0.40):
-    #     Always block — even with corroboration — because a 40%+ divergence
-    #     from Manifold is implausibly large and almost always a frozen/stale
-    #     market, not a real signal.
-    #
-    #   Consensus gate (MANI_MAX_SOLO_DIVERGENCE, default 0.50):
-    #     Block Manifold-only divergences above 50% unless Polymarket or
-    #     Metaculus independently shows an opportunity for the same ticker.
-    if poly_opps:
-        corroborated: set[str] = {
-            o.kalshi_ticker for o in poly_opps
-            if o.source in ("polymarket", "metaculus")
-        }
-        gated: list[PolyOpportunity] = []
-        hard_blocked = 0
-        gate_blocked = 0
-        for opp in poly_opps:
-            if opp.source == "manifold":
-                if MANI_HARD_CAP_DIVERGENCE > 0 and opp.divergence > MANI_HARD_CAP_DIVERGENCE:
-                    logging.info(
-                        "Manifold hard cap: divergence %.0f%% > cap %.0f%% — blocked %s.",
-                        opp.divergence * 100, MANI_HARD_CAP_DIVERGENCE * 100,
-                        opp.kalshi_ticker,
-                    )
-                    hard_blocked += 1
-                    continue
-                if (
-                    MANI_MAX_SOLO_DIVERGENCE > 0
-                    and opp.divergence > MANI_MAX_SOLO_DIVERGENCE
-                    and opp.kalshi_ticker not in corroborated
-                ):
-                    logging.info(
-                        "Consensus gate: Manifold-only %.0f%% divergence blocked on %s "
-                        "— no corroborating real-money source.",
-                        opp.divergence * 100, opp.kalshi_ticker,
-                    )
-                    gate_blocked += 1
-                    continue
-            gated.append(opp)
-        if hard_blocked:
-            logging.info("Manifold hard cap: blocked %d opportunity(ies).", hard_blocked)
-        if gate_blocked:
-            logging.info("Consensus gate: blocked %d Manifold-only opportunity(ies).", gate_blocked)
-        poly_opps = gated
 
     # ---- snapshot opps for counter-signal exits ----------------------------
     # Taken here — after all quality gates but before entry filters (liquidity,
