@@ -76,7 +76,28 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("INSERT INTO schema_version(version) VALUES(1)")
         logging.info("DB schema migration V1 applied.")
 
-    # Add future migrations here:
-    # if current < 2:
-    #     ...
-    #     conn.execute("INSERT INTO schema_version(version) VALUES(2)")
+    if current < 2:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nba_snapshots (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at           TEXT    NOT NULL,
+                game_date           TEXT    NOT NULL,
+                matchup_id          INTEGER NOT NULL,
+                home_team           TEXT    NOT NULL,
+                away_team           TEXT    NOT NULL,
+                pinnacle_home       REAL,
+                pinnacle_away       REAL,
+                kalshi_ticker_home  TEXT,
+                kalshi_ticker_away  TEXT,
+                kalshi_home_bid     INTEGER,
+                kalshi_home_ask     INTEGER,
+                kalshi_away_bid     INTEGER,
+                kalshi_away_ask     INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_nba_snapshots_game
+                ON nba_snapshots (matchup_id, logged_at)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(2)")
+        logging.info("DB schema migration V2 applied (nba_snapshots).")

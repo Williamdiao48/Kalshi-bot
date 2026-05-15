@@ -66,6 +66,7 @@ _DEFAULT_DB_PATH = OPPORTUNITY_LOG_DB
 RETENTION_OPPORTUNITIES_DAYS: int = env_int("RETENTION_OPPORTUNITIES_DAYS", 30)
 RETENTION_RAW_FORECASTS_DAYS: int = env_int("RETENTION_RAW_FORECASTS_DAYS", 30)
 RETENTION_PRICE_SNAPSHOTS_DAYS: int = env_int("RETENTION_PRICE_SNAPSHOTS_DAYS", 30)
+RETENTION_NBA_SNAPSHOTS_DAYS: int = env_int("RETENTION_NBA_SNAPSHOTS_DAYS", 90)
 
 _CREATE_RAW_FORECASTS_SQL = """
 CREATE TABLE IF NOT EXISTS raw_forecasts (
@@ -243,6 +244,7 @@ class OpportunityLog:
             ("opportunities",   "logged_at",   RETENTION_OPPORTUNITIES_DAYS),
             ("raw_forecasts",   "logged_at",   RETENTION_RAW_FORECASTS_DAYS),
             ("price_snapshots", "snapshot_at", RETENTION_PRICE_SNAPSHOTS_DAYS),
+            ("nba_snapshots",   "logged_at",   RETENTION_NBA_SNAPSHOTS_DAYS),
         ]
         total = 0
         for table, ts_col, days in thresholds:

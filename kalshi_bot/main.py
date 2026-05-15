@@ -43,6 +43,7 @@ from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi,
 from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, edgar, predictit
 from .news import box_office
+from .news import pinnacle
 from .box_office_matcher import match_box_office_to_kalshi
 from .display import print_text_opportunity as _print_text_opportunity, print_numeric_opportunity as _print_numeric_opportunity, print_poly_opportunity as _print_poly_opportunity
 from .db import open_db, OPPORTUNITY_LOG_DB, run_migrations
@@ -992,6 +993,56 @@ def _signal_key_text(opp: Opportunity) -> str:
     return (opp.matched_terms[0] if opp.matched_terms else opp.topic).lower()
 
 
+def _log_nba_snapshots(conn, games: list, nba_markets: list) -> None:
+    """Join Pinnacle game data to KXNBAGAME Kalshi markets and write snapshot rows."""
+    if not games:
+        return
+    # Build lookup: frozenset({abbrev1, abbrev2}) → {abbrev → market dict}
+    kalshi_by_pair: dict = {}
+    for m in nba_markets:
+        parsed = pinnacle._parse_nba_ticker(m.get("ticker", ""))
+        if not parsed:
+            continue
+        t1, t2 = parsed
+        side = m["ticker"].split("-")[-1]
+        key = frozenset({t1, t2})
+        kalshi_by_pair.setdefault(key, {})[side] = m
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for game in games:
+        home = pinnacle._PINNACLE_TO_ABBREV.get(game["home_team"].lower())
+        away = pinnacle._PINNACLE_TO_ABBREV.get(game["away_team"].lower())
+        if not home or not away:
+            logging.debug(
+                "Pinnacle: no abbrev match for '%s' vs '%s'",
+                game["home_team"], game["away_team"],
+            )
+            continue
+        kalshi = kalshi_by_pair.get(frozenset({home, away}), {})
+        home_m = kalshi.get(home, {})
+        away_m = kalshi.get(away, {})
+        rows.append((
+            now, game["game_date"], game["matchup_id"],
+            game["home_team"], game["away_team"],
+            game.get("home_prob"), game.get("away_prob"),
+            home_m.get("ticker"), away_m.get("ticker"),
+            home_m.get("yes_bid"), home_m.get("yes_ask"),
+            away_m.get("yes_bid"), away_m.get("yes_ask"),
+        ))
+    if rows:
+        conn.executemany("""
+            INSERT INTO nba_snapshots
+            (logged_at, game_date, matchup_id, home_team, away_team,
+             pinnacle_home, pinnacle_away,
+             kalshi_ticker_home, kalshi_ticker_away,
+             kalshi_home_bid, kalshi_home_ask,
+             kalshi_away_bid, kalshi_away_ask)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+        logging.info("NBA: wrote %d snapshot row(s).", len(rows))
+
+
 async def _poll(
     session: aiohttp.ClientSession,
     seen: SeenDocuments,
@@ -1073,6 +1124,8 @@ async def _poll(
         ("metaculus",    metaculus.fetch_questions(session)),
         ("predictit",    predictit.fetch_contracts(session)),
         ("positions",    fetch_positions(session)),
+        ("pinnacle",     pinnacle.fetch_nba_games(session)),
+        ("nba_markets",  fetch_markets_by_series(session, series_tickers=("KXNBAGAME",))),
     ]
     _task_names, _task_coros = zip(*_tasks)
     _raw = await asyncio.gather(*_task_coros, return_exceptions=True)
@@ -1107,6 +1160,8 @@ async def _poll(
     metaculus_result   = R["metaculus"]
     predictit_result   = R["predictit"]
     positions_result   = R["positions"]
+    pinnacle_result    = R["pinnacle"]
+    nba_markets_result = R["nba_markets"]
 
     if isinstance(fedwatch_result, Exception):
         logging.error("CME FedWatch fetch error: %s", fedwatch_result)
@@ -2655,6 +2710,11 @@ async def _poll(
             poly_opps=_exit_poly_opps,
         )
 
+    # ---- NBA snapshot logging (Pinnacle + Kalshi aligned rows) ---------------
+    if not isinstance(pinnacle_result, Exception) \
+            and not isinstance(nba_markets_result, Exception):
+        _log_nba_snapshots(opp_log._conn, pinnacle_result, nba_markets_result)
+
     # ---- populate fast-loop watchlist --------------------------------------
     # Identify cities within WATCH_THRESHOLD_F of a band ceiling so the fast
     # inner loop only refreshes series prices for cities that matter.
@@ -3117,9 +3177,8 @@ async def _fast_loop(
 async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
     """Start the bot and poll indefinitely."""
     logging.info(
-        "Kalshi bot starting — interval=%ds  fed-agencies=%d",
+        "Kalshi bot starting — interval=%ds",
         poll_interval,
-        len(AGENCIES),
     )
 
     seen = SeenDocuments()
