@@ -28,6 +28,13 @@ from .news.pinnacle import _PINNACLE_TO_ABBREV, _parse_nba_ticker
 
 NBA_CONVERGENCE_ENABLED: bool = env_bool("NBA_CONVERGENCE_ENABLED", True)
 
+# Minimum hours until market close to allow entry.  NBA markets close when the
+# game ends — if close_time is within this window the game is live and Pinnacle
+# is showing in-game lines, not pre-game.  In-game Pinnacle lines move rapidly
+# on scoring runs, creating fake gaps that vanish two polls later.
+# Default 5h: typical NBA game takes ~2.5h, so 5h before close ≈ game has started.
+_MIN_HOURS_TO_CLOSE: float = 5.0
+
 # Minimum yes_bid in cents to exclude stub-bid / illiquid markets.
 _MIN_BID: int = 5
 
@@ -153,6 +160,26 @@ def find_opportunities(
             # Stub-bid filter: exclude markets with an essentially-zero bid.
             if yes_bid < _MIN_BID:
                 continue
+
+            # In-game filter: if the market closes within _MIN_HOURS_TO_CLOSE,
+            # the game is live and Pinnacle lines are in-game (not pre-game).
+            # In-game Pinnacle lines spike on scoring runs, creating transient
+            # fake gaps that vanish two polls later.
+            _close_str = m.get("close_time") or m.get("expiration_time", "")
+            if _close_str:
+                try:
+                    from .strike_arb import parse_iso_dt
+                    _close_dt = parse_iso_dt(_close_str)
+                    if _close_dt is not None:
+                        _htc = (_close_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if _htc < _MIN_HOURS_TO_CLOSE:
+                            logging.debug(
+                                "NBA convergence skip (game live): %s closes in %.1fh < %.1fh",
+                                m.get("ticker", "?"), _htc, _MIN_HOURS_TO_CLOSE,
+                            )
+                            continue
+                except Exception:
+                    pass
 
             spread = float(yes_ask - yes_bid)
             mid    = (yes_bid + yes_ask) / 2.0
