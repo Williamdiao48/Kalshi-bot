@@ -232,7 +232,7 @@ POLY_ENABLED: bool = env_bool("POLY_ENABLED", False)
 
 # Minimum composite score for NBA Pinnacle convergence trades.
 # Set to 0 to fall back to TRADE_MIN_SCORE.
-NBA_CONVERGENCE_MIN_SCORE: float = env_float("NBA_CONVERGENCE_MIN_SCORE", 0.0)
+NBA_CONVERGENCE_MIN_SCORE: float = env_float("NBA_CONVERGENCE_MIN_SCORE", 0.70)
 
 # Metrics to skip entirely, regardless of score or edge.
 # Comma-separated.  Based on observed 0% win rate across all dry-run trades.
@@ -2751,7 +2751,7 @@ class TradeExecutor:
         """
         self.stats.seen += 1
 
-        effective_min = max(TRADE_MIN_SCORE, NBA_CONVERGENCE_MIN_SCORE)
+        effective_min = NBA_CONVERGENCE_MIN_SCORE if NBA_CONVERGENCE_MIN_SCORE > 0 else TRADE_MIN_SCORE
         if score < effective_min:
             logging.debug(
                 "NBA convergence skip (score %.2f < min %.2f): %s",
@@ -2794,7 +2794,10 @@ class TradeExecutor:
             self.stats.filtered_kelly += 1
             return
 
-        reward_to_risk = expected_profit / entry_ask
+        # Use 50% of entry cost as downside — convergence trades carry a 50% stop-loss,
+        # so the worst realistic loss is half the entry, not the full entry cost.
+        expected_loss = 0.5 * entry_ask
+        reward_to_risk = expected_profit / expected_loss
         kelly_f = opp.win_probability - (1.0 - opp.win_probability) / max(reward_to_risk, 0.01)
         kelly_f = max(kelly_f, 0.0)
 
@@ -2878,7 +2881,6 @@ class TradeExecutor:
             note_data["hrrr_val_f"] = signal.hrrr_val
 
         from datetime import datetime, timezone
-        import json
         self._conn.execute(
             """INSERT INTO shadow_band_arb
                (logged_at, ticker, side, limit_price, contracts, city,

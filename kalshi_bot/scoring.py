@@ -510,7 +510,7 @@ def score_nba_convergence(opp: NBAConvergenceOpportunity) -> float:
     gap_abs = abs(opp.gap)
 
     s_spread   = max(0.0, 1.0 - spread / 15.0)          # 0¢→1.0, 15¢→0.0
-    s_gap      = min(1.0, gap_abs / 20.0)               # 20¢ gap → full score
+    s_gap      = min(1.0, gap_abs / 15.0)               # 15¢ gap → full score (backtest max)
     s_win_prob = max(0.0, (opp.win_probability - 0.5) / 0.5)  # 50%→0.0, 100%→1.0
 
     # Temporal: estimate hours until game.
