@@ -35,6 +35,14 @@ NBA_CONVERGENCE_ENABLED: bool = env_bool("NBA_CONVERGENCE_ENABLED", True)
 # Default 5h: typical NBA game takes ~2.5h, so 5h before close ≈ game has started.
 _MIN_HOURS_TO_CLOSE: float = 5.0
 
+# Maximum hours until market close to allow entry.  Kalshi NBA prices don't
+# track Pinnacle pre-game — they only converge once the game is live and
+# scoring runs move both books together.  Entering 10+ hours before close
+# (6+ hours before tip-off) just takes on directional game risk with no
+# convergence mechanism.  Default 8h: tip-off is ~2.5h before close, so
+# 8h before close ≈ ~5.5h before tip-off — blocks distant pre-game entries.
+_MAX_HOURS_TO_CLOSE: float = 8.0
+
 # Minimum yes_bid in cents to exclude stub-bid / illiquid markets.
 _MIN_BID: int = 5
 
@@ -176,6 +184,12 @@ def find_opportunities(
                             logging.debug(
                                 "NBA convergence skip (game live): %s closes in %.1fh < %.1fh",
                                 m.get("ticker", "?"), _htc, _MIN_HOURS_TO_CLOSE,
+                            )
+                            continue
+                        if _htc > _MAX_HOURS_TO_CLOSE:
+                            logging.debug(
+                                "NBA convergence skip (too early): %s closes in %.1fh > %.1fh",
+                                m.get("ticker", "?"), _htc, _MAX_HOURS_TO_CLOSE,
                             )
                             continue
                 except Exception:
