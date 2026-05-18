@@ -2660,6 +2660,17 @@ class TradeExecutor:
             )
             return
 
+        # GFS morning gate: cap lagging entries at 1 contract for data logging.
+        # When METAR running max < morning GFS forecast at signal time, temp has
+        # not yet beaten the model → continued heating risk remains → reduce size.
+        if signal.gfs_lagging is True and count > 1:
+            logging.info(
+                "BandArb YES GFS-lagging cap: %s  obs=%.1f°F < gfs_morning=%.1f°F"
+                " → capped %d→1 contract (data logging)",
+                signal.ticker, signal.observed_max, signal.gfs_morning_f or 0.0, count,
+            )
+            count = 1
+
         if not BAND_ARB_EXECUTION_ENABLED:
             logging.info(
                 "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f",
@@ -2711,6 +2722,9 @@ class TradeExecutor:
             _yes_note["hrrr_val_f"] = round(signal.hrrr_val, 1)
         if signal.nws_climo_val is not None:
             _yes_note["nws_climo_val_f"] = round(signal.nws_climo_val, 1)
+        if signal.gfs_morning_f is not None:
+            _yes_note["gfs_morning_f"] = round(signal.gfs_morning_f, 1)
+            _yes_note["gfs_lagging"]   = signal.gfs_lagging
 
         await self._execute(
             session=session,

@@ -525,6 +525,12 @@ class BandArbSignal:
     corr_status: str = ""               # "metar_only" | "metar_noaa_corroborated" | "metar_noaa_lagging"
     yes_ask_entry: int = 0              # YES ask at entry (enables spread + market_p logging)
     shadow: bool = False                # True = blocked by whitelist; log only, do not execute
+    # GFS morning forecast gate (band_arb YES only)
+    # gfs_morning_f: frozen morning GFS daily-max forecast for this city/date
+    # gfs_lagging: True when METAR running max < morning forecast at signal time
+    #   → 1-contract cap (data logging); False/None → full Kelly sizing
+    gfs_morning_f: float | None = None
+    gfs_lagging: bool | None = None
 
 
 @dataclass
@@ -644,6 +650,7 @@ def find_band_arbs(
     hrrr_values: dict[str, float] | None = None,
     nws_climo_values: dict[str, float] | None = None,
     synoptic_celsius: dict[str, int | None] | None = None,
+    gfs_morning_values: dict[str, float] | None = None,
 ) -> list[BandArbSignal]:
     """Scan open KXHIGH and KXLOWT markets for bands definitively passed through by METAR.
 
@@ -1168,6 +1175,16 @@ def find_band_arbs(
                 _yes_corr_status = "metar_noaa_corroborated"
             else:
                 _yes_corr_status = "metar_noaa_lagging"
+            # GFS morning gate: compare METAR running max against frozen morning forecast
+            _gfs_f = (gfs_morning_values or {}).get(parsed.metric)
+            _gfs_lagging: bool | None = None
+            if _gfs_f is not None:
+                _gfs_lagging = observed_max < _gfs_f
+                logging.debug(
+                    "BandArb YES GFS gate %s: obs=%.1f°F  gfs_morning=%.1f°F  %s",
+                    ticker, observed_max, _gfs_f,
+                    "LAGGING (1-contract cap)" if _gfs_lagging else "OVERSHOT (full Kelly)",
+                )
             signals.append(BandArbSignal(
                 metric=parsed.metric, ticker=ticker, yes_bid=yes_bid, no_ask=no_ask,
                 observed_max=observed_max, band_ceil=parsed.strike_hi,
@@ -1179,6 +1196,8 @@ def find_band_arbs(
                 nws_climo_val=(nws_climo_values or {}).get(parsed.metric),
                 corr_status=_yes_corr_status,
                 yes_ask_entry=yes_ask_int,
+                gfs_morning_f=_gfs_f,
+                gfs_lagging=_gfs_lagging,
             ))
             continue
 

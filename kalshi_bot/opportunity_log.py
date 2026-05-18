@@ -67,6 +67,24 @@ RETENTION_OPPORTUNITIES_DAYS: int = env_int("RETENTION_OPPORTUNITIES_DAYS", 30)
 RETENTION_RAW_FORECASTS_DAYS: int = env_int("RETENTION_RAW_FORECASTS_DAYS", 30)
 RETENTION_PRICE_SNAPSHOTS_DAYS: int = env_int("RETENTION_PRICE_SNAPSHOTS_DAYS", 30)
 RETENTION_NBA_SNAPSHOTS_DAYS: int = env_int("RETENTION_NBA_SNAPSHOTS_DAYS", 90)
+RETENTION_CRYPTO_PRICE_LOG_DAYS: int = env_int("RETENTION_CRYPTO_PRICE_LOG_DAYS", 90)
+
+_CREATE_CRYPTO_PRICE_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS crypto_price_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at    TEXT    NOT NULL,
+    series       TEXT    NOT NULL,   -- "KXBTC15M", "KXETH15M", "KXSOL15M"
+    ticker       TEXT    NOT NULL,   -- full market ticker e.g. "KXBTC15M-26MAY16-T105000"
+    yes_bid      INTEGER,            -- Kalshi YES bid in cents (NULL if market stale)
+    yes_ask      INTEGER,            -- Kalshi YES ask in cents
+    asset_price  REAL                -- Coinbase spot price in USD at poll time
+)
+"""
+
+_CREATE_CRYPTO_PRICE_LOG_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_crypto_price_log_series_logged
+    ON crypto_price_log (series, logged_at)
+"""
 
 _CREATE_RAW_FORECASTS_SQL = """
 CREATE TABLE IF NOT EXISTS raw_forecasts (
@@ -241,10 +259,11 @@ class OpportunityLog:
         Set any retention env var to 0 to disable purging for that table.
         """
         thresholds = [
-            ("opportunities",   "logged_at",   RETENTION_OPPORTUNITIES_DAYS),
-            ("raw_forecasts",   "logged_at",   RETENTION_RAW_FORECASTS_DAYS),
-            ("price_snapshots", "snapshot_at", RETENTION_PRICE_SNAPSHOTS_DAYS),
-            ("nba_snapshots",   "logged_at",   RETENTION_NBA_SNAPSHOTS_DAYS),
+            ("opportunities",    "logged_at",   RETENTION_OPPORTUNITIES_DAYS),
+            ("raw_forecasts",    "logged_at",   RETENTION_RAW_FORECASTS_DAYS),
+            ("price_snapshots",  "snapshot_at", RETENTION_PRICE_SNAPSHOTS_DAYS),
+            ("nba_snapshots",    "logged_at",   RETENTION_NBA_SNAPSHOTS_DAYS),
+            ("crypto_price_log", "logged_at",   RETENTION_CRYPTO_PRICE_LOG_DAYS),
         ]
         total = 0
         for table, ts_col, days in thresholds:
@@ -281,6 +300,8 @@ class OpportunityLog:
         self._conn.execute(_CREATE_TRADE_CONTEXT_VIEW_SQL)
         self._conn.execute(_CREATE_SIGNAL_SUPPRESSION_SQL)
         self._conn.execute(_CREATE_SUPPRESSION_IDX_SQL)
+        self._conn.execute(_CREATE_CRYPTO_PRICE_LOG_SQL)
+        self._conn.execute(_CREATE_CRYPTO_PRICE_LOG_IDX_SQL)
 
     # -----------------------------------------------------------------------
     # Cross-cycle deduplication
@@ -428,6 +449,31 @@ class OpportunityLog:
                 """,
                 rows,
             )
+
+    def log_crypto_prices(
+        self,
+        rows: "list[tuple[str, str, int | None, int | None, float | None]]",
+    ) -> None:
+        """Log KXBTC15M/KXETH15M/KXSOL15M YES bid/ask alongside spot price.
+
+        Called every poll cycle so we can later validate whether Kalshi prices
+        incorporate mean reversion (i.e. does YES bid fall when BTC trended up
+        in the prior hour?).
+
+        Args:
+            rows: list of (series, ticker, yes_bid, yes_ask, asset_price_usd)
+        """
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.executemany(
+            """
+            INSERT INTO crypto_price_log
+                (logged_at, series, ticker, yes_bid, yes_ask, asset_price)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [(now, s, t, b, a, p) for s, t, b, a, p in rows],
+        )
 
     def log_forecast_no_sources(self, signals: "list") -> None:
         """Log per-source qualifying details for forecast_no signals to raw_forecasts.

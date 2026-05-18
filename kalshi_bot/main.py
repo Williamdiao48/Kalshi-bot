@@ -157,6 +157,51 @@ _last_synoptic_celsius: dict[str, int | None] = {}
 _last_hrrr_highs: dict[str, float] = {}
 _last_hrrr_highs_time: float = 0.0  # time.monotonic(); 0 = never populated
 _last_hrrr_lows: dict[str, float] = {}  # temp_low_* HRRR values, cached alongside highs
+# GFS morning snapshot: first open_meteo_gfs value logged today per metric.
+# Frozen once per UTC day so the YES sizing gate uses the pre-observation model
+# forecast rather than the afternoon-contaminated GFS seamless update.
+# Keyed by metric (temp_high_*), values in °F.
+_gfs_morning_snap: dict[str, float] = {}
+_gfs_morning_snap_date: str = ""  # UTC date string (YYYY-MM-DD) of last refresh
+
+
+def _refresh_gfs_morning_snap(conn) -> None:
+    """Query DB for the first open_meteo_gfs value per metric logged today (UTC).
+
+    Only fetches once per UTC day — subsequent calls return immediately.
+    Uses the first (earliest) logged value to get the overnight/pre-observation
+    GFS forecast before the 18Z afternoon run incorporates today's temperatures.
+    """
+    global _gfs_morning_snap, _gfs_morning_snap_date
+    import datetime as _dt
+    today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+    if _gfs_morning_snap_date == today and _gfs_morning_snap:
+        return
+    try:
+        rows = conn.execute("""
+            SELECT rf.metric, rf.data_value
+            FROM raw_forecasts rf
+            INNER JOIN (
+                SELECT metric, MIN(logged_at) AS first_at
+                FROM raw_forecasts
+                WHERE source = 'open_meteo_gfs'
+                  AND metric LIKE 'temp_high_%'
+                  AND date(logged_at) = ?
+                GROUP BY metric
+            ) fv ON rf.metric = fv.metric AND rf.logged_at = fv.first_at
+            WHERE rf.source = 'open_meteo_gfs'
+        """, (today,)).fetchall()
+        if rows:
+            _gfs_morning_snap = {metric: val for metric, val in rows}
+            _gfs_morning_snap_date = today
+            import logging as _log
+            _log.debug(
+                "GFS morning snapshot refreshed: %d cities  date=%s",
+                len(_gfs_morning_snap), today,
+            )
+    except Exception as exc:
+        import logging as _log
+        _log.debug("GFS morning snapshot query failed: %s", exc)
 
 
 def _update_fast_loop_cache(
@@ -1663,6 +1708,35 @@ async def _poll(
     if not isinstance(nws_asos_result, Exception) and nws_asos_result:
         opp_log.log_asos_obs(nws_asos_result)
 
+    # ---- Crypto price log (mean reversion validation dataset) ---------------
+    # Log YES bid/ask for KXBTC15M/KXETH15M/KXSOL15M alongside Coinbase spot
+    # price every cycle. After ~2 weeks we can test whether Kalshi's pricing
+    # incorporates mean reversion (YES drops when BTC trended up in prior hour).
+    _CRYPTO_SERIES_METRIC = {
+        "KXBTC15M": "price_btc_usd",
+        "KXETH15M": "price_eth_usd",
+        "KXSOL15M": "price_sol_usd",
+    }
+    _coinbase_prices: dict[str, float] = {}
+    if not isinstance(coinbase_result, Exception) and coinbase_result:
+        for _dp in coinbase_result:
+            if _dp.metric in _CRYPTO_SERIES_METRIC.values():
+                _coinbase_prices[_dp.metric] = _dp.value
+    _crypto_log_rows = []
+    for _m in markets:
+        _t = _m.get("ticker", "")
+        _series = _t.split("-")[0]
+        if _series not in _CRYPTO_SERIES_METRIC:
+            continue
+        _asset_metric = _CRYPTO_SERIES_METRIC[_series]
+        _crypto_log_rows.append((
+            _series, _t,
+            _m.get("yes_bid"), _m.get("yes_ask"),
+            _coinbase_prices.get(_asset_metric),
+        ))
+    if _crypto_log_rows:
+        opp_log.log_crypto_prices(_crypto_log_rows)
+
     # ---- Weather-specific edge and time-to-close gates ---------------------
     # Applied after forecast consensus so all sources are already
     # merged / deduplicated before the per-source quality gates fire.
@@ -2471,6 +2545,7 @@ async def _poll(
         if dp.source == "nws_climo"
         and dp.metric.startswith(("temp_high", "temp_low"))
     }
+    _refresh_gfs_morning_snap(opp_log._conn)
     if _band_arb_obs_early:
         _early_band_arb_signals = find_band_arbs(
             markets,
@@ -2482,6 +2557,7 @@ async def _poll(
             hrrr_values={**hrrr_hourly_highs, **hrrr_hourly_lows} or None,
             nws_climo_values=_band_arb_nws_climo or None,
             synoptic_celsius=_synoptic_celsius or None,
+            gfs_morning_values=_gfs_morning_snap or None,
         )
         if _early_band_arb_signals:
             logging.info(
@@ -3144,6 +3220,7 @@ async def _fast_loop(
         hrrr_values=_hrrr_for_arb,
         nws_climo_values=_last_nws_climo or None,
         synoptic_celsius=_fast_syn_celsius or None,
+        gfs_morning_values=_gfs_morning_snap or None,
     )
     if signals:
         logging.debug("Fast loop: %d band_arb signal(s) found.", len(signals))
