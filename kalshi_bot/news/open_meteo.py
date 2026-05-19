@@ -77,7 +77,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from ..data import DataPoint
-from ..cities import CITIES, CITY_TZ_STRINGS as _CITY_TZ_STRINGS  # same city registry as NOAA
+from ..cities import CITIES, LOW_CITIES, CITY_TZ_STRINGS as _CITY_TZ_STRINGS  # same city registry as NOAA
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -398,6 +398,88 @@ async def _fetch_city_model_high(
     )]
 
 
+async def _fetch_city_model_low(
+    session:      aiohttp.ClientSession,
+    metric:       str,
+    city_name:    str,
+    lat:          float,
+    lon:          float,
+    city_tz:      ZoneInfo,
+    city_tz_str:  str,
+    om_model:     str,
+    source_name:  str,
+) -> list[DataPoint]:
+    """Fetch today's GFS daily-min forecast for one low-temp city.
+
+    Mirrors _fetch_city_model_high but requests temperature_2m_min.  Only the
+    GFS model is needed — the result feeds the warm-NO clearance gate in
+    strike_arb.find_band_arbs(), stored in _gfs_morning_snap via main.py.
+    Returns a single-element list on success, empty list on any failure.
+    """
+    params = {
+        "latitude":         f"{lat:.4f}",
+        "longitude":        f"{lon:.4f}",
+        "daily":            "temperature_2m_min",
+        "temperature_unit": "fahrenheit",
+        "timezone":         city_tz_str,
+        "forecast_days":    "3",
+        "models":           om_model,
+    }
+    async with _model_sem:
+        try:
+            async with session.get(
+                _BASE_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except Exception as exc:
+            logging.debug(
+                "Open-Meteo low model fetch failed %s/%s: %s", city_name, om_model, exc
+            )
+            return []
+
+    daily = data.get("daily", {})
+    times: list[str] = daily.get("time", [])
+    mins: list = daily.get("temperature_2m_min", [])
+
+    if not times or not mins:
+        return []
+
+    today_str = datetime.now(city_tz).strftime("%Y-%m-%d")
+    try:
+        today_idx = times.index(today_str)
+    except ValueError:
+        return []
+
+    min_val = mins[today_idx] if today_idx < len(mins) else None
+    if min_val is None:
+        return []
+
+    try:
+        forecast_noon_local = datetime.strptime(today_str, "%Y-%m-%d").replace(
+            hour=12, tzinfo=city_tz
+        )
+        as_of = forecast_noon_local.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return []
+
+    return [DataPoint(
+        source   = source_name,
+        metric   = metric,
+        value    = float(min_val),
+        unit     = "°F",
+        as_of    = as_of,
+        metadata = {
+            "city":            city_name,
+            "forecast_date":   today_str,
+            "forecast_offset": 0,
+            "om_model":        om_model,
+        },
+    )]
+
+
 async def fetch_model_forecasts(
     session: aiohttp.ClientSession,
 ) -> list[DataPoint]:
@@ -407,11 +489,13 @@ async def fetch_model_forecasts(
     ``open_meteo_icon``, ``open_meteo_gem`` — one per city per model for today
     (forecast_offset=0 only).
 
+    Also emits ``open_meteo_gfs`` DataPoints for all temp_low_* metrics using
+    daily-min temperature, to feed the warm-NO GFS clearance gate in
+    strike_arb.find_band_arbs().
+
     These are used by ``find_forecast_nos()`` in strike_arb.py as additional
     independent corroboration sources, validated by the backtest in
-    scripts/backtest_forecast_accuracy.py.  Only temp_high_* metrics are fetched
-    because the models provide daily-max temperature; temp_low_* signals are
-    handled by the existing noaa / nws_hourly / hrrr pipeline.
+    scripts/backtest_forecast_accuracy.py.
 
     Cached for OPEN_METEO_MODELS_CACHE_MINUTES (default 30 min) to stay within
     the free-tier request budget (10k/day).
@@ -438,6 +522,19 @@ async def fetch_model_forecasts(
         for metric, (city_name, lat, lon, city_tz) in CITIES.items()
         if metric.startswith("temp_high_")
         for om_model, source_name in _FORECAST_MODELS
+    ]
+
+    # GFS daily-min for low-temp cities (warm-NO clearance gate only)
+    tasks += [
+        _fetch_city_model_low(
+            session, metric, city_name, lat, lon,
+            city_tz=city_tz,
+            city_tz_str=_CITY_TZ_STRINGS.get(metric) or _warn_tz_fallback(metric),
+            om_model="gfs_seamless",
+            source_name="open_meteo_gfs",
+        )
+        for metric, (city_name, lat, lon, city_tz) in LOW_CITIES.items()
+        if metric.startswith("temp_low_")
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)

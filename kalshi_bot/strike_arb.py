@@ -218,6 +218,13 @@ BAND_ARB_LOW_YES_MAX_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MAX_YES_ASK", 85)
 # the overnight low can still drop with a cold front after the morning minimum is set.
 # Only enter when the overnight risk window has substantially closed (~6 PM local).
 BAND_ARB_LOW_YES_MAX_HTC: float = env_float("BAND_ARB_LOW_YES_MAX_HTC", 6.0)
+# GFS daily min clearance gate for warm-side NO: block the signal unless the
+# GFS morning daily-minimum forecast exceeds the band ceiling by at least this
+# many degrees.  When clearance < 2°F GFS thinks the temp may still fall into
+# the band.  Backtest (May 2025): 14 losing trades had clearance < 2°F
+# (net -$165.72); blocking them would have saved $139 vs $26 foregone wins.
+# Set to 0.0 to disable.
+BAND_ARB_LOW_GFS_MIN_CLEARANCE_F: float = env_float("BAND_ARB_LOW_GFS_MIN_CLEARANCE_F", 2.0)
 
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
@@ -974,6 +981,23 @@ def find_band_arbs(
                             ticker, _climo_warm, band_ceil,
                         )
                         continue
+
+                # GFS daily min clearance gate: GFS daily-min must exceed the
+                # band ceiling by BAND_ARB_LOW_GFS_MIN_CLEARANCE_F.  When GFS
+                # shows tight clearance the model thinks temp may still drop
+                # into the band — most May losing trades had clearance < 2°F.
+                if BAND_ARB_LOW_GFS_MIN_CLEARANCE_F > 0 and gfs_morning_values is not None:
+                    _gfs_low_min = gfs_morning_values.get(parsed.metric)
+                    if _gfs_low_min is not None:
+                        _gfs_clearance = _gfs_low_min - band_ceil
+                        if _gfs_clearance < BAND_ARB_LOW_GFS_MIN_CLEARANCE_F:
+                            logging.warning(
+                                "BandArb warm-NO skip (GFS clearance): %s —"
+                                " GFS_min=%.1f°F ceil=%.1f°F clearance=%.1f°F < %.1f°F",
+                                ticker, _gfs_low_min, band_ceil,
+                                _gfs_clearance, BAND_ARB_LOW_GFS_MIN_CLEARANCE_F,
+                            )
+                            continue
 
                 # Cap: above 90¢ only 5–10¢ upside remains — skip.
                 if no_ask > BAND_ARB_LOW_CEIL_MAX_NO_ASK:

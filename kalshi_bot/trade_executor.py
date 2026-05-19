@@ -2517,6 +2517,15 @@ class TradeExecutor:
             )
             return
 
+        # Hard cap for low-temp NO trades: Kelly oversizes expensive NO contracts
+        # because payout ratio is unfavorable but win probability looks high.
+        if signal.metric.startswith("temp_low_") and count > 10:
+            logging.info(
+                "BandArb low-NO cap: %s count %d → 10 (temp_low hard cap)",
+                signal.ticker, count,
+            )
+            count = 10
+
         if not BAND_ARB_EXECUTION_ENABLED:
             logging.info(
                 "BandArb DETECT-ONLY (BAND_ARB_EXECUTION_ENABLED=false): "
