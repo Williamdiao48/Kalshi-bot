@@ -173,7 +173,11 @@ def find_opportunities(
             # the game is live and Pinnacle lines are in-game (not pre-game).
             # In-game Pinnacle lines spike on scoring runs, creating transient
             # fake gaps that vanish two polls later.
-            _close_str = m.get("close_time") or m.get("expiration_time", "")
+            # expected_expiration_time is the actual game end time; close_time
+            # is the series-level max expiration (weeks away) and is useless here.
+            _close_str = (m.get("expected_expiration_time")
+                          or m.get("close_time")
+                          or m.get("expiration_time", ""))
             if _close_str:
                 try:
                     from .strike_arb import parse_iso_dt
