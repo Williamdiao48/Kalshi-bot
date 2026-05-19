@@ -265,6 +265,11 @@ FORECAST_NO_MAX_ASK: int = env_int("FORECAST_NO_MAX_ASK", 80)
 # would need to be enormous to justify buying NO.  15¢ floor (85¢ YES bid cap)
 # keeps entries in the zone where we still have meaningful information edge.
 FORECAST_NO_MIN_ASK: int = env_int("FORECAST_NO_MIN_ASK", 15)
+# Block forecast_no on threshold markets where direction=over (will temp EXCEED T?).
+# Backtest (18 T-market trades): direction=over has 0 wins / 5 losses / -$4.13.
+# Summer heat overshoots are routine; a model saying 81°F only needs to miss by
+# 7°F for a T88 YES to resolve.  direction=under is less exposed (temp must drop).
+FORECAST_NO_BLOCK_THRESHOLD_OVER: bool = env_bool("FORECAST_NO_BLOCK_THRESHOLD_OVER", True)
 # City suffixes to skip (same default as band_arb YES — AUS has low hit rate)
 FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in
@@ -2021,6 +2026,16 @@ def find_forecast_nos(
                         ticker, _fno_local_hour, FORECAST_NO_OPEN_METEO_DAYTIME_HOUR,
                     )
                     continue
+
+        # Block threshold-over signals: "will high EXCEED T?" is structurally weak
+        # in summer — models only need to undershoot by a few degrees for YES to win.
+        if FORECAST_NO_BLOCK_THRESHOLD_OVER and parsed.direction == "over":
+            logging.debug(
+                "ForecastNO skip: %s — direction=over threshold market blocked"
+                " (0/5 win rate historically; high temp overshoot risk)",
+                ticker,
+            )
+            continue
 
         min_edge = min(e for _, _, e, _ in qualifying)
         source_names = [s for s, _, _, _ in qualifying]
