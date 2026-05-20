@@ -2468,7 +2468,7 @@ async def _poll(
     # Integer Celsius (5-min automated, ±0.9°F) flows through _synoptic_celsius instead
     # so find_band_arbs uses the correct F_low = (C−0.5)×1.8+32 bound rather than the
     # center value, preventing false NO signals near band ceilings.
-    # temp_low is excluded (ASOS limit=12 only covers ~1hr; METAR 24hr lookback is correct).
+    # temp_low is excluded (ASOS covers highs; METAR 24hr lookback is the correct daily-min source).
     if not isinstance(nws_asos_result, Exception) and nws_asos_result:
         for _dp in nws_asos_result:
             if _dp.metric.startswith("temp_high_") and _dp.value is not None:

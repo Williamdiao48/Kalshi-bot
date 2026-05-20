@@ -24,8 +24,9 @@ Response: GeoJSON FeatureCollection.  Each Feature's ``properties`` contains:
   maxTemperatureLast6Hours  — Celsius float or null (at synoptic hours)
   minTemperatureLast6Hours  — Celsius float or null (at synoptic hours)
 
-Observations are returned newest-first.  ``limit=12`` covers ~1 hour
-(12 × 5-min intervals).
+Observations are returned newest-first.  ``limit=72`` covers ~6 hours
+(72 × 5-min intervals), ensuring daily peaks are captured even when they
+occur well before the afternoon lock window.
 
 Integration
 -----------
@@ -124,7 +125,7 @@ async def _fetch_station(
     try:
         async with session.get(
             url,
-            params={"limit": "12"},
+            params={"limit": "72"},
             headers=_HEADERS,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:

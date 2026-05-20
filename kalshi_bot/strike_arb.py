@@ -230,19 +230,19 @@ BAND_ARB_LOW_GFS_MIN_CLEARANCE_F: float = env_float("BAND_ARB_LOW_GFS_MIN_CLEARA
 FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
 # Minimum forecast-to-strike edge (°F) for a source's value to count toward
 # corroboration.  With NOAA day-1 MAE ~3-4°F, 5°F means P(correct) > 85%.
-FORECAST_NO_MIN_EDGE_F: float = env_float("FORECAST_NO_MIN_EDGE_F", 3.0)
+FORECAST_NO_MIN_EDGE_F: float = env_float("FORECAST_NO_MIN_EDGE_F", 2.0)
 # Direction-specific edge overrides for "between" band NO signals.
-# NO_HIGH (forecast above band) is more reliable than NO_LOW (forecast below
-# band) per backtest — lower threshold justified.  Both default to the global
-# FORECAST_NO_MIN_EDGE_F when not set explicitly.
+# Backtest (May 2026, 19 days, n=35 best config): NO_LOW WR=94.4%, NO_HIGH WR=82.4%
+# at min_edge=2.0 — both directions are profitable at 2.0, so unified threshold.
 FORECAST_NO_NO_HIGH_MIN_EDGE_F: float = float(
-    os.environ.get("FORECAST_NO_NO_HIGH_MIN_EDGE_F", "2.5")
+    os.environ.get("FORECAST_NO_NO_HIGH_MIN_EDGE_F", "2.0")
 )
 FORECAST_NO_NO_LOW_MIN_EDGE_F: float = float(
-    os.environ.get("FORECAST_NO_NO_LOW_MIN_EDGE_F", "3.5")
+    os.environ.get("FORECAST_NO_NO_LOW_MIN_EDGE_F", "2.0")
 )
 # Number of independent sources required (noaa_observed counts as 2 if edge >= 2°F)
-FORECAST_NO_MIN_SOURCES: int = env_int("FORECAST_NO_MIN_SOURCES", 2)
+# Backtest: src=4 → 88.6% WR (+16¢ avg); src=2/3 → ~70% WR (+2¢ avg). Clear cliff.
+FORECAST_NO_MIN_SOURCES: int = env_int("FORECAST_NO_MIN_SOURCES", 4)
 # Higher source minimum for KXLOWT forecast_no signals — overnight lows are harder
 # to forecast than daytime highs (cold-front timing uncertainty, boundary-layer
 # decoupling).  Requires 3 sources (hrrr + nws_hourly + open_meteo or noaa) all
@@ -264,12 +264,16 @@ FORECAST_NO_MAX_ASK: int = env_int("FORECAST_NO_MAX_ASK", 80)
 # A 2¢ NO ask means the market is 98% confident YES wins; the forecast edge
 # would need to be enormous to justify buying NO.  15¢ floor (85¢ YES bid cap)
 # keeps entries in the zone where we still have meaningful information edge.
-FORECAST_NO_MIN_ASK: int = env_int("FORECAST_NO_MIN_ASK", 15)
+FORECAST_NO_MIN_ASK: int = env_int("FORECAST_NO_MIN_ASK", 45)
 # Block forecast_no on threshold markets where direction=over (will temp EXCEED T?).
 # Backtest (18 T-market trades): direction=over has 0 wins / 5 losses / -$4.13.
 # Summer heat overshoots are routine; a model saying 81°F only needs to miss by
 # 7°F for a T88 YES to resolve.  direction=under is less exposed (temp must drop).
 FORECAST_NO_BLOCK_THRESHOLD_OVER: bool = env_bool("FORECAST_NO_BLOCK_THRESHOLD_OVER", True)
+# Restrict forecast_no to "between" (B-market) entries only.
+# Backtest (May 2026, 19 days): between_only → 88.6% WR, +16¢ avg (n=35);
+# T-markets (direction=under/over) drag current policy to -3.2¢ avg at 66.5% WR.
+FORECAST_NO_BETWEEN_ONLY: bool = env_bool("FORECAST_NO_BETWEEN_ONLY", True)
 # City suffixes to skip (same default as band_arb YES — AUS has low hit rate)
 FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in
@@ -432,15 +436,14 @@ FORECAST_NO_HRRR_SPREAD_F: float = float(
 # blocking genuinely chaotic convective-day signals (>10°F).
 # Set to 0 to disable.
 FORECAST_NO_MODEL_SPREAD_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "6.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "4.0")
 )
 # Minimum model spread (°F) required to fire a forecast_no signal.
-# Live data: < 3°F spread → 56% win rate (tight consensus already priced in);
-# 3–6°F → 74% win rate (genuine alpha); > 6°F → 51% (too much disagreement).
-# Note: the upper bound above already handles the > 9°F case.
-# Set to 0 to disable.
+# Backtest (May 2026): spread_min gate hurts — WR drops from 82.7% → 70.2% as
+# spread_min increases from 0 to 3°F.  Tight consensus is a feature, not a bug.
+# Disabled (0) per backtest findings.
 FORECAST_NO_MODEL_SPREAD_MIN_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "3.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "0.0")
 )
 
 
@@ -2026,6 +2029,15 @@ def find_forecast_nos(
                         ticker, _fno_local_hour, FORECAST_NO_OPEN_METEO_DAYTIME_HOUR,
                     )
                     continue
+
+        # Block all T-markets (threshold under/over) — only B-markets (between) qualify.
+        # Backtest: between_only → 88.6% WR; T-markets drag overall WR to 66.5% at -3¢/trade.
+        if FORECAST_NO_BETWEEN_ONLY and parsed.direction != "between":
+            logging.debug(
+                "ForecastNO skip: %s — direction=%s T-market blocked (between_only=True)",
+                ticker, parsed.direction,
+            )
+            continue
 
         # Block threshold-over signals: "will high EXCEED T?" is structurally weak
         # in summer — models only need to undershoot by a few degrees for YES to win.
