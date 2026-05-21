@@ -850,7 +850,7 @@ class DryRunLedger:
                 WHERE mode = 'dry_run'
                   AND opportunity_kind = 'forecast_no'
                   AND exited_at IS NOT NULL
-                  AND exited_at >= datetime('now', '-30 hours')
+                  AND DATE(exited_at) = DATE('now')
                 """
             ).fetchall()
             return {row[0] for row in rows}

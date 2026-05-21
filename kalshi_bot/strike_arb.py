@@ -134,17 +134,24 @@ BAND_ARB_LOW_BUFFER_F: float = env_float("BAND_ARB_LOW_BUFFER_F", 0.5)
 # Backtest optimal: 1.0°F; 3°F+ causes EV to go negative (NO too expensive).
 BAND_ARB_LOW_CEIL_BUFFER_F: float = env_float("BAND_ARB_LOW_CEIL_BUFFER_F", 1.0)
 # Earliest local hour at which the warm-side NO signal may fire.
-# P75 of daily low occurrence in May is 6–9 AM; 9 AM is safe for most cities.
-BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 9)
+# Backtest (May 2026, 104 trades): 57/104 trades fire at the 9 AM gate opening
+# and produce avg -228¢. Noon-to-3 PM window is 100% WR, +1025¢ avg — the
+# overnight low is definitively set and morning temps have developed.
+BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 12)
+# Latest local hour for warm-side NO entries. After mid-afternoon the next
+# night's cooling window opens and late-day signals degrade (16+: 50% WR).
+BAND_ARB_LOW_CEIL_MAX_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MAX_HOUR", 15)
 # Maximum NO ask for warm-side KXLOWT NO entries.
-# Above 90¢ only 5–10¢ upside remains — risk/reward not worth it.
-BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 90)
-# Whitelist of city suffixes allowed to generate warm-side NO signals.
-# Only cities with stable overnight lows (desert/coastal) belong here.
-# Empty string = allow all cities.  Default: "lax,las" (LA and Las Vegas only).
-BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES: frozenset[str] = frozenset(
+# Backtest (May 2026, 69 shadow trades): ≤88¢ = 100% WR across all non-DEN cities
+# in noon–3pm window; ≥89¢ introduces losses (negative-EV Kelly).
+BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 88)
+# Blocklist of city suffixes that may NOT generate warm-side NO signals.
+# DEN is structurally unreliable (33% WR in backtest — alpine morning cold air
+# pools persist past noon; METAR at airport lags valley lows).
+# All other cities are allowed when the hour + ask gates pass.
+BAND_ARB_LOW_WARM_NO_BLOCK_CITIES: frozenset[str] = frozenset(
     c.strip().lower()
-    for c in os.environ.get("BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES", "lax,las").split(",")
+    for c in os.environ.get("BAND_ARB_LOW_WARM_NO_BLOCK_CITIES", "den").split(",")
     if c.strip()
 )
 # Extra buffer applied for KXLOWT when noaa_observed has no data yet (api.weather.gov
@@ -430,13 +437,12 @@ FORECAST_NO_HRRR_SPREAD_F: float = float(
 # forecast for a given metric before the signal is blocked.  When models
 # disagree by more than this amount, forecast uncertainty is too high to
 # justify a trade.  Applies to all directions (including band/"between" markets).
-# Calibration: live log audit (2026-05-04) showed 4°F was too conservative —
-# all 21 markets blocked at 4–10°F spread settled as NO wins; 10°F+ blocks
-# from May 2 split roughly 50/50.  9°F keeps all the winners while still
-# blocking genuinely chaotic convective-day signals (>10°F).
+# Calibration: hist backtest (2026-05-20, n=150) shows 4–8°F spread bucket
+# is profitable (WR=71–72%, avg=+4–7¢); 8°F+ breaks down (WR=50%, avg=-15¢).
+# 4°F default was too conservative — blocked profitable signals in that range.
 # Set to 0 to disable.
 FORECAST_NO_MODEL_SPREAD_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "4.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "8.0")
 )
 # Minimum model spread (°F) required to fire a forecast_no signal.
 # Backtest (May 2026): spread_min gate hurts — WR drops from 82.7% → 70.2% as
@@ -808,9 +814,17 @@ def find_band_arbs(
 
         # Skip if already priced as near-certain NO (no edge left)
         if BAND_ARB_MIN_NO_ASK > 0 and no_ask < BAND_ARB_MIN_NO_ASK:
+            logging.debug(
+                "BandArb NO skip: %s — no_ask=%d¢ below min=%d¢ (market strongly YES)",
+                ticker, no_ask, BAND_ARB_MIN_NO_ASK,
+            )
             continue
         # Skip if market price exceeds cap
         if BAND_ARB_MAX_NO_ASK > 0 and no_ask > BAND_ARB_MAX_NO_ASK:
+            logging.debug(
+                "BandArb NO skip: %s — no_ask=%d¢ above max=%d¢ (already priced in)",
+                ticker, no_ask, BAND_ARB_MAX_NO_ASK,
+            )
             continue
 
         is_definitive_no = False
@@ -888,7 +902,7 @@ def find_band_arbs(
                     if (
                         _warm_htc is not None
                         and _warm_htc < 20
-                        and _low_local_hour >= BAND_ARB_LOW_CEIL_MIN_HOUR
+                        and BAND_ARB_LOW_CEIL_MIN_HOUR <= _low_local_hour <= BAND_ARB_LOW_CEIL_MAX_HOUR
                     ):
                         is_warm_no = True
                         band_ceil = parsed.strike_hi
@@ -924,29 +938,28 @@ def find_band_arbs(
         if not is_definitive_no:
             # --- Warm-side NO: running daily min confirmed above band ceiling ---
             if is_warm_no:
-                if BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES:
-                    _warm_suffix = parsed.metric.replace("temp_low_", "")
-                    if _warm_suffix not in BAND_ARB_LOW_WARM_NO_WHITELIST_CITIES:
-                        logging.debug(
-                            "BandArb warm-NO shadow: %s — city '%s' not in whitelist, tracking only",
-                            ticker, _warm_suffix,
-                        )
-                        _warm_city_shadow = mkt.get("subtitle", "") or ticker
-                        signals.append(BandArbSignal(
-                            metric=parsed.metric,
-                            ticker=ticker,
-                            yes_bid=yes_bid,
-                            no_ask=no_ask,
-                            observed_max=observed_max,
-                            band_ceil=parsed.strike_hi,
-                            direction=parsed.direction,
-                            city=_warm_city_shadow,
-                            side="no",
-                            hours_to_close=_warm_htc or 0.0,
-                            strike_lo=parsed.strike_hi,
-                            shadow=True,
-                        ))
-                        continue
+                _warm_suffix = parsed.metric.replace("temp_low_", "")
+                if _warm_suffix in BAND_ARB_LOW_WARM_NO_BLOCK_CITIES:
+                    logging.debug(
+                        "BandArb warm-NO shadow: %s — city '%s' in blocklist, tracking only",
+                        ticker, _warm_suffix,
+                    )
+                    _warm_city_shadow = mkt.get("subtitle", "") or ticker
+                    signals.append(BandArbSignal(
+                        metric=parsed.metric,
+                        ticker=ticker,
+                        yes_bid=yes_bid,
+                        no_ask=no_ask,
+                        observed_max=observed_max,
+                        band_ceil=parsed.strike_hi,
+                        direction=parsed.direction,
+                        city=_warm_city_shadow,
+                        side="no",
+                        hours_to_close=_warm_htc or 0.0,
+                        strike_lo=parsed.strike_hi,
+                        shadow=True,
+                    ))
+                    continue
 
                 _warm_ceil_nws = band_ceil + 0.5  # NWS rounds to nearest integer; ceil+0.5 is the safe threshold
 
@@ -1007,7 +1020,7 @@ def find_band_arbs(
                             )
                             continue
 
-                # Cap: above 90¢ only 5–10¢ upside remains — skip.
+                # Cap: above 85¢ only 5–15¢ upside remains — skip.
                 if no_ask > BAND_ARB_LOW_CEIL_MAX_NO_ASK:
                     logging.debug(
                         "BandArb warm-NO skip %s: no_ask=%d¢ > max=%d¢",
@@ -1151,6 +1164,10 @@ def find_band_arbs(
             in_band = (parsed.strike_lo + buf) <= observed_max <= (parsed.strike_hi - buf)
 
             if not in_band:
+                logging.debug(
+                    "BandArb YES skip: %s — obs=%.1f°F outside band [%.1f–%.1f] (buf=%.1f)",
+                    ticker, observed_max, parsed.strike_lo + buf, parsed.strike_hi - buf, buf,
+                )
                 continue
 
             # Determine if we're past the 4:30 PM daily-high lock point
@@ -1175,6 +1192,10 @@ def find_band_arbs(
                 continue
             yes_ask_int = int(yes_ask_raw)
             if yes_ask_int < BAND_ARB_YES_MIN_YES_ASK or yes_ask_int > BAND_ARB_YES_MAX_YES_ASK:
+                logging.debug(
+                    "BandArb YES skip: %s — yes_ask=%d outside [%d, %d]",
+                    ticker, yes_ask_int, BAND_ARB_YES_MIN_YES_ASK, BAND_ARB_YES_MAX_YES_ASK,
+                )
                 continue
 
             # NOAA corroboration REQUIRED for YES — no market-price fallback

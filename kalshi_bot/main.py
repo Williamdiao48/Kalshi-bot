@@ -3286,9 +3286,9 @@ async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> No
             continue
         outcome = "won" if result == side else "lost"
         if outcome == "won":
-            pnl = limit_price * contracts
+            pnl = (100 - limit_price) * contracts
         else:
-            pnl = -(100 - limit_price) * contracts
+            pnl = -limit_price * contracts
         conn.execute(
             "UPDATE shadow_band_arb SET outcome = ?, pnl_cents = ? WHERE id = ?",
             (outcome, pnl, row_id),

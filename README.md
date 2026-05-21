@@ -480,6 +480,10 @@ caffeinate -i venv/bin/python run.py
 | `BAND_ARB_NOAA_NONE_MAX_NO_ASK` | `40` | Max NO ask when NOAA absent (market soft-confirmation cap) |
 | `BAND_ARB_MAX_SOURCE_DIVERGENCE_F` | `4.0` | Max METAR vs NOAA divergence before suppressing signal |
 | `WATCH_THRESHOLD_F` | `2.0` | °F from a band ceiling to add city to fast-loop watchlist |
+| `BAND_ARB_LOW_CEIL_MIN_HOUR` | `12` | Earliest local hour for warm-side KXLOWT NO entries (overnight low established by noon) |
+| `BAND_ARB_LOW_CEIL_MAX_HOUR` | `15` | Latest local hour for warm-side KXLOWT NO entries (afternoon cooling window opens after 3 PM) |
+| `BAND_ARB_LOW_CEIL_MAX_NO_ASK` | `88` | Max NO ask for warm-side KXLOWT NO entries — ≤88¢ = 100% WR in backtest; ≥89¢ introduces losses |
+| `BAND_ARB_LOW_WARM_NO_BLOCK_CITIES` | `den` | Cities blocked from warm-side NO signals (DEN: alpine cold air pools persist past noon, 33% WR) |
 | `BAND_ARB_YES_ENABLED` | `true` | Enable band-arb YES signals (temp inside band after lock hour) |
 | `BAND_ARB_YES_MIN_YES_ASK` | `50` | Min YES ask for band-arb YES entries |
 | `BAND_ARB_YES_MAX_YES_ASK` | `85` | Max YES ask for band-arb YES entries |
