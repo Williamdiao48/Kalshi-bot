@@ -116,6 +116,12 @@ POLL_BAND_ARB_END_ET_HOUR:   int = env_int("POLL_BAND_ARB_END_ET_HOUR", 21)
 WATCH_THRESHOLD_F: float = env_float("WATCH_THRESHOLD_F", 3.0)
 FAST_LOOP_INTERVAL: float = env_float("FAST_LOOP_INTERVAL", 10.0)
 
+# Position watcher: tight NWS ASOS poll loop for open band_arb YES positions.
+# Bypasses the 4-minute ASOS cache and fetches fresh per-station data every
+# POSITION_WATCHER_INTERVAL seconds so a ceiling breach triggers an immediate
+# force-exit rather than waiting up to 4 minutes for the cache to expire.
+POSITION_WATCHER_INTERVAL: float = env_float("POSITION_WATCHER_INTERVAL", 5.0)
+
 # Shared state between _poll() and _fast_loop().
 #
 # Safety invariant: all writes go through _update_fast_loop_cache() and
@@ -3278,6 +3284,78 @@ async def _fast_loop(
     await _settle_shadow_band_arbs(conn=executor._conn, session=session)
 
 
+async def _position_watcher(
+    session: aiohttp.ClientSession,
+    ledger: "DryRunLedger",
+) -> None:
+    """Tight polling loop (~5s) for open band_arb YES positions on HIGH markets.
+
+    Runs independently of the main 80s poll cycle.  Every POSITION_WATCHER_INTERVAL
+    seconds it force-fetches NWS ASOS for only the cities with open positions,
+    bypassing the shared 4-minute cache, and calls request_force_exit the moment
+    the observed temperature exceeds band_ceil + 0.5°F.
+
+    Root cause addressed: trade #269 (KXHIGHTSEA-26MAY20-B66.5) — 20°C=68°F
+    appeared in the NWS ASOS API at 00:40 UTC while the main loop's 4-minute cache
+    was stale; the market repriced to 0 within 54s.  A 5-second watcher would have
+    caught the reading and force-exited while the YES bid was still at 94¢.
+    """
+    import json as _json
+    from .cities import CITIES, KALSHI_STATION_IDS
+
+    while True:
+        await asyncio.sleep(POSITION_WATCHER_INTERVAL)
+        try:
+            rows = ledger._conn.execute("""
+                SELECT id, ticker, note FROM trades
+                WHERE mode = 'dry_run'
+                  AND source = 'band_arb'
+                  AND side = 'yes'
+                  AND ticker NOT LIKE 'KXLOWT%'
+                  AND outcome IS NULL
+                  AND exited_at IS NULL
+            """).fetchall()
+            if not rows:
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+            for row_id, ticker, note_str in rows:
+                try:
+                    note = _json.loads(note_str) if note_str else {}
+                except Exception:
+                    continue
+                band_ceil = note.get("band_ceil_f")
+                metric = note.get("metric")
+                if band_ceil is None or metric is None:
+                    continue
+                icao = KALSHI_STATION_IDS.get(metric)
+                city_entry = CITIES.get(metric)
+                if icao is None or city_entry is None:
+                    continue
+                city_tz = city_entry[3]
+                pts = await nws_asos._fetch_station(
+                    session, icao, metric, city_tz, now_utc
+                )
+                for dp in pts:
+                    if dp.value is None:
+                        continue
+                    if dp.value >= band_ceil + 0.5:
+                        logging.warning(
+                            "[pos-watcher] trade #%d %s: obs=%.1f°F ≥ ceil+0.5=%.1f°F"
+                            " — ceiling breached, queuing force-exit.",
+                            row_id, ticker, dp.value, band_ceil + 0.5,
+                        )
+                        ledger.request_force_exit(
+                            ticker,
+                            f"watcher_breach@{dp.value:.1f}F",
+                        )
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.debug("Position watcher error: %s", exc)
+
+
 async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> None:
     """Check open shadow_band_arb rows against live market data and record outcome."""
     from .markets import KALSHI_API_BASE
@@ -3346,6 +3424,16 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
 
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
+            _watcher_task: asyncio.Task | None = None
+            if TRADE_DRY_RUN and ledger is not None:
+                _watcher_task = asyncio.create_task(
+                    _position_watcher(session, ledger),
+                    name="position_watcher",
+                )
+                logging.info(
+                    "Position watcher started (interval=%.0fs).",
+                    POSITION_WATCHER_INTERVAL,
+                )
             while True:
                 try:
                     await _poll(session, seen, opp_log, executor, ledger)
@@ -3376,6 +3464,12 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                 if _remaining > 0:
                     await asyncio.sleep(_remaining)
     finally:
+        if _watcher_task is not None and not _watcher_task.done():
+            _watcher_task.cancel()
+            try:
+                await _watcher_task
+            except asyncio.CancelledError:
+                pass
         seen.close()
         opp_log.close()
         executor.close()
