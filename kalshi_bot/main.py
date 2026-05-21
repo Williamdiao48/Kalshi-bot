@@ -2957,6 +2957,12 @@ async def _fast_loop(
     #   Decimal °C (:53 METAR-synced) → obs_values: 0.1°C precision is safe
     #     for the direct ±0.5°F comparison used in the obs_values NO path.
     _asos_syn_celsius_fast: dict[str, int] = {}
+    # Direct C→F running max from nws_asos — used exclusively for breach-exit
+    # detection on open band_arb YES positions.  Integer °C readings are excluded
+    # from obs_values to prevent false NO signals (±0.9°F uncertainty near ceilings),
+    # but for exits we want the plain conversion: preserving a locked YES win is
+    # more important than the minor risk of exiting a few cents early.
+    _asos_direct_max_f: dict[str, float] = {}
     try:
         _asos_force = nws_asos.should_force_refresh()
         _asos_points = await nws_asos.fetch_city_observations(session, force=_asos_force)
@@ -2970,6 +2976,10 @@ async def _fast_loop(
                     _existing_syn = _asos_syn_celsius_fast.get(_dp.metric)
                     if _existing_syn is None or _syn_c > _existing_syn:
                         _asos_syn_celsius_fast[_dp.metric] = int(_syn_c)
+                # Direct C→F max (all readings, including integer °C) → breach-exit only
+                _existing_direct = _asos_direct_max_f.get(_dp.metric)
+                if _existing_direct is None or _dp.value > _existing_direct:
+                    _asos_direct_max_f[_dp.metric] = _dp.value
                 # Decimal Celsius max → obs_values (sufficiently precise for ±0.5°F gate)
                 _precise_f = _meta.get("precise_max_f")
                 if _precise_f is not None:
@@ -3020,14 +3030,22 @@ async def _fast_loop(
                 # and is handled by the price-based stop-loss. Skip this check entirely.
                 if _row_ticker.startswith("KXLOWT"):
                     continue
-                _cur_obs = obs_values.get(_metric)
+                # Use the higher of: precise decimal obs OR direct integer C→F conversion.
+                # The direct path catches 5-min automated integer °C readings (e.g. 20°C=68°F)
+                # that are excluded from obs_values for signal-generation reasons.
+                _cur_obs_precise = obs_values.get(_metric)
+                _cur_obs_direct  = _asos_direct_max_f.get(_metric)
+                _cur_obs = max(
+                    v for v in (_cur_obs_precise, _cur_obs_direct) if v is not None
+                ) if (_cur_obs_precise is not None or _cur_obs_direct is not None) else None
                 if _cur_obs is None:
                     continue
                 if _cur_obs >= _band_ceil + 0.5:
+                    _obs_src = "direct" if (_cur_obs_direct is not None and _cur_obs_direct >= _band_ceil + 0.5) else "precise"
                     logging.warning(
-                        "[asos-breach] trade #%d %s: obs=%.1f°F ≥ band_ceil=%.1f°F+0.5"
+                        "[asos-breach] trade #%d %s: obs=%.1f°F (%s) ≥ band_ceil=%.1f°F+0.5"
                         " — ceiling breached, queuing force-exit.",
-                        _row_id, _row_ticker, _cur_obs, _band_ceil,
+                        _row_id, _row_ticker, _cur_obs, _obs_src, _band_ceil,
                     )
                     ledger.request_force_exit(_row_ticker, f"asos_ceiling_breach@{_cur_obs:.1f}F")
         except Exception as _exc:
