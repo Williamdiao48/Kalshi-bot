@@ -127,6 +127,7 @@ from .arb_detector import (
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
 from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
 from .nba_convergence import NBAConvergenceOpportunity
+from .band_arb_sizer import win_prob as band_arb_win_prob
 
 
 # ---------------------------------------------------------------------------
@@ -2634,10 +2635,24 @@ class TradeExecutor:
         if self._circuit_breaker_tripped(signal.ticker, "BandArb YES"):
             return
 
-        # Compute p_win and sizing parameters
+        # Compute p_win from lookup table (keyed on overshoot vs GFS morning forecast)
+        overshoot_f = (
+            signal.observed_max - signal.gfs_morning_f
+            if signal.gfs_morning_f is not None
+            else None
+        )
+        sizer_p = band_arb_win_prob(overshoot_f)
+        if sizer_p is None:
+            logging.info(
+                "BandArb YES skip (lag > 1.5°F: overshoot=%.2f°F): %s",
+                overshoot_f, signal.ticker,
+            )
+            return
+
+        # Compute sizing parameters
         from .strike_arb import BAND_ARB_YES_MAX_HOURS_PRELOCK as _YES_MAX_HTC
         if signal.is_locked:
-            p_win      = BAND_ARB_YES_LOCKED_P
+            p_win      = sizer_p
             kelly_frac = LOCKED_OBS_KELLY_FRACTION
             max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
             hard_cap   = LOCKED_OBS_MAX_CONTRACTS
@@ -2650,7 +2665,7 @@ class TradeExecutor:
             _htc = signal.hours_to_close
             _max_htc = max(_YES_MAX_HTC, 0.001)
             time_factor = 0.10 * (1.0 - _htc / _max_htc)
-            p_win = min(0.92, BAND_ARB_YES_BASE_P + clearance_factor + time_factor)
+            p_win = min(sizer_p, BAND_ARB_YES_BASE_P + clearance_factor + time_factor)
             kelly_frac = KELLY_FRACTION
             max_cents  = max(1, int(MAX_POSITION_CENTS * _dd_factor))
             hard_cap   = TRADE_MAX_CONTRACTS
@@ -2668,17 +2683,6 @@ class TradeExecutor:
                 p_win, signal.yes_ask, signal.ticker,
             )
             return
-
-        # GFS morning gate: cap lagging entries at 1 contract for data logging.
-        # When METAR running max < morning GFS forecast at signal time, temp has
-        # not yet beaten the model → continued heating risk remains → reduce size.
-        if signal.gfs_lagging is True and count > 1:
-            logging.info(
-                "BandArb YES GFS-lagging cap: %s  obs=%.1f°F < gfs_morning=%.1f°F"
-                " → capped %d→1 contract (data logging)",
-                signal.ticker, signal.observed_max, signal.gfs_morning_f or 0.0, count,
-            )
-            count = 1
 
         if not BAND_ARB_EXECUTION_ENABLED:
             logging.info(
