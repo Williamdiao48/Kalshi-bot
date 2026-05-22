@@ -72,6 +72,11 @@ from .cities import CITIES  # city timezone lookup for date-alignment guard
 # p90 is exposed for solo numeric YES observational lock checks.
 _BAND_ARB_P75_MINUTES: dict[str, dict[int, int]] = {}
 _BAND_ARB_P90_MINUTES: dict[str, dict[int, int]] = {}
+# Per-city/month p75 trough times for overnight LOWS (minutes since local midnight).
+# Used by warm-NO entry gate: only enter after the p75 trough time for this city/month.
+# Only values < 720 (noon) are used; winter/evening values fall back to the
+# BAND_ARB_LOW_CEIL_MIN_HOUR default (6 AM).
+_BAND_ARB_LOW_P75_MINUTES: dict[str, dict[int, int]] = {}
 _p75_path = _Path(__file__).parent.parent / "data" / "peak_hour_p90.py"
 if _p75_path.exists():
     _spec = _ilu.spec_from_file_location("peak_hour_p90", _p75_path)
@@ -80,6 +85,7 @@ if _p75_path.exists():
         _spec.loader.exec_module(_p75_mod)  # type: ignore[union-attr]
         _BAND_ARB_P75_MINUTES = getattr(_p75_mod, "P75_MINUTES", {})
         _BAND_ARB_P90_MINUTES = getattr(_p75_mod, "P90_MINUTES", {})
+        _BAND_ARB_LOW_P75_MINUTES = getattr(_p75_mod, "LOW_P75_MINUTES", {})
 
 # Per-source/city/month forecast bias corrections from 10-year Open-Meteo backtest.
 # Key: (source, city_suffix, month)  Value: mean(forecast − actual) °F
@@ -131,13 +137,16 @@ BAND_ARB_NOAA_NONE_MAX_NO_ASK: int = env_int("BAND_ARB_NOAA_NONE_MAX_NO_ASK", 40
 BAND_ARB_LOW_BUFFER_F: float = env_float("BAND_ARB_LOW_BUFFER_F", 0.5)
 # Warm-side NO: minimum clearance (°F) between the METAR running daily min and the
 # band ceiling before firing a daytime NO signal on KXLOWT "between" markets.
-# Backtest optimal: 1.0°F; 3°F+ causes EV to go negative (NO too expensive).
-BAND_ARB_LOW_CEIL_BUFFER_F: float = env_float("BAND_ARB_LOW_CEIL_BUFFER_F", 1.0)
-# Earliest local hour at which the warm-side NO signal may fire.
-# Backtest (May 2026, 104 trades): 57/104 trades fire at the 9 AM gate opening
-# and produce avg -228¢. Noon-to-3 PM window is 100% WR, +1025¢ avg — the
-# overnight low is definitively set and morning temps have developed.
-BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 12)
+# Backtest (2026-03-15 to 2026-05-21, P75+0h anchor): WR=57% at margin<1.5°F,
+# WR=87% at margin>=1.5°F. 1.5°F is the margin gate threshold.
+BAND_ARB_LOW_CEIL_BUFFER_F: float = env_float("BAND_ARB_LOW_CEIL_BUFFER_F", 1.5)
+# Fallback earliest local hour for warm-side NO entries (used when per-city/month
+# P75 trough data is unavailable or indicates a winter evening trough ≥ noon).
+# The primary gate is per-city/month P75 from data/peak_hour_p90.py (LOW_P75_MINUTES);
+# for summer months P75 ≈ 6–9 AM local, which is the real entry gate.
+# Backtest (2022–2026, n=2,642 margin≥1.5): WR at P75+0h ≈ 85–93% depending on
+# margin; P75 entries earn 3–15x more EV than noon entries due to lower NO ask prices.
+BAND_ARB_LOW_CEIL_MIN_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MIN_HOUR", 6)
 # Latest local hour for warm-side NO entries. After mid-afternoon the next
 # night's cooling window opens and late-day signals degrade (16+: 50% WR).
 BAND_ARB_LOW_CEIL_MAX_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MAX_HOUR", 15)
@@ -225,13 +234,14 @@ BAND_ARB_LOW_YES_MAX_YES_ASK: int = env_int("BAND_ARB_LOW_YES_MAX_YES_ASK", 85)
 # the overnight low can still drop with a cold front after the morning minimum is set.
 # Only enter when the overnight risk window has substantially closed (~6 PM local).
 BAND_ARB_LOW_YES_MAX_HTC: float = env_float("BAND_ARB_LOW_YES_MAX_HTC", 6.0)
-# GFS daily min clearance gate for warm-side NO: block the signal unless the
-# GFS morning daily-minimum forecast exceeds the band ceiling by at least this
-# many degrees.  When clearance < 2°F GFS thinks the temp may still fall into
-# the band.  Backtest (May 2025): 14 losing trades had clearance < 2°F
-# (net -$165.72); blocking them would have saved $139 vs $26 foregone wins.
-# Set to 0.0 to disable.
-BAND_ARB_LOW_GFS_MIN_CLEARANCE_F: float = env_float("BAND_ARB_LOW_GFS_MIN_CLEARANCE_F", 2.0)
+# GFS daily min clearance gate for warm-side NO.
+# Backtest (2022–2026, Section 11): for pos=2/3 (affordable NO trades the bot
+# actually enters), a ≥+2°F GFS threshold adds ~1% WR lift while cutting 55–67%
+# of qualifying trades — net negative EV. The headline 94% WR at ≥+2°F is driven
+# by expensive pos=0/1 bands the bot skips. Gate is disabled (0.0) to preserve
+# volume; the 1.5°F METAR margin gate is the primary filter.
+# Set to a positive value to re-enable if GFS query is fixed to use temp_low_* metrics.
+BAND_ARB_LOW_GFS_MIN_CLEARANCE_F: float = env_float("BAND_ARB_LOW_GFS_MIN_CLEARANCE_F", 0.0)
 
 # --- Forecast-driven NO signal configuration --------------------------------
 FORECAST_NO_ENABLED: bool = env_bool("FORECAST_NO_ENABLED", True)
@@ -888,21 +898,36 @@ def find_band_arbs(
                     and observed_max >= parsed.strike_hi + BAND_ARB_LOW_CEIL_BUFFER_F
                 ):
                     # Warm-side NO: running daily min is already above the band ceiling.
-                    # Only fire after the overnight low is typically set (local hour gate)
-                    # and for same-day markets (hours_to_close < 20).
+                    # Enter after the per-city/month P75 trough time (typically 6–9 AM
+                    # in summer), which is when 75% of overnight lows have been set.
+                    # P75 from LOW_P75_MINUTES is used when available and < noon (720 min);
+                    # otherwise falls back to BAND_ARB_LOW_CEIL_MIN_HOUR (default 6 AM).
+                    # Upper bound: BAND_ARB_LOW_CEIL_MAX_HOUR (default 3 PM) prevents
+                    # next-night cooling risk. Same-day market only (hours_to_close < 20).
                     _low_tz_key = parsed.metric.replace("temp_low_", "temp_high_")
                     _low_tz_info = CITIES.get(_low_tz_key)
-                    _low_local_hour = (
-                        datetime.now(_low_tz_info[3]).hour
+                    _low_local_now = (
+                        datetime.now(_low_tz_info[3])
                         if _low_tz_info is not None
-                        else datetime.now().hour
+                        else datetime.now()
+                    )
+                    _low_local_hour = _low_local_now.hour
+                    _low_local_minutes = _low_local_hour * 60 + _low_local_now.minute
+                    # Resolve minimum entry time: P75 if available and a morning value,
+                    # else fall back to BAND_ARB_LOW_CEIL_MIN_HOUR * 60.
+                    _p75_low = _BAND_ARB_LOW_P75_MINUTES.get(parsed.metric, {}).get(_low_local_now.month)
+                    _min_entry_minutes = (
+                        _p75_low
+                        if _p75_low is not None and _p75_low < 720
+                        else BAND_ARB_LOW_CEIL_MIN_HOUR * 60
                     )
                     _close_time_str_warm = mkt.get("close_time") or mkt.get("expiration_time", "")
                     _warm_htc = _hours_to_close(_close_time_str_warm)
                     if (
                         _warm_htc is not None
                         and _warm_htc < 20
-                        and BAND_ARB_LOW_CEIL_MIN_HOUR <= _low_local_hour <= BAND_ARB_LOW_CEIL_MAX_HOUR
+                        and _low_local_minutes >= _min_entry_minutes
+                        and _low_local_hour <= BAND_ARB_LOW_CEIL_MAX_HOUR
                     ):
                         is_warm_no = True
                         band_ceil = parsed.strike_hi

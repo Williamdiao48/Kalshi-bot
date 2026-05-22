@@ -336,7 +336,7 @@ _sl_raw = os.environ.get(
     ' "noaa_day2:yes": 0.45, "noaa_day2_early:yes": 0.45,'
     ' "noaa_day2:no": 0.55, "noaa_day2_early:no": 0.55,'
     ' "noaa_day2": 0.30, "hrrr": 0.40,'
-    ' "band_arb:no": 0.70, "band_arb:yes": 0.50, "forecast_no": 0.90,'
+    ' "band_arb:no": 0.0, "band_arb:yes": 0.50, "forecast_no": 0.90,'
     ' "numeric": 0.70,'
     ' "binance": 0.25, "coinbase": 0.25}',
 )
