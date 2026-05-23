@@ -925,6 +925,74 @@ async def main() -> None:
     print("  may differ. Use shadow trade avg NO ask per bucket to calibrate.")
     print()
 
+    # ------------------------------------------------------------------ #
+    print()
+    print("=" * 70)
+    print("  SECTION 13 — SHARPE RATIO  (P75+0h, margin≥1.5°F)")
+    print("     Per-trade Sharpe: treats each trade independently (sqrt(252))")
+    print("     Daily portfolio Sharpe: all calendar days in backtest window,")
+    print("       zero return on non-trade days — captures cold-front correlation")
+    print("       and opportunity sparsity (sqrt(365)).")
+    print("     Risk-free rate = 0.  NOTE: results are indicative only —")
+    print("     extend BAND_START to 2022-01-01 for a statistically robust estimate.")
+    print("=" * 70)
+
+    import math
+    from collections import defaultdict
+    from datetime import date as _date
+
+    sharpe_recs = [r for r in p75_recs if r["margin_f"] >= 1.5]
+
+    _d0 = _date.fromisoformat(BAND_START)
+    _d1 = _date.fromisoformat(BAND_END)
+    total_calendar_days = (_d1 - _d0).days + 1
+
+    for ask in PRICE_SCENARIOS:
+        payout = 100 - ask
+
+        # Per-trade returns as fraction of entry cost
+        returns_per_trade = [
+            payout / ask if r["no_win"] else -1.0
+            for r in sharpe_recs
+        ]
+        n = len(returns_per_trade)
+        if n < 2:
+            continue
+        mean_r = sum(returns_per_trade) / n
+        var_r = sum((x - mean_r) ** 2 for x in returns_per_trade) / (n - 1)
+        sharpe_trade = mean_r / var_r ** 0.5 * math.sqrt(252) if var_r > 0 else 0
+
+        # Daily portfolio: group active trade-days, fill non-trade days with 0
+        daily_pnl: dict[str, float] = defaultdict(float)
+        daily_cost: dict[str, float] = defaultdict(float)
+        for r in sharpe_recs:
+            daily_pnl[r["date"]] += (payout * 10) if r["no_win"] else (-ask * 10)
+            daily_cost[r["date"]] += ask * 10
+        active_returns = [daily_pnl[d] / daily_cost[d] for d in daily_pnl]
+        nd = len(active_returns)
+        all_returns = active_returns + [0.0] * (total_calendar_days - nd)
+        N = len(all_returns)
+        mean_all = sum(all_returns) / N
+        var_all = sum((x - mean_all) ** 2 for x in all_returns) / (N - 1)
+        sharpe_daily = mean_all / var_all ** 0.5 * math.sqrt(365) if var_all > 0 else 0
+
+        wr = sum(1 for r in sharpe_recs if r["no_win"]) / n
+        total_pnl = sum(
+            (payout * 10) if r["no_win"] else (-ask * 10)
+            for r in sharpe_recs
+        ) / 100
+
+        print(f"\n  NO ask = {ask}¢  (WR={100*wr:.1f}%  n={n} trades  "
+              f"{nd}/{total_calendar_days} active days)")
+        print(f"  Total PnL (10 contracts/trade):        ${total_pnl:>+,.0f}")
+        print(f"  Per-trade Sharpe  (annualized):        {sharpe_trade:.2f}")
+        print(f"  Daily portfolio Sharpe (annualized):   {sharpe_daily:.2f}")
+    print()
+    print(f"  Window: {BAND_START} → {BAND_END} ({total_calendar_days} calendar days).")
+    print(f"  Per-trade Sharpe will be high due to 93%+ WR on a binary outcome —")
+    print(f"  daily portfolio Sharpe is the more conservative and realistic figure.")
+    print()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
