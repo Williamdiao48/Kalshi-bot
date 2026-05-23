@@ -562,6 +562,7 @@ class BandArbSignal:
     #   → 1-contract cap (data logging); False/None → full Kelly sizing
     gfs_morning_f: float | None = None
     gfs_lagging: bool | None = None
+    is_rising: bool | None = None  # True = spot still at running max; False = plateaued
 
 
 @dataclass
@@ -682,6 +683,7 @@ def find_band_arbs(
     nws_climo_values: dict[str, float] | None = None,
     synoptic_celsius: dict[str, int | None] | None = None,
     gfs_morning_values: dict[str, float] | None = None,
+    metar_is_rising: dict[str, bool | None] | None = None,
 ) -> list[BandArbSignal]:
     """Scan open KXHIGH and KXLOWT markets for bands definitively passed through by METAR.
 
@@ -1276,6 +1278,7 @@ def find_band_arbs(
                 yes_ask_entry=yes_ask_int,
                 gfs_morning_f=_gfs_f,
                 gfs_lagging=_gfs_lagging,
+                is_rising=(metar_is_rising or {}).get(parsed.metric),
             ))
             continue
 

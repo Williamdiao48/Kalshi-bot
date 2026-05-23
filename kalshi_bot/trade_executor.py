@@ -127,7 +127,7 @@ from .arb_detector import (
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
 from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
 from .nba_convergence import NBAConvergenceOpportunity
-from .band_arb_sizer import win_prob as band_arb_win_prob
+from .band_arb_sizer import win_prob as band_arb_win_prob, kelly_scale as band_arb_kelly_scale
 
 
 # ---------------------------------------------------------------------------
@@ -2641,19 +2641,20 @@ class TradeExecutor:
             if signal.gfs_morning_f is not None
             else None
         )
-        sizer_p = band_arb_win_prob(overshoot_f)
+        sizer_p = band_arb_win_prob(overshoot_f, signal.is_rising)
         if sizer_p is None:
             logging.info(
                 "BandArb YES skip (lag > 1.5°F: overshoot=%.2f°F): %s",
                 overshoot_f, signal.ticker,
             )
             return
+        _sizer_kelly_scale = band_arb_kelly_scale(overshoot_f, signal.is_rising)
 
         # Compute sizing parameters
         from .strike_arb import BAND_ARB_YES_MAX_HOURS_PRELOCK as _YES_MAX_HTC
         if signal.is_locked:
             p_win      = sizer_p
-            kelly_frac = LOCKED_OBS_KELLY_FRACTION
+            kelly_frac = LOCKED_OBS_KELLY_FRACTION * _sizer_kelly_scale
             max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
             hard_cap   = LOCKED_OBS_MAX_CONTRACTS
         else:
@@ -2684,11 +2685,14 @@ class TradeExecutor:
             )
             return
 
+        _trend_lbl = "rising" if signal.is_rising else ("plateaued" if signal.is_rising is False else "trend=?")
         if not BAND_ARB_EXECUTION_ENABLED:
             logging.info(
-                "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f",
+                "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f  ov=%.2f°F  %s  kelly_scale=%.2f",
                 "locked" if signal.is_locked else "pre-lock",
                 signal.ticker, count, signal.yes_ask, p_win,
+                overshoot_f if overshoot_f is not None else float("nan"),
+                _trend_lbl, _sizer_kelly_scale,
             )
             return
 

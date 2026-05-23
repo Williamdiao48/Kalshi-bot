@@ -2463,6 +2463,7 @@ async def _poll(
     # an Exception raises TypeError and would crash the entire _poll().
     _band_arb_obs_early: dict[str, float] = {}
     _band_arb_obs_dates: dict[str, date] = {}
+    _metar_is_rising: dict[str, bool | None] = {}
     if not isinstance(metar_result, Exception) and metar_result:
         for _dp in metar_result:
             if _dp.metric.startswith(("temp_high", "temp_low")):
@@ -2470,6 +2471,11 @@ async def _poll(
                 _ld = (_dp.metadata or {}).get("local_date")
                 if _ld:
                     _band_arb_obs_dates[_dp.metric] = date.fromisoformat(_ld)
+            if _dp.metric.startswith("temp_high_"):
+                _obs_s = (_dp.metadata or {}).get("obs_series", [])
+                if _obs_s:
+                    # True if last hourly reading is at/near today's running max
+                    _metar_is_rising[_dp.metric] = (_obs_s[-1][1] >= _dp.value - 0.3)
     # Merge NWS ASOS (5-min cadence) into obs_early — only for decimal-precision readings.
     # Integer Celsius (5-min automated, ±0.9°F) flows through _synoptic_celsius instead
     # so find_band_arbs uses the correct F_low = (C−0.5)×1.8+32 bound rather than the
@@ -2564,6 +2570,7 @@ async def _poll(
             nws_climo_values=_band_arb_nws_climo or None,
             synoptic_celsius=_synoptic_celsius or None,
             gfs_morning_values=_gfs_morning_snap or None,
+            metar_is_rising=_metar_is_rising or None,
         )
         if _early_band_arb_signals:
             logging.info(
@@ -3235,6 +3242,14 @@ async def _fast_loop(
         if _ex is None or _sc > _ex:
             _fast_syn_celsius[_m] = _sc
 
+    # Trend indicator for band_arb YES sizer: True if last METAR reading is at/near running max
+    _fast_is_rising: dict[str, bool | None] = {}
+    for _dp in metar_result:
+        if _dp.metric.startswith("temp_high_"):
+            _obs_s = (_dp.metadata or {}).get("obs_series", [])
+            if _obs_s:
+                _fast_is_rising[_dp.metric] = (_obs_s[-1][1] >= _dp.value - 0.3)
+
     signals = find_band_arbs(
         fresh_markets,
         obs_values,
@@ -3245,6 +3260,7 @@ async def _fast_loop(
         nws_climo_values=_last_nws_climo or None,
         synoptic_celsius=_fast_syn_celsius or None,
         gfs_morning_values=_gfs_morning_snap or None,
+        metar_is_rising=_fast_is_rising or None,
     )
     if signals:
         logging.debug("Fast loop: %d band_arb signal(s) found.", len(signals))

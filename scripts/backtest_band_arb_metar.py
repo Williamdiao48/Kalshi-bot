@@ -741,6 +741,85 @@ async def main() -> None:
             row_parts = [_fmt(grid_stats(filter_grp, pt, sl)) for sl in SL_FRACS]
             print(f"  {pt_label[pt]:14}  " + "  ".join(row_parts))
 
+    # ── Section 12: Overshoot × trend cross-tab ──────────────────────────────
+    print()
+    print("=" * 70)
+    print("  12. OVERSHOOT × TREND CROSS-TAB AT P75  (sizer calibration)")
+    print("      Rows = overshoot bucket; Cols = trend state")
+    print("      Rising = not plateau_1h; Plateaued = plateau_1h at entry")
+    print("=" * 70)
+
+    # Sizer-aligned overshoot buckets (matching band_arb_sizer.py)
+    sizer_buckets = [
+        ("skip   (<-1.5°F)",  -99.0, -1.5),
+        ("cautious(-1.5–0°F)", -1.5,  0.0),
+        ("close   (0–+1°F)",    0.0,  1.0),
+        ("overshot(>+1°F)",     1.0, 99.0),
+    ]
+
+    def _trend_lbl(r: dict) -> str:
+        if r.get("temp_delta_1h") is None:
+            return "unknown"
+        return "rising" if r["temp_delta_1h"] > 0 else "plateaued"
+
+    hdr12 = f"  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}"
+
+    print(f"\n  {'Bucket':>22}  {'── RISING ───────────────────────':>35}"
+          f"  {'── PLATEAUED ────────────────────':>35}"
+          f"  {'── ALL (with delta) ─────────────':>35}")
+    print(f"  {'':>22}{hdr12}{hdr12}{hdr12}")
+    print("  " + "-" * 115)
+
+    for lbl, lo_v, hi_v in sizer_buckets:
+        grp_ov = [r for r in p75_recs
+                  if r.get("overshoot") is not None and lo_v <= r["overshoot"] < hi_v]
+        rising    = [r for r in grp_ov if _trend_lbl(r) == "rising"]
+        plateaued = [r for r in grp_ov if _trend_lbl(r) == "plateaued"]
+        all_delta = [r for r in grp_ov if _trend_lbl(r) != "unknown"]
+        row = "  ".join(_fmt(grid_stats(g, None, None)) for g in [rising, plateaued, all_delta])
+        print(f"  {lbl:>22}  {row}")
+
+    # No-GFS row (trend-only fallback)
+    print("  " + "-" * 115)
+    grp_nogfs  = [r for r in p75_recs if r.get("overshoot") is None]
+    rising_ng  = [r for r in grp_nogfs if _trend_lbl(r) == "rising"]
+    plat_ng    = [r for r in grp_nogfs if _trend_lbl(r) == "plateaued"]
+    all_ng     = [r for r in grp_nogfs if _trend_lbl(r) != "unknown"]
+    row_ng = "  ".join(_fmt(grid_stats(g, None, None)) for g in [rising_ng, plat_ng, all_ng])
+    print(f"  {'no_gfs':>22}  {row_ng}")
+
+    # Summary note: expected sizer table values
+    print()
+    print("  ── Implied sizer table (Laplace-smoothed win probs) ──")
+    print(f"  {'Bucket':>22}  {'rising p(win)':>14}  {'plateaued p(win)':>16}  {'cells n (R / P)':>16}")
+    print("  " + "-" * 76)
+    for lbl, lo_v, hi_v in sizer_buckets:
+        grp_ov = [r for r in p75_recs
+                  if r.get("overshoot") is not None and lo_v <= r["overshoot"] < hi_v]
+        rising    = [r for r in grp_ov if _trend_lbl(r) == "rising"]
+        plateaued = [r for r in grp_ov if _trend_lbl(r) == "plateaued"]
+
+        def _laplace(grp_: list[dict]) -> str:
+            n_ = sum(1 for r in grp_ if r["cents"] is not None)
+            if n_ == 0:
+                return "  —"
+            wins_ = sum(1 for r in grp_ if r["result"] == "yes" and r["cents"] is not None)
+            p_ = (wins_ + 1) / (n_ + 2)
+            return f"{p_:>5.1%}"
+
+        sr = grid_stats(rising, None, None)
+        sp = grid_stats(plateaued, None, None)
+        print(f"  {lbl:>22}  {_laplace(rising):>14}  {_laplace(plateaued):>16}  "
+              f"{sr['n']:>6} / {sp['n']:<6}")
+
+    # No-GFS fallback
+    rising_ng_p  = _laplace(rising_ng)
+    plat_ng_p    = _laplace(plat_ng)
+    sr_ng = grid_stats(rising_ng, None, None)
+    sp_ng = grid_stats(plat_ng, None, None)
+    print(f"  {'no_gfs':>22}  {rising_ng_p:>14}  {plat_ng_p:>16}  "
+          f"{sr_ng['n']:>6} / {sp_ng['n']:<6}")
+
     print()
 
 
