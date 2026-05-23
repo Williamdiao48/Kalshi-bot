@@ -3103,49 +3103,6 @@ async def _fast_loop(
         except Exception as _exc:
             logging.debug("Fast loop: KXLOWT YES floor-breach check failed: %s", _exc)
 
-    # Observation-based exit for KXLOWT warm-NO positions:
-    # If the running daily min has fallen to or below the band ceiling,
-    # the warm-side lock is broken — force-exit immediately.
-    if TRADE_DRY_RUN and ledger is not None and obs_values:
-        try:
-            import json as _json
-            _lowt_no_rows = ledger._conn.execute(
-                """
-                SELECT id, ticker, note FROM trades
-                WHERE mode = 'dry_run'
-                  AND source = 'band_arb'
-                  AND side = 'no'
-                  AND ticker LIKE 'KXLOWT%'
-                  AND outcome IS NULL
-                  AND exited_at IS NULL
-                """
-            ).fetchall()
-            for _row_id, _row_ticker, _row_note in _lowt_no_rows:
-                try:
-                    _note = _json.loads(_row_note) if _row_note else {}
-                except Exception:
-                    continue
-                if not _note.get("corr_status", "").startswith("metar_warm"):
-                    continue
-                _metric = _note.get("metric")
-                _strike_hi = _note.get("band_ceil_f")
-                if _metric is None or _strike_hi is None:
-                    continue
-                _cur_min = obs_values.get(_metric)
-                if _cur_min is None:
-                    continue
-                if _cur_min <= _strike_hi - 0.5:
-                    logging.warning(
-                        "[lowt-breach] trade #%d %s: obs_min=%.1f°F ≤ ceil=%.1f°F-0.5"
-                        " — band breached from above, queuing force-exit.",
-                        _row_id, _row_ticker, _cur_min, _strike_hi,
-                    )
-                    ledger.request_force_exit(
-                        _row_ticker, f"metar_lowt_breach@{_cur_min:.1f}F"
-                    )
-        except Exception as _exc:
-            logging.debug("Fast loop: KXLOWT NO breach check failed: %s", _exc)
-
     # Floor-breach exit for KXLOWT band_arb YES positions:
     # If the running daily min drops below the band floor, the low has left the
     # band — YES is losing.  Mirror the ceiling-breach exit for KXHIGHT YES.

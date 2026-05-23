@@ -1034,9 +1034,11 @@ def find_band_arbs(
                 # band ceiling by BAND_ARB_LOW_GFS_MIN_CLEARANCE_F.  When GFS
                 # shows tight clearance the model thinks temp may still drop
                 # into the band — most May losing trades had clearance < 2°F.
+                _warm_gfs_min: float | None = None  # carried into signal for sizer
                 if BAND_ARB_LOW_GFS_MIN_CLEARANCE_F > 0 and gfs_morning_values is not None:
                     _gfs_low_min = gfs_morning_values.get(parsed.metric)
                     if _gfs_low_min is not None:
+                        _warm_gfs_min = _gfs_low_min
                         _gfs_clearance = _gfs_low_min - band_ceil
                         if _gfs_clearance < BAND_ARB_LOW_GFS_MIN_CLEARANCE_F:
                             logging.warning(
@@ -1077,6 +1079,7 @@ def find_band_arbs(
                     strike_lo=band_ceil,
                     corr_status=_warm_corr,
                     hrrr_val=_hrrr_warm_val,
+                    gfs_morning_f=_warm_gfs_min,
                 ))
                 logging.info(
                     "BandArb warm-NO %s: running_min=%.1f°F >= ceil=%.1f°F+%.1f°F"

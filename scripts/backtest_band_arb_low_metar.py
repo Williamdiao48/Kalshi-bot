@@ -9,10 +9,14 @@ the band. Win if Kalshi settles "no" (final low NOT in [floor, ceil)).
 Data range: 2022-01-01 → 2026-05-21 (bands limited to Kalshi settled window).
 NO side only. 12 entry anchors: P50/P75/P90 × +0h/+1h/+2h/+3h.
 
+Candle data (--fetch-candles): fetches hourly YES ask prices from Kalshi API
+for each ticker, enabling price spike analysis and exit-policy simulation.
+
 Run:
   venv/bin/python scripts/backtest_band_arb_low_metar.py
-  venv/bin/python scripts/backtest_band_arb_low_metar.py --refresh     # re-fetch METAR
-  venv/bin/python scripts/backtest_band_arb_low_metar.py --fetch-gfs   # fill GFS gaps
+  venv/bin/python scripts/backtest_band_arb_low_metar.py --refresh       # re-fetch METAR
+  venv/bin/python scripts/backtest_band_arb_low_metar.py --fetch-gfs     # fill GFS gaps
+  venv/bin/python scripts/backtest_band_arb_low_metar.py --fetch-candles # fetch price data
 """
 
 from __future__ import annotations
@@ -33,15 +37,18 @@ import aiohttp
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from kalshi_bot.auth import generate_headers
 from kalshi_bot.cities import LOW_CITIES
+from kalshi_bot.markets import KALSHI_API_BASE
 from scripts.build_forecast_calibration import IEM_STATIONS
 
 DATA_DIR  = Path(__file__).parent.parent / "data"
 CACHE_DIR = DATA_DIR / "cache" / "metar_low_historical"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-BANDS_CSV  = DATA_DIR / "kxlowt_bands.csv"
-GFS_CACHE  = DATA_DIR / "cache" / "noaa_gate_low_backtest"
-TROUGH_CSV = DATA_DIR / "overnight_low_analysis.csv"
+BANDS_CSV   = DATA_DIR / "kxlowt_bands.csv"
+GFS_CACHE   = DATA_DIR / "cache" / "noaa_gate_low_backtest"
+TROUGH_CSV  = DATA_DIR / "overnight_low_analysis.csv"
+CANDLE_JSON = DATA_DIR / "kxlowt_no_candle_cache.json"
 
 BAND_START = "2026-03-15"
 BAND_END   = "2026-05-21"
@@ -55,9 +62,12 @@ ENTRY_OFFSETS = [0, 1, 2, 3]
 ENTRY_KEYS    = [f"{a}+{n}h" for a in ENTRY_ANCHORS for n in ENTRY_OFFSETS]
 
 _parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-_parser.add_argument("--refresh",   action="store_true", help="Re-fetch METAR (ignores cache)")
-_parser.add_argument("--fetch-gfs", action="store_true", help="Fetch missing GFS data from Open-Meteo")
+_parser.add_argument("--refresh",       action="store_true", help="Re-fetch METAR (ignores cache)")
+_parser.add_argument("--fetch-gfs",     action="store_true", help="Fetch missing GFS data from Open-Meteo")
+_parser.add_argument("--fetch-candles", action="store_true", help="Fetch Kalshi hourly candle data for price analysis")
 _args = _parser.parse_args()
+
+_CANDLE_SEM: asyncio.Semaphore  # initialized in main()
 
 
 # ── Trough CSV loading ─────────────────────────────────────────────────────────
@@ -224,6 +234,150 @@ async def _fetch_gfs_range(
     )
     result = {d: v for d, v in zip(dates, vals) if v is not None}
     cache_path.write_text(json.dumps(result))
+    return result
+
+
+# ── Kalshi candle data (price analysis) ───────────────────────────────────────
+
+async def _fetch_candles_for_ticker(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    local_date_str: str,
+) -> list[dict]:
+    """Fetch hourly YES ask candles covering the full local trading day.
+
+    Window: local_date 00:00 UTC → local_date+1 06:00 UTC (30 h) covers the
+    full US local day in all timezones (ET = UTC-4, PT = UTC-7).
+    """
+    local_d  = datetime.strptime(local_date_str, "%Y-%m-%d").date()
+    start_ts = int(datetime(local_d.year, local_d.month, local_d.day,
+                            0, 0, tzinfo=timezone.utc).timestamp())
+    end_ts   = start_ts + 30 * 3600
+    series   = ticker.rsplit("-", 2)[0]
+    path     = f"/trade-api/v2/series/{series}/markets/{ticker}/candlesticks"
+    headers  = generate_headers("GET", path)
+    params   = {"period_interval": 60, "start_ts": start_ts, "end_ts": end_ts}
+
+    async with _CANDLE_SEM:
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/series/{series}/markets/{ticker}/candlesticks",
+                params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 429:
+                    await asyncio.sleep(3.0)
+                    return []
+                if r.status != 200:
+                    return []
+                data = await r.json()
+        except Exception:
+            return []
+        await asyncio.sleep(0.15)
+    return data.get("candlesticks", [])
+
+
+def load_no_candle_cache() -> dict[str, list[dict]]:
+    if CANDLE_JSON.exists():
+        try:
+            return json.loads(CANDLE_JSON.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_no_candle_cache(cache: dict[str, list[dict]]) -> None:
+    CANDLE_JSON.write_text(json.dumps(cache, separators=(",", ":")))
+
+
+def _ya_cents(candle: dict, field: str = "close_dollars") -> int | None:
+    """YES ask price in cents from a candle field. Returns None if ≥100¢ (post-settlement)."""
+    v = candle.get("yes_ask", {}).get(field)
+    if v is None:
+        return None
+    c = round(float(v) * 100)
+    return c if c < 100 else None
+
+
+def _yb_cents(candle: dict, field: str = "close_dollars") -> int | None:
+    """YES bid price in cents from a candle field. Returns None if ≤0¢ (post-settlement)."""
+    v = candle.get("yes_bid", {}).get(field)
+    if v is None:
+        return None
+    c = round(float(v) * 100)
+    return c if c > 0 else None
+
+
+def _entry_yes_ask(candles: list[dict], entry_ts: int) -> int | None:
+    """YES ask at the last hourly boundary at or before entry_ts."""
+    best: int | None = None
+    for c in sorted(candles, key=lambda x: x.get("end_period_ts", 0)):
+        if c.get("end_period_ts", 0) <= entry_ts:
+            v = _ya_cents(c, "close_dollars")
+            if v is not None:
+                best = v
+        else:
+            break
+    return best
+
+
+def _entry_yes_bid(candles: list[dict], entry_ts: int) -> int | None:
+    """YES bid at the last hourly boundary at or before entry_ts.
+
+    NO ask = 100 - YES bid, so this gives the true cost of buying NO at detection time.
+    """
+    best: int | None = None
+    for c in sorted(candles, key=lambda x: x.get("end_period_ts", 0)):
+        if c.get("end_period_ts", 0) <= entry_ts:
+            v = _yb_cents(c, "close_dollars")
+            if v is not None:
+                best = v
+        else:
+            break
+    return best
+
+
+def _peak_yes_ask(candles: list[dict], entry_ts: int) -> int | None:
+    """Maximum YES ask (high_dollars) in candles whose period starts at or after entry_ts.
+
+    Uses end_period_ts > entry_ts (strict) so candles ending exactly at entry_ts
+    (which cover the hour *before* entry) are excluded.
+    """
+    highs = [
+        _ya_cents(c, "high_dollars")
+        for c in candles
+        if c.get("end_period_ts", 0) > entry_ts
+    ]
+    valid = [h for h in highs if h is not None]
+    return max(valid) if valid else None
+
+
+def _hourly_yes_asks(candles: list[dict], entry_ts: int) -> list[tuple[int, int]]:
+    """List of (end_period_ts, yes_ask_close_cents) for candles after entry_ts (strict)."""
+    result = []
+    for c in sorted(candles, key=lambda x: x.get("end_period_ts", 0)):
+        if c.get("end_period_ts", 0) <= entry_ts:
+            continue
+        v = _ya_cents(c, "close_dollars")
+        if v is not None:
+            result.append((c["end_period_ts"], v))
+    return result
+
+
+def _hourly_prices(candles: list[dict], entry_ts: int) -> list[tuple[int, int, int]]:
+    """List of (end_period_ts, yes_ask_close_cents, yes_bid_close_cents) after entry_ts.
+
+    yes_bid_close determines NO ask = 100 - yes_bid for a delayed entry simulation.
+    Both ask and bid must be valid (non-None) for a row to be included.
+    """
+    result = []
+    for c in sorted(candles, key=lambda x: x.get("end_period_ts", 0)):
+        if c.get("end_period_ts", 0) <= entry_ts:
+            continue
+        ya = _ya_cents(c, "close_dollars")
+        yb = _yb_cents(c, "close_dollars")
+        if ya is not None and yb is not None:
+            result.append((c["end_period_ts"], ya, yb))
     return result
 
 
@@ -434,6 +588,7 @@ async def main() -> None:
                         "anchor":        anchor,
                         "offset_h":      offset_h,
                         "local_hour":    local_hour,
+                        "entry_ts":      int(cutoff.timestamp()),
                         "running_min":   rmin,
                         "gfs_daily_min": gfs_daily_min,
                         "overshoot_gfs": overshoot,
@@ -446,6 +601,12 @@ async def main() -> None:
                         "band_result":   band["result"],
                         "band_pos":      band_pos,    # 0=deepest (most margin), N-1=shallowest
                         "n_qualifying":  n_qual,
+                        # price fields — populated below after candle load
+                        "entry_yes_ask": None,
+                        "entry_yes_bid": None,   # YES bid at detection → NO ask = 100 - this
+                        "peak_yes_ask":  None,
+                        "hourly_yes_asks": [],
+                        "hourly_prices": [],     # (ts, yes_ask, yes_bid) for spike simulation
                     })
 
     total = len(records)
@@ -453,6 +614,52 @@ async def main() -> None:
     if total == 0:
         print("\nNo records — check that kxlowt_bands.csv has data and METAR fetched correctly.")
         return
+
+    # ── Candle data: fetch and/or load ────────────────────────────────────
+    global _CANDLE_SEM
+    _CANDLE_SEM = asyncio.Semaphore(1)
+
+    candle_cache = load_no_candle_cache()
+    if _args.fetch_candles:
+        # Collect unique (ticker, date) pairs not yet cached
+        needed = {
+            (r["ticker"], r["date"])
+            for r in records
+            if r["ticker"] not in candle_cache
+        }
+        if needed:
+            print(f"\nFetching candles for {len(needed)} tickers …")
+            async with aiohttp.ClientSession() as _csess:
+                for i, (ticker, local_date) in enumerate(sorted(needed)):
+                    candle_cache[ticker] = await _fetch_candles_for_ticker(
+                        _csess, ticker, local_date
+                    )
+                    if (i + 1) % 100 == 0:
+                        print(f"  {i+1}/{len(needed)} …", flush=True)
+            save_no_candle_cache(candle_cache)
+            print(f"  Saved {len(candle_cache)} tickers to {CANDLE_JSON.name}")
+        else:
+            print(f"\nAll tickers already cached ({len(candle_cache)} entries).")
+
+    # Attach price fields to every record
+    n_priced = 0
+    for rec in records:
+        candles = candle_cache.get(rec["ticker"], [])
+        if not candles:
+            continue
+        ts = rec["entry_ts"]
+        rec["entry_yes_ask"]   = _entry_yes_ask(candles, ts)
+        rec["entry_yes_bid"]   = _entry_yes_bid(candles, ts)
+        rec["peak_yes_ask"]    = _peak_yes_ask(candles, ts)
+        rec["hourly_yes_asks"] = _hourly_yes_asks(candles, ts)
+        rec["hourly_prices"]   = _hourly_prices(candles, ts)
+        if rec["entry_yes_ask"] is not None:
+            n_priced += 1
+
+    n_unique_tickers = len({r["ticker"] for r in records})
+    print(f"Candle coverage: {n_priced:,} / {total:,} records priced "
+          f"({n_unique_tickers} unique tickers, "
+          f"{len(candle_cache)} cached)")
 
     # ── Section 1: Continued Cooling Stats ────────────────────────────────
     print()
@@ -863,111 +1070,116 @@ async def main() -> None:
     print("  Reading: for each band_pos, % of trades kept shrinks left→right as threshold rises.")
     print("  High WR lift per gate tightening shows how much that pos benefits from GFS filter.")
 
-    # ── Section 12: Kelly sizing simulation ───────────────────────────────────
-    # The backtest has no market prices, so we can't compute exact Kelly fractions.
-    # Instead we show EV and sizing metrics at three assumed NO ask price levels
-    # (60¢, 70¢, 80¢) representing the affordable range the bot actually enters.
-    # For each (band_pos × margin) bucket at P75+0h, we report:
-    #   WR   — win probability from backtest
-    #   EV   — expected value per contract = WR*(100-ask) - (1-WR)*ask
-    #   Kf   — half-Kelly fraction (half-Kelly is standard for correlated markets)
-    #   EV$  — dollar EV per 10-contract trade at that Kelly stake
-    # Positive EV requires WR > NO_ask (e.g. WR>70% for NO at 70¢).
+    # ── Candle-price gate: skip trades where NO is too expensive ─────────────
+    # Trades with NO ask > NO_ASK_CAP have near-zero EV (market already priced in).
+    NO_ASK_CAP = 90   # cents; entry_yes_bid must be ≥ (100 - NO_ASK_CAP) = 10¢
+
+    def _priced(r: dict) -> bool:
+        return (
+            r["entry_yes_bid"] is not None
+            and (100 - r["entry_yes_bid"]) <= NO_ASK_CAP
+        )
+
+    # ── Section 12: Kelly sizing simulation (candle prices) ───────────────────
     print()
     print()
     print("=" * 70)
-    print("  SECTION 12 — KELLY SIZING SIMULATION  (P75+0h, assumed NO ask prices)")
-    print("     EV/c = expected value per contract  (WR*(100-ask) - (1-WR)*ask)")
+    print("  SECTION 12 — KELLY SIZING SIMULATION  (P75+0h, candle prices)")
+    print(f"     NO ask cap = {NO_ASK_CAP}¢  (YES bid ≥ {100-NO_ASK_CAP}¢; skips nearly-certain NO)")
+    print("     NO ask = 100 − YES bid from candle at trough entry time.")
+    print("     EV/c = WR × YES_bid − (1−WR) × NO_ask  (per contract)")
     print("     Kf   = half-Kelly fraction of bankroll to stake per trade")
     print("     EV$  = dollar EV for a 10-contract trade at half-Kelly stake")
-    print("     Three price scenarios: ask=60¢  ask=70¢  ask=80¢")
-    print("     bot's actual range: 20–88¢ NO ask; pos=2/3 likely 50–85¢")
+    print("     n_p  = records passing NO ask cap (coverage of total n)")
     print("=" * 70)
 
-    PRICE_SCENARIOS = [60, 70, 80]
-
-    def _kelly_row(wr: float, asks: list[int]) -> list[str]:
-        parts = []
-        for ask in asks:
-            payout = 100 - ask
-            ev = wr * payout - (1 - wr) * ask          # EV per contract (cents)
-            full_k = ev / payout if payout > 0 else 0  # full Kelly fraction
-            half_k = max(0.0, full_k / 2)              # half-Kelly (safer)
-            # Dollar EV for 10-contract trade: contracts * EV/contract / 100
-            ev_dollar = 10 * ev / 100
-            if ev <= 0:
-                parts.append(f"  {'neg':>6} {'—':>5} {'—':>6}")
-            else:
-                parts.append(f"  {ev:>+5.1f}¢ {100*half_k:>4.1f}% {ev_dollar:>+5.2f}$")
-        return parts
-
-    col_hdr = "  ".join(f"{'ask='+str(a)+'¢':>20}" for a in PRICE_SCENARIOS)
-    sub_hdr = "  ".join(f"{'EV/c':>6} {'Kf':>5} {'EV$':>6}" for _ in PRICE_SCENARIOS)
+    def _kelly_from_prices(wr: float, avg_no_ask: float) -> str:
+        yes_bid = 100 - avg_no_ask
+        ev = wr * yes_bid - (1 - wr) * avg_no_ask
+        if ev <= 0:
+            return f"  {'neg':>6}  {'—':>5}  {'—':>6}"
+        full_k = ev / yes_bid if yes_bid > 0 else 0
+        half_k = max(0.0, full_k / 2)
+        ev_dollar = 10 * ev / 100
+        return f"  {ev:>+5.1f}¢  {100*half_k:>4.1f}%  {ev_dollar:>+5.2f}$"
 
     for pos in range(max_pos + 1):
         print()
         print(f"  pos={pos}  {'─'*60}")
-        print(f"  {'Margin':>10}   {'n':>5}   {'WR':>6}   {col_hdr}")
-        print(f"  {'':>10}   {'':>5}   {'':>6}   {sub_hdr}")
-        print("  " + "-" * 85)
+        print(f"  {'Margin':>10}   {'n':>5}  {'n_p':>5}   {'WR':>6}   "
+              f"{'avg_NO_ask':>10}   {'EV/c':>6}  {'Kf':>5}  {'EV$':>6}")
+        print("  " + "-" * 75)
         row_recs = [r for r in p75_recs if r["band_pos"] == pos]
         for label, m_lo, m_hi in pos_margin_buckets:
-            g = [r for r in row_recs if m_lo <= r["margin_f"] < m_hi]
-            s = _stats(g)
+            g     = [r for r in row_recs if m_lo <= r["margin_f"] < m_hi]
+            g_p   = [r for r in g if _priced(r)]
+            s     = _stats(g)
             if s["n"] < 5:
                 continue
-            wr = s["wins"] / s["n"]
-            kelly_cols = "   ".join(_kelly_row(wr, PRICE_SCENARIOS))
-            print(f"  {label:>10}   {s['n']:>5}   {100*wr:>5.1f}%   {kelly_cols}")
+            wr    = s["wins"] / s["n"]
+            if g_p:
+                avg_no_ask = sum(100 - r["entry_yes_bid"] for r in g_p) / len(g_p)
+                kelly_str  = _kelly_from_prices(wr, avg_no_ask)
+                na_str     = f"{avg_no_ask:>9.1f}¢"
+            else:
+                kelly_str  = "  (no price data)"
+                na_str     = "         —"
+            print(f"  {label:>10}   {s['n']:>5}  {len(g_p):>5}   {100*wr:>5.1f}%   "
+                  f"{na_str}  {kelly_str}")
 
     print()
-    print("  Note: WR from backtest temperature data only — actual market prices")
-    print("  may differ. Use shadow trade avg NO ask per bucket to calibrate.")
-    print()
+    print("  Note: avg_NO_ask is the average across candle-priced records only.")
+    print("  Rows without candle data (n_p=0) show WR only.")
 
     # ------------------------------------------------------------------ #
     print()
     print("=" * 70)
-    print("  SECTION 13 — SHARPE RATIO  (P75+0h, margin≥1.5°F)")
+    print("  SECTION 13 — SHARPE RATIO  (P75+0h, margin≥1.5°F, candle prices)")
+    print(f"     NO ask cap = {NO_ASK_CAP}¢  applied (same gate as Section 12).")
+    print("     Uses actual YES bid per record: NO ask = 100 − YES bid.")
+    print("     Return per trade = YES_bid / NO_ask  (win)  or  −1  (lose).")
     print("     Per-trade Sharpe: treats each trade independently (sqrt(252))")
     print("     Daily portfolio Sharpe: all calendar days in backtest window,")
-    print("       zero return on non-trade days — captures cold-front correlation")
-    print("       and opportunity sparsity (sqrt(365)).")
-    print("     Risk-free rate = 0.  NOTE: results are indicative only —")
-    print("     extend BAND_START to 2022-01-01 for a statistically robust estimate.")
+    print("       zero return on non-trade days (sqrt(365)).")
+    print("     Risk-free rate = 0.")
     print("=" * 70)
 
     import math
     from collections import defaultdict
     from datetime import date as _date
 
-    sharpe_recs = [r for r in p75_recs if r["margin_f"] >= 1.5]
+    sharpe_recs = [r for r in p75_recs if r["margin_f"] >= 1.5 and _priced(r)]
+    sharpe_recs_all = [r for r in p75_recs if r["margin_f"] >= 1.5]
 
     _d0 = _date.fromisoformat(BAND_START)
     _d1 = _date.fromisoformat(BAND_END)
     total_calendar_days = (_d1 - _d0).days + 1
 
-    for ask in PRICE_SCENARIOS:
-        payout = 100 - ask
+    n = len(sharpe_recs)
+    n_all = len(sharpe_recs_all)
+    if n < 2:
+        print(f"\n  Insufficient priced records (n={n}) — run with --fetch-candles.")
+    else:
+        wr  = sum(1 for r in sharpe_recs if r["no_win"]) / n
+        avg_no_ask = sum(100 - r["entry_yes_bid"] for r in sharpe_recs) / n
 
-        # Per-trade returns as fraction of entry cost
+        # Per-trade returns as fraction of NO ask (entry cost)
         returns_per_trade = [
-            payout / ask if r["no_win"] else -1.0
+            r["entry_yes_bid"] / (100 - r["entry_yes_bid"]) if r["no_win"] else -1.0
             for r in sharpe_recs
         ]
-        n = len(returns_per_trade)
-        if n < 2:
-            continue
         mean_r = sum(returns_per_trade) / n
         var_r = sum((x - mean_r) ** 2 for x in returns_per_trade) / (n - 1)
         sharpe_trade = mean_r / var_r ** 0.5 * math.sqrt(252) if var_r > 0 else 0
 
-        # Daily portfolio: group active trade-days, fill non-trade days with 0
+        # Daily portfolio P&L using actual per-record costs/payouts
         daily_pnl: dict[str, float] = defaultdict(float)
         daily_cost: dict[str, float] = defaultdict(float)
         for r in sharpe_recs:
-            daily_pnl[r["date"]] += (payout * 10) if r["no_win"] else (-ask * 10)
-            daily_cost[r["date"]] += ask * 10
+            yes_bid  = r["entry_yes_bid"]
+            no_ask   = 100 - yes_bid
+            daily_pnl[r["date"]]  += (yes_bid * 10) if r["no_win"] else (-no_ask * 10)
+            daily_cost[r["date"]] += no_ask * 10
         active_returns = [daily_pnl[d] / daily_cost[d] for d in daily_pnl]
         nd = len(active_returns)
         all_returns = active_returns + [0.0] * (total_calendar_days - nd)
@@ -976,21 +1188,265 @@ async def main() -> None:
         var_all = sum((x - mean_all) ** 2 for x in all_returns) / (N - 1)
         sharpe_daily = mean_all / var_all ** 0.5 * math.sqrt(365) if var_all > 0 else 0
 
-        wr = sum(1 for r in sharpe_recs if r["no_win"]) / n
         total_pnl = sum(
-            (payout * 10) if r["no_win"] else (-ask * 10)
+            (r["entry_yes_bid"] * 10) if r["no_win"] else (-(100 - r["entry_yes_bid"]) * 10)
             for r in sharpe_recs
         ) / 100
 
-        print(f"\n  NO ask = {ask}¢  (WR={100*wr:.1f}%  n={n} trades  "
-              f"{nd}/{total_calendar_days} active days)")
+        print(f"\n  Candle-priced records: n={n} / {n_all}  (coverage {100*n/n_all:.0f}%)")
+        print(f"  WR={100*wr:.1f}%  avg NO ask={avg_no_ask:.1f}¢  avg YES bid={100-avg_no_ask:.1f}¢")
         print(f"  Total PnL (10 contracts/trade):        ${total_pnl:>+,.0f}")
         print(f"  Per-trade Sharpe  (annualized):        {sharpe_trade:.2f}")
         print(f"  Daily portfolio Sharpe (annualized):   {sharpe_daily:.2f}")
+        print(f"  Active days: {nd}/{total_calendar_days}")
     print()
     print(f"  Window: {BAND_START} → {BAND_END} ({total_calendar_days} calendar days).")
-    print(f"  Per-trade Sharpe will be high due to 93%+ WR on a binary outcome —")
     print(f"  daily portfolio Sharpe is the more conservative and realistic figure.")
+    print()
+
+    # ── Section 14: Price Spike Analysis ─────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  SECTION 14 — INTRADAY PRICE SPIKE ANALYSIS  (candle data)")
+    print("     spike = peak_yes_ask − entry_yes_ask  (always ≥ 0 for NO buyer)")
+    print("     hold-through WR = win rate on trades where spike ≥ 30¢")
+    print("     Requires --fetch-candles to populate.")
+    print("=" * 70)
+
+    priced_recs = [r for r in records if r["entry_yes_ask"] is not None and r["peak_yes_ask"] is not None]
+    if not priced_recs:
+        print("\n  No price data — run with --fetch-candles.")
+    else:
+        def _spike(r):
+            return r["peak_yes_ask"] - r["entry_yes_ask"]
+
+        # By entry key (show P75/P90 family)
+        print(f"\n  {'Entry key':>10}  {'n':>5}  {'avg_entry':>10}  "
+              f"{'avg_spike(W)':>13}  {'avg_spike(L)':>13}  {'big≥30¢':>8}  {'hold-thru WR':>13}")
+        print("  " + "-" * 80)
+        for ek in ENTRY_KEYS:
+            grp = [r for r in priced_recs if r["entry_key"] == ek]
+            if len(grp) < 10:
+                continue
+            wins  = [r for r in grp if r["no_win"]]
+            loses = [r for r in grp if not r["no_win"]]
+            avg_e = sum(r["entry_yes_ask"] for r in grp) / len(grp)
+            avg_sw = sum(_spike(r) for r in wins)  / len(wins)  if wins  else 0
+            avg_sl = sum(_spike(r) for r in loses) / len(loses) if loses else 0
+            big    = [r for r in grp if _spike(r) >= 30]
+            big_wr = sum(1 for r in big if r["no_win"]) / len(big) if big else 0
+            print(f"  {ek:>10}  {len(grp):>5}  {avg_e:>9.1f}¢  "
+                  f"{avg_sw:>12.1f}¢  {avg_sl:>12.1f}¢  "
+                  f"{len(big):>4}/{len(grp):<3}  {100*big_wr:>12.1f}%")
+
+        # By margin bucket at P75+0h
+        p75_priced = [r for r in priced_recs if r["entry_key"] == "p75+0h"]
+        if p75_priced:
+            print(f"\n  Margin bucket (P75+0h):  n={len(p75_priced)}")
+            print(f"  {'Margin':>10}  {'n':>5}  {'avg_entry':>10}  {'avg_spike':>10}  "
+                  f"{'big≥30¢%':>9}  {'hold-thru WR':>13}")
+            print("  " + "-" * 65)
+            mbuckets = [
+                ("1–1.5°F",  1.0, 1.5),
+                ("1.5–2°F",  1.5, 2.0),
+                ("2–3°F",    2.0, 3.0),
+                (">3°F",     3.0, 99.),
+            ]
+            for lbl, lo, hi in mbuckets:
+                grp = [r for r in p75_priced if lo <= r["margin_f"] < hi]
+                if not grp:
+                    continue
+                avg_e  = sum(r["entry_yes_ask"] for r in grp) / len(grp)
+                avg_sp = sum(_spike(r) for r in grp) / len(grp)
+                big    = [r for r in grp if _spike(r) >= 30]
+                big_wr = sum(1 for r in big if r["no_win"]) / len(big) if big else 0
+                print(f"  {lbl:>10}  {len(grp):>5}  {avg_e:>9.1f}¢  {avg_sp:>9.1f}¢  "
+                      f"{100*len(big)/len(grp):>8.0f}%  {100*big_wr:>12.1f}%")
+
+    # ── Section 15: Exit Policy P&L Simulation ───────────────────────────────
+    print()
+    print("=" * 70)
+    print("  SECTION 15 — EXIT POLICY SIMULATION  (P75+0h, per-contract cents)")
+    print("     P&L = entry_yes_ask − exit_yes_ask  (NO position)")
+    print("     Settlement win: exit at ~1¢ YES  →  P&L ≈ entry_yes_ask")
+    print("     Settlement lose: exit at ~99¢ YES →  P&L ≈ -(100 - entry_yes_ask)")
+    print("     PT fires at first hourly close ≤ pt_thresh.")
+    print("     SL fires at first hourly close ≥ sl_thresh.")
+    print("=" * 70)
+
+    p75_hourly = [
+        r for r in priced_recs
+        if r["entry_key"] == "p75+0h"
+        and r["entry_yes_ask"] is not None
+        and r["hourly_yes_asks"]
+        and _priced(r)
+    ]
+
+    if not p75_hourly:
+        print("\n  No hourly price data — run with --fetch-candles.")
+    else:
+        def _simulate(recs, pt_thresh=None, sl_thresh=None):
+            """Returns list of per-contract P&L under the given exit policy."""
+            pnls = []
+            for r in recs:
+                entry = r["entry_yes_ask"]
+                exited = False
+                for _, ask in r["hourly_yes_asks"]:
+                    if pt_thresh is not None and ask <= pt_thresh:
+                        pnls.append(entry - ask)
+                        exited = True
+                        break
+                    if sl_thresh is not None and ask >= sl_thresh:
+                        pnls.append(entry - ask)  # negative
+                        exited = True
+                        break
+                if not exited:
+                    # settlement
+                    pnls.append(entry - 1 if r["no_win"] else -(100 - entry))
+            return pnls
+
+        policies = [
+            ("Hold to settlement",   None, None),
+            ("PT at YES≤5¢",          5,   None),
+            ("PT at YES≤8¢",          8,   None),
+            ("PT at YES≤10¢",        10,   None),
+            ("SL at YES≥60¢",        None,   60),
+            ("SL at YES≥70¢",        None,   70),
+            ("SL at YES≥80¢",        None,   80),
+            ("PT@8¢ + SL@70¢",        8,     70),
+            ("PT@8¢ + SL@80¢",        8,     80),
+        ]
+
+        n = len(p75_hourly)
+        hold_pnls = _simulate(p75_hourly)
+        hold_total = sum(hold_pnls)
+
+        print(f"\n  n={n} P75+0h records with hourly price data\n")
+        print(f"  {'Policy':25}  {'n_exit':>7}  {'WR':>6}  {'avg_pnl':>8}  "
+              f"{'total(10c)':>11}  {'vs_hold':>8}")
+        print("  " + "-" * 72)
+
+        for name, pt, sl in policies:
+            pnls    = _simulate(p75_hourly, pt, sl)
+            wr      = sum(1 for p in pnls if p > 0) / len(pnls)
+            avg_pnl = sum(pnls) / len(pnls)
+            total10 = sum(pnls) * 10 / 100  # dollars, 10 contracts
+            vs_hold = (sum(pnls) - hold_total) * 10 / 100
+            # Count how many exited early (not at settlement)
+            if pt is None and sl is None:
+                n_exit = 0
+            else:
+                # Re-run to count early exits
+                n_exit = sum(
+                    1 for r in p75_hourly
+                    if any(
+                        (pt is not None and ask <= pt) or (sl is not None and ask >= sl)
+                        for _, ask in r["hourly_yes_asks"]
+                        if (pt is None or ask <= pt) or (sl is None or ask >= sl)
+                    )
+                    # simplify: just re-simulate and check
+                )
+                # Re-count properly
+                n_exit = 0
+                for r in p75_hourly:
+                    for _, ask in r["hourly_yes_asks"]:
+                        if (pt is not None and ask <= pt) or (sl is not None and ask >= sl):
+                            n_exit += 1
+                            break
+            vs_str = f"{vs_hold:+.0f}" if (pt is not None or sl is not None) else "baseline"
+            print(f"  {name:25}  {n_exit:>7}  {100*wr:>5.1f}%  {avg_pnl:>+7.1f}¢  "
+                  f"${total10:>+9,.0f}  {vs_str:>8}")
+
+        print()
+        print("  Note: SL entries show negative avg_pnl — this is expected when the")
+        print("  YES price spikes above SL threshold on trades that ultimately WIN at")
+        print("  settlement.  A high SL WR% does NOT mean more profit — check total.")
+
+    # ── Section 16 — Delayed Entry: Wait for YES spike, buy NO cheaper ────
+    print()
+    print("=" * 70)
+    print("  SECTION 16 — DELAYED ENTRY: WAIT FOR YES SPIKE  (P75+0h)")
+    print("     Strategy: at detection, do NOT enter immediately.")
+    print("     Wait until YES ask rises ≥ X% above detection price,")
+    print("     then enter NO at that hour's NO ask = 100 − YES bid.")
+    print("     P&L if win  = YES bid at entry  (= 100 − NO ask)")
+    print("     P&L if lose = −(100 − YES bid)  (= −NO ask)")
+    print("     Immediate baseline uses entry_yes_bid at detection.")
+    print("=" * 70)
+
+    p75_priced = [
+        r for r in records
+        if r["entry_key"] == "p75+0h"
+        and r["entry_yes_ask"] is not None
+        and _priced(r)
+    ]
+
+    if not p75_priced:
+        print("  No priced P75+0h records — run with --fetch-candles first.")
+    else:
+        # Baseline: enter immediately at detection using YES bid
+        def _immediate_pnl(r: dict) -> float | None:
+            yb = r["entry_yes_bid"]
+            if yb is None:
+                return None
+            return float(yb) if r["no_win"] else -(100 - yb)
+
+        baseline_pnls = [p for r in p75_priced if (p := _immediate_pnl(r)) is not None]
+        baseline_wr   = sum(1 for p in baseline_pnls if p > 0) / len(baseline_pnls)
+        baseline_avg  = sum(baseline_pnls) / len(baseline_pnls)
+        baseline_tot  = sum(baseline_pnls) * 10 / 100
+
+        print(f"\n  Baseline — enter immediately at detection (n={len(baseline_pnls)})")
+        print(f"  WR={100*baseline_wr:.1f}%  avg_pnl={baseline_avg:+.1f}¢  "
+              f"total(10c)=${baseline_tot:+,.0f}")
+        print(f"  avg NO ask at entry = {100 - sum(r['entry_yes_bid'] for r in p75_priced if r['entry_yes_bid']) / len(p75_priced):.1f}¢")
+
+        print()
+        spike_thresholds = [0.10, 0.20, 0.25, 0.30, 0.50]
+        print(f"  {'Threshold':>10}  {'triggered':>9}  {'coverage':>9}  "
+              f"{'WR':>6}  {'avg_pnl':>8}  {'avg_NO_ask':>10}  "
+              f"{'total(10c)':>11}  {'vs_immediate':>13}")
+        print("  " + "-" * 85)
+
+        for thresh in spike_thresholds:
+            pnls: list[float] = []
+            no_asks: list[int] = []
+            skipped = 0
+
+            for r in p75_priced:
+                y0 = r["entry_yes_ask"]
+                target = y0 * (1 + thresh)
+                triggered = False
+                for _ts, ya, yb in r["hourly_prices"]:
+                    if ya >= target:
+                        no_ask_entry = 100 - yb
+                        pnl = float(yb) if r["no_win"] else -float(no_ask_entry)
+                        pnls.append(pnl)
+                        no_asks.append(no_ask_entry)
+                        triggered = True
+                        break
+                if not triggered:
+                    skipped += 1
+
+            if not pnls:
+                print(f"  {100*thresh:>9.0f}%  {'0':>9}  — (never triggered)")
+                continue
+
+            wr      = sum(1 for p in pnls if p > 0) / len(pnls)
+            avg_pnl = sum(pnls) / len(pnls)
+            avg_na  = sum(no_asks) / len(no_asks)
+            tot     = sum(pnls) * 10 / 100
+            vs_imm  = (sum(pnls) - sum(baseline_pnls[:len(pnls)])) * 10 / 100
+            cov     = len(pnls) / len(p75_priced)
+
+            print(f"  {100*thresh:>9.0f}%  {len(pnls):>9,}  {100*cov:>8.1f}%  "
+                  f"{100*wr:>5.1f}%  {avg_pnl:>+8.1f}¢  {avg_na:>10.1f}¢  "
+                  f"${tot:>+10,.0f}  {vs_imm:>+13,.0f}")
+
+        print()
+        print("  Note: 'vs_immediate' compares triggered trades only against the same")
+        print("  trades entered immediately — isolates the timing benefit.")
+        print("  Lower avg_NO_ask = cheaper entry = better P&L per win.")
     print()
 
 

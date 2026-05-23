@@ -128,6 +128,7 @@ from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
 from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
 from .nba_convergence import NBAConvergenceOpportunity
 from .band_arb_sizer import win_prob as band_arb_win_prob, kelly_scale as band_arb_kelly_scale
+from .band_arb_low_sizer import win_prob as band_arb_low_win_prob, kelly_scale as band_arb_low_kelly_scale
 
 
 # ---------------------------------------------------------------------------
@@ -2501,14 +2502,39 @@ class TradeExecutor:
         if self._circuit_breaker_tripped(signal.ticker, "BandArb"):
             return
 
-        # Kelly sizing: use LOCKED_OBS parameters — this is near-certain observed data
-        # win_prob for NO = 1 − p_yes ≈ 0.97 (NOAA_OBSERVED_MAX_P)
-        p_win = NOAA_OBSERVED_MAX_P  # P(NO wins) = P(band stays passed through)
+        # Kelly sizing: table-driven for warm-NO (KXLOWT), flat NOAA_OBSERVED_MAX_P otherwise.
+        if signal.metric.startswith("temp_low_"):
+            margin_f = signal.observed_max - signal.band_ceil
+            gfs_clearance = (
+                signal.gfs_morning_f - signal.band_ceil
+                if signal.gfs_morning_f is not None
+                else None
+            )
+            p_win = band_arb_low_win_prob(margin_f, gfs_clearance)
+            if p_win is None:
+                logging.info(
+                    "BandArb low-NO skip (sizer skip: margin=%.2f°F clearance=%s): %s",
+                    margin_f,
+                    f"{gfs_clearance:.2f}°F" if gfs_clearance is not None else "None",
+                    signal.ticker,
+                )
+                return
+            _low_kelly_frac = LOCKED_OBS_KELLY_FRACTION * band_arb_low_kelly_scale(margin_f)
+            logging.info(
+                "BandArb low-NO sizer: %s margin=%.2f°F clearance=%s → p=%.3f scale=%.2f",
+                signal.ticker, margin_f,
+                f"{gfs_clearance:.2f}°F" if gfs_clearance is not None else "None",
+                p_win, band_arb_low_kelly_scale(margin_f),
+            )
+        else:
+            p_win = NOAA_OBSERVED_MAX_P
+            _low_kelly_frac = LOCKED_OBS_KELLY_FRACTION
+
         count = kelly_contracts(
             win_prob=p_win,
             cost_cents=signal.no_ask,
             max_cents=min(max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents()),
-            kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
+            kelly_fraction=_low_kelly_frac,
             hard_cap=LOCKED_OBS_MAX_CONTRACTS,
         )
         if count == 0:
@@ -2518,8 +2544,7 @@ class TradeExecutor:
             )
             return
 
-        # Hard cap for low-temp NO trades: Kelly oversizes expensive NO contracts
-        # because payout ratio is unfavorable but win probability looks high.
+        # Hard cap for low-temp NO trades.
         if signal.metric.startswith("temp_low_") and count > 10:
             logging.info(
                 "BandArb low-NO cap: %s count %d → 10 (temp_low hard cap)",
@@ -2572,7 +2597,7 @@ class TradeExecutor:
             score=1.0,       # near-certain observed signal
             p_estimate=p_win,
             source="band_arb",
-            kelly_fraction=LOCKED_OBS_KELLY_FRACTION,
+            kelly_fraction=_low_kelly_frac,
             yes_bid=signal.yes_bid,
             yes_ask=signal.yes_ask_entry or None,
             corroborating_sources=_band_corr,
