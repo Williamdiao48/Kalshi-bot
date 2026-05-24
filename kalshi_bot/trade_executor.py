@@ -394,6 +394,13 @@ ADDON_MAX_TOTAL_CONTRACTS: int = env_int("ADDON_MAX_TOTAL_CONTRACTS", 20)
 # Locked (post-4:30 PM): flat LOCKED_P mirrors band_arb NO confidence level.
 BAND_ARB_YES_BASE_P: float = env_float("BAND_ARB_YES_BASE_P", 0.62)
 BAND_ARB_YES_LOCKED_P: float = env_float("BAND_ARB_YES_LOCKED_P", 0.88)
+# Flat win probability for KXLOWT YES entries.
+# Backtest (Mar–May 2026, P75 entry, n=263): 85.6% WR → Laplace-smoothed 0.84.
+# Price is the dominant discriminative variable (Section 5); cold_gap and trend
+# show <2pp WR difference — insufficient for a reliable 2D sizer at current n.
+# Min ask gate of 30¢ cuts the 69.7% WR sub-30¢ bucket; all remaining trades
+# are 82%+ WR. Sized at KELLY_FRACTION (0.25) — conservative for a new tier.
+BAND_ARB_LOW_YES_P: float = env_float("BAND_ARB_LOW_YES_P", 0.84)
 
 # Maximum total cost basis across all currently open positions (cents).
 # Guards against correlated blowup when many weather markets are open
@@ -2611,13 +2618,19 @@ class TradeExecutor:
     ) -> None:
         """Execute or log a band-arb YES trade.
 
-        Two tiers:
+        KXHIGHT YES — two tiers:
           Pre-lock  (is_locked=False): dynamic p_win based on clearance from
                     band boundaries and time remaining until close.  Normal
                     Kelly sizing with profit-take enabled.
-          Locked    (is_locked=True):  post-4:30 PM local — daily high is
-                    confirmed inside the band.  Flat p_win=BAND_ARB_YES_LOCKED_P,
-                    LOCKED_OBS sizing (aggressive), hold to settlement.
+          Locked    (is_locked=True):  post-P75 local — daily high confirmed
+                    inside the band.  Flat p_win from sizer, LOCKED_OBS sizing.
+
+        KXLOWT YES — single tier:
+          Entry after morning trough lock hour, running daily min inside the
+          band, NOAA corroborated.  Flat p_win=BAND_ARB_LOW_YES_P (backtest
+          85.6% WR Laplace-smoothed), KELLY_FRACTION sizing (conservative).
+          is_locked is always False for this tier; no locked path exists because
+          the overnight low can still drop until market close.
         """
         # Add-on guard — same pattern as band_arb NO
         _yes_existing = self._open_contracts_on_ticker(signal.ticker, "yes")
@@ -2660,41 +2673,54 @@ class TradeExecutor:
         if self._circuit_breaker_tripped(signal.ticker, "BandArb YES"):
             return
 
-        # Compute p_win from lookup table (keyed on overshoot vs GFS morning forecast)
-        overshoot_f = (
-            signal.observed_max - signal.gfs_morning_f
-            if signal.gfs_morning_f is not None
-            else None
-        )
-        sizer_p = band_arb_win_prob(overshoot_f, signal.is_rising)
-        if sizer_p is None:
-            logging.info(
-                "BandArb YES skip (lag > 1.5°F: overshoot=%.2f°F): %s",
-                overshoot_f, signal.ticker,
-            )
-            return
-        _sizer_kelly_scale = band_arb_kelly_scale(overshoot_f, signal.is_rising)
+        is_low_yes = signal.metric.startswith("temp_low_")
 
-        # Compute sizing parameters
-        from .strike_arb import BAND_ARB_YES_MAX_HOURS_PRELOCK as _YES_MAX_HTC
-        if signal.is_locked:
-            p_win      = sizer_p
-            kelly_frac = LOCKED_OBS_KELLY_FRACTION * _sizer_kelly_scale
-            max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
-            hard_cap   = LOCKED_OBS_MAX_CONTRACTS
+        if is_low_yes:
+            # KXLOWT YES: flat probability calibrated from backtest (Section 5,
+            # P75 entry, min ask 30¢, n=197 priced trades, 88%+ WR in all
+            # non-skip price buckets). No 2D sizer — cold_gap and trend show
+            # <2pp WR difference, insufficient to justify extra complexity.
+            p_win            = BAND_ARB_LOW_YES_P
+            kelly_frac       = KELLY_FRACTION
+            max_cents        = max(1, int(MAX_POSITION_CENTS * _dd_factor))
+            hard_cap         = TRADE_MAX_CONTRACTS
+            overshoot_f      = None
+            _sizer_kelly_scale = 1.0
         else:
-            min_clearance = min(
-                signal.observed_max - signal.strike_lo,
-                signal.band_ceil - signal.observed_max,
+            # KXHIGHT YES: sizer keyed on overshoot vs GFS morning forecast.
+            overshoot_f = (
+                signal.observed_max - signal.gfs_morning_f
+                if signal.gfs_morning_f is not None
+                else None
             )
-            clearance_factor = min(0.20, min_clearance / 5.0)
-            _htc = signal.hours_to_close
-            _max_htc = max(_YES_MAX_HTC, 0.001)
-            time_factor = 0.10 * (1.0 - _htc / _max_htc)
-            p_win = min(sizer_p, BAND_ARB_YES_BASE_P + clearance_factor + time_factor)
-            kelly_frac = KELLY_FRACTION
-            max_cents  = max(1, int(MAX_POSITION_CENTS * _dd_factor))
-            hard_cap   = TRADE_MAX_CONTRACTS
+            sizer_p = band_arb_win_prob(overshoot_f, signal.is_rising)
+            if sizer_p is None:
+                logging.info(
+                    "BandArb YES skip (lag > 1.5°F: overshoot=%.2f°F): %s",
+                    overshoot_f, signal.ticker,
+                )
+                return
+            _sizer_kelly_scale = band_arb_kelly_scale(overshoot_f, signal.is_rising)
+
+            from .strike_arb import BAND_ARB_YES_MAX_HOURS_PRELOCK as _YES_MAX_HTC
+            if signal.is_locked:
+                p_win      = sizer_p
+                kelly_frac = LOCKED_OBS_KELLY_FRACTION * _sizer_kelly_scale
+                max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
+                hard_cap   = LOCKED_OBS_MAX_CONTRACTS
+            else:
+                min_clearance = min(
+                    signal.observed_max - signal.strike_lo,
+                    signal.band_ceil - signal.observed_max,
+                )
+                clearance_factor = min(0.20, min_clearance / 5.0)
+                _htc     = signal.hours_to_close
+                _max_htc = max(_YES_MAX_HTC, 0.001)
+                time_factor = 0.10 * (1.0 - _htc / _max_htc)
+                p_win      = min(sizer_p, BAND_ARB_YES_BASE_P + clearance_factor + time_factor)
+                kelly_frac = KELLY_FRACTION
+                max_cents  = max(1, int(MAX_POSITION_CENTS * _dd_factor))
+                hard_cap   = TRADE_MAX_CONTRACTS
 
         count = kelly_contracts(
             win_prob=p_win,
@@ -2710,15 +2736,28 @@ class TradeExecutor:
             )
             return
 
-        _trend_lbl = "rising" if signal.is_rising else ("plateaued" if signal.is_rising is False else "trend=?")
         if not BAND_ARB_EXECUTION_ENABLED:
-            logging.info(
-                "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f  ov=%.2f°F  %s  kelly_scale=%.2f",
-                "locked" if signal.is_locked else "pre-lock",
-                signal.ticker, count, signal.yes_ask, p_win,
-                overshoot_f if overshoot_f is not None else float("nan"),
-                _trend_lbl, _sizer_kelly_scale,
-            )
+            if is_low_yes:
+                logging.info(
+                    "BandArb LOW-YES DETECT-ONLY: %s YES×%d @ %d¢  p=%.2f"
+                    "  margin_lo=%.1f°F  margin_hi=%.1f°F",
+                    signal.ticker, count, signal.yes_ask, p_win,
+                    signal.observed_max - signal.strike_lo,
+                    signal.band_ceil - signal.observed_max,
+                )
+            else:
+                _trend_lbl = (
+                    "rising" if signal.is_rising
+                    else ("plateaued" if signal.is_rising is False else "trend=?")
+                )
+                logging.info(
+                    "BandArb YES DETECT-ONLY (%s): %s YES×%d @ %d¢  p=%.2f"
+                    "  ov=%.2f°F  %s  kelly_scale=%.2f",
+                    "locked" if signal.is_locked else "pre-lock",
+                    signal.ticker, count, signal.yes_ask, p_win,
+                    overshoot_f if overshoot_f is not None else float("nan"),
+                    _trend_lbl, _sizer_kelly_scale,
+                )
             return
 
         if MAX_TOTAL_EXPOSURE_CENTS > 0:
@@ -2734,13 +2773,22 @@ class TradeExecutor:
                 return
 
         self.stats.trades_attempted += 1
-        score = 1.0 if signal.is_locked else round(0.70 + p_win * 0.15, 2)
-        logging.info(
-            "BandArb YES: %s  obs=%.1f°F in [%.1f–%.1f]  YES×%d @ %d¢  p=%.2f  (%s)",
-            signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
-            count, signal.yes_ask, p_win,
-            "locked" if signal.is_locked else "pre-lock",
-        )
+        if is_low_yes:
+            score = round(0.70 + p_win * 0.15, 2)
+            logging.info(
+                "BandArb LOW-YES: %s  obs_min=%.1f°F in [%.1f–%.1f]"
+                "  YES×%d @ %d¢  p=%.2f  %.1fh to close",
+                signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
+                count, signal.yes_ask, p_win, signal.hours_to_close,
+            )
+        else:
+            score = 1.0 if signal.is_locked else round(0.70 + p_win * 0.15, 2)
+            logging.info(
+                "BandArb YES: %s  obs=%.1f°F in [%.1f–%.1f]  YES×%d @ %d¢  p=%.2f  (%s)",
+                signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
+                count, signal.yes_ask, p_win,
+                "locked" if signal.is_locked else "pre-lock",
+            )
 
         # Corroborating sources: YES always requires NOAA (enforced upstream)
         _yes_corr: list[str] = ["metar", "noaa_observed"]
