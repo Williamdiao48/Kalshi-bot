@@ -204,6 +204,14 @@ BAND_ARB_YES_BLACKLIST_CITIES: frozenset[str] = frozenset(
 )
 # Pre-lock: only fire within this many hours of close
 BAND_ARB_YES_MAX_HOURS_PRELOCK: float = env_float("BAND_ARB_YES_MAX_HOURS_PRELOCK", 6.0)
+# Early entry: fire up to this many minutes before the P75 lock point when
+# the running max is already OVERSHOT (past GFS morning forecast) AND still rising.
+# Backtest (Feb–May 2026): P75-1h overshot WR=74.5% avg=+24.4¢ vs P75 all WR=70.3%.
+# Best sub-filter (overshot+rising+price≥40): 95.8% WR, +25.7¢.
+BAND_ARB_YES_EARLY_ENTRY_ENABLED: bool = env_bool("BAND_ARB_YES_EARLY_ENTRY_ENABLED", True)
+BAND_ARB_YES_EARLY_ENTRY_MINUTES: int = env_int("BAND_ARB_YES_EARLY_ENTRY_MINUTES", 60)
+# Min YES ask for early entries (backtest: 40¢+ overshot profitable; keep below normal 50¢ min)
+BAND_ARB_YES_EARLY_MIN_YES_ASK: int = env_int("BAND_ARB_YES_EARLY_MIN_YES_ASK", 40)
 # Max YES ask to enter (market already priced in above this). Default: 85¢
 BAND_ARB_YES_MAX_YES_ASK: int = env_int("BAND_ARB_YES_MAX_YES_ASK", 85)
 # Min YES ask (no edge if market is already near-certain YES). Default: 10¢
@@ -651,6 +659,20 @@ def _is_past_lock(city_tz, metric: str | None = None) -> bool:
             return local_now.hour * 60 + local_now.minute >= p75
     lock_mins = BAND_ARB_YES_LOCK_LOCAL_HOUR * 60 + BAND_ARB_YES_LOCK_LOCAL_MINUTE
     return local_now.hour * 60 + local_now.minute >= lock_mins
+
+
+def _minutes_until_lock(city_tz, metric: str | None = None) -> int | None:
+    """Minutes remaining until the P75 lock point, or None if already past."""
+    local_now = datetime.now(city_tz)
+    current_mins = local_now.hour * 60 + local_now.minute
+    if metric is not None:
+        p75 = _BAND_ARB_P75_MINUTES.get(metric, {}).get(local_now.month)
+        if p75 is not None:
+            delta = p75 - current_mins
+            return delta if delta > 0 else None
+    lock_mins = BAND_ARB_YES_LOCK_LOCAL_HOUR * 60 + BAND_ARB_YES_LOCK_LOCAL_MINUTE
+    delta = lock_mins - current_mins
+    return delta if delta > 0 else None
 
 
 def is_past_p90(metric: str, city_tz) -> bool:
@@ -1200,7 +1222,7 @@ def find_band_arbs(
                 )
                 continue
 
-            # Determine if we're past the 4:30 PM daily-high lock point
+            # Determine if we're past the P75 daily-high lock point
             _lookup_metric_yes = parsed.metric.replace("temp_low_", "temp_high_")
             _city_info_yes = CITIES.get(_lookup_metric_yes)
             if _city_info_yes is None:
@@ -1208,23 +1230,50 @@ def find_band_arbs(
             _city_tz_yes = _city_info_yes[3]
             locked = _is_past_lock(_city_tz_yes, metric=parsed.metric)
 
-            # Time gate: before lock, only fire within BAND_ARB_YES_MAX_HOURS_PRELOCK of close
+            # GFS morning gate (needed for both time gate and sizer)
+            _gfs_f = (gfs_morning_values or {}).get(parsed.metric)
+            _gfs_lagging: bool | None = None
+            if _gfs_f is not None:
+                _gfs_lagging = observed_max < _gfs_f
+
+            # Rising flag for early-entry gate
+            _is_rising_now = (metar_is_rising or {}).get(parsed.metric)
+
+            # Time gate: three paths allowed —
+            #   (a) Locked (past P75): always fire.
+            #   (b) Pre-lock, within BAND_ARB_YES_MAX_HOURS_PRELOCK of close: fire.
+            #   (c) Early entry: within BAND_ARB_YES_EARLY_ENTRY_MINUTES of P75 lock,
+            #       AND overshot (running max ≥ GFS morning forecast) AND still rising.
+            #       Backtest: P75-1h overshot+rising+price≥40¢ → 95.8% WR, +25.7¢.
             close_time_str = mkt.get("close_time") or mkt.get("expiration_time", "")
             htc = _hours_to_close(close_time_str)
             if htc is None:
                 continue
-            if not locked and htc > BAND_ARB_YES_MAX_HOURS_PRELOCK:
-                continue
+            if not locked:
+                _mins_to_lock = _minutes_until_lock(_city_tz_yes, metric=parsed.metric)
+                _early_entry = (
+                    BAND_ARB_YES_EARLY_ENTRY_ENABLED
+                    and _mins_to_lock is not None
+                    and _mins_to_lock <= BAND_ARB_YES_EARLY_ENTRY_MINUTES
+                    and _gfs_lagging is False   # overshot: running max ≥ GFS forecast
+                    and _is_rising_now is True  # spot still at/near running max
+                )
+                if not _early_entry and htc > BAND_ARB_YES_MAX_HOURS_PRELOCK:
+                    continue
+            else:
+                _early_entry = False
 
-            # YES ask pricing gate (both tiers)
+            # YES ask pricing gate — lower minimum for early entries (market not yet fully priced)
             yes_ask_raw = mkt.get("yes_ask")
             if yes_ask_raw is None:
                 continue
             yes_ask_int = int(yes_ask_raw)
-            if yes_ask_int < BAND_ARB_YES_MIN_YES_ASK or yes_ask_int > BAND_ARB_YES_MAX_YES_ASK:
+            _min_ask = BAND_ARB_YES_EARLY_MIN_YES_ASK if _early_entry else BAND_ARB_YES_MIN_YES_ASK
+            if yes_ask_int < _min_ask or yes_ask_int > BAND_ARB_YES_MAX_YES_ASK:
                 logging.debug(
-                    "BandArb YES skip: %s — yes_ask=%d outside [%d, %d]",
-                    ticker, yes_ask_int, BAND_ARB_YES_MIN_YES_ASK, BAND_ARB_YES_MAX_YES_ASK,
+                    "BandArb YES skip: %s — yes_ask=%d outside [%d, %d]%s",
+                    ticker, yes_ask_int, _min_ask, BAND_ARB_YES_MAX_YES_ASK,
+                    " (early-entry)" if _early_entry else "",
                 )
                 continue
 
@@ -1246,9 +1295,11 @@ def find_band_arbs(
             city_yes = mkt.get("subtitle", "") or ticker
             logging.info(
                 "BandArb YES signal (%s): %s  obs=%.1f°F in [%.1f–%.1f]"
-                "  YES_ask=%d¢  %.1fh to close",
-                "LOCKED" if locked else "pre-lock", ticker,
-                observed_max, parsed.strike_lo, parsed.strike_hi, yes_ask_int, htc,
+                "  YES_ask=%d¢  %.1fh to close%s",
+                "LOCKED" if locked else ("early-entry" if _early_entry else "pre-lock"),
+                ticker, observed_max, parsed.strike_lo, parsed.strike_hi, yes_ask_int, htc,
+                f"  [overshot+rising, {_minutes_until_lock(_city_tz_yes, metric=parsed.metric)}min to lock]"
+                if _early_entry else "",
             )
             # YES always requires NOAA corroboration (checked above).
             # Use lower bound of noaa_val_yes: "corroborated" only if even the
@@ -1258,11 +1309,7 @@ def find_band_arbs(
                 _yes_corr_status = "metar_noaa_corroborated"
             else:
                 _yes_corr_status = "metar_noaa_lagging"
-            # GFS morning gate: compare METAR running max against frozen morning forecast
-            _gfs_f = (gfs_morning_values or {}).get(parsed.metric)
-            _gfs_lagging: bool | None = None
             if _gfs_f is not None:
-                _gfs_lagging = observed_max < _gfs_f
                 logging.debug(
                     "BandArb YES GFS gate %s: obs=%.1f°F  gfs_morning=%.1f°F  %s",
                     ticker, observed_max, _gfs_f,
