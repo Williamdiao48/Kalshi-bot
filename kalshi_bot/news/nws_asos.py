@@ -85,6 +85,23 @@ _station_cache: dict[str, tuple[float, list[DataPoint]]] = {}
 # Reverse map: ICAO → metric key (same as metar.py builds internally)
 _STATION_TO_METRIC: dict[str, str] = {v: k for k, v in KALSHI_STATION_IDS.items()}
 
+# Staging buffer for asos_poll_log rows from the last fetch_city_observations call.
+# Each entry is an 11-tuple matching the asos_poll_log INSERT order:
+# (logged_at, obs_at, station, metric, daily_max_f, precise_max_f,
+#  synoptic_celsius_max, obs_count, cache_hit, cache_age_s, force_refresh)
+_pending_poll_rows: list[tuple] = []
+
+
+def take_poll_rows() -> list[tuple]:
+    """Return ASOS poll log rows from the last fetch and clear the buffer.
+
+    Called by main.py after fetch_city_observations() to retrieve rows for
+    asos_poll_log.  Covers both cache hits and fresh API calls.
+    """
+    rows = _pending_poll_rows[:]
+    _pending_poll_rows.clear()
+    return rows
+
 
 def _lst_tz(city_tz: ZoneInfo) -> timezone:
     """Fixed-offset timezone for NWS Local Standard Time (no DST)."""
@@ -276,6 +293,7 @@ async def _fetch_station(
                 "six_hr_max_f":         six_hr_max_f,
                 "synoptic_celsius_max": daily_max_celsius_int,
                 "precise_max_f":        daily_max_f_precise,
+                "latest_ts":            latest_ts,
             },
         )
     ]
@@ -299,6 +317,10 @@ async def fetch_city_observations(
 
     now = time.monotonic()
     now_utc = datetime.now(timezone.utc)
+    logged_at = now_utc.isoformat()
+    _is_force = force or should_force_refresh(now_utc)
+
+    _pending_poll_rows.clear()
 
     tasks = []
     cached_results: list[DataPoint] = []
@@ -307,6 +329,23 @@ async def fetch_city_observations(
         cached = _station_cache.get(icao)
         if not force and cached is not None and (now - cached[0]) < NWS_ASOS_CACHE_SECONDS:
             cached_results.extend(cached[1])
+            # Emit a cache-hit poll row using the cached DataPoint's metadata.
+            cache_age = now - cached[0]
+            for dp in cached[1]:
+                meta = dp.metadata or {}
+                _pending_poll_rows.append((
+                    logged_at,
+                    None,                              # obs_at unknown for cache hit
+                    meta.get("station", icao),
+                    dp.metric,
+                    meta.get("observed_max"),
+                    meta.get("precise_max_f"),
+                    meta.get("synoptic_celsius_max"),
+                    meta.get("obs_count"),
+                    1,                                 # cache_hit
+                    round(cache_age, 1),
+                    1 if _is_force else 0,
+                ))
             continue
         city_entry = CITIES.get(metric_key)
         if city_entry is None:
@@ -333,6 +372,22 @@ async def fetch_city_observations(
             logging.debug("NWS ASOS gather error: %s", r)
         elif isinstance(r, list):
             fresh_points.extend(r)
+            # Emit fresh-fetch poll rows for each station's DataPoint.
+            for dp in r:
+                meta = dp.metadata or {}
+                _pending_poll_rows.append((
+                    logged_at,
+                    meta.get("latest_ts"),             # obs_at from NWS API
+                    meta.get("station", ""),
+                    dp.metric,
+                    meta.get("observed_max"),
+                    meta.get("precise_max_f"),
+                    meta.get("synoptic_celsius_max"),
+                    meta.get("obs_count"),
+                    0,                                 # cache_hit
+                    None,                              # cache_age_s not applicable
+                    1 if _is_force else 0,
+                ))
 
     all_points = cached_results + fresh_points
     logging.debug("NWS ASOS: %d DataPoint(s) across %d station(s).", len(all_points), len(KALSHI_STATION_IDS))

@@ -1711,8 +1711,14 @@ async def _poll(
         opp_log.log_raw_forecasts(numeric_opps)
     if not isinstance(metar_result, Exception) and metar_result:
         opp_log.log_metar_6hr_obs(metar_result)
+        _metar_obs = metar.take_obs_rows()
+        if _metar_obs:
+            opp_log.log_metar_obs(_metar_obs)
     if not isinstance(nws_asos_result, Exception) and nws_asos_result:
         opp_log.log_asos_obs(nws_asos_result)
+    _asos_poll = nws_asos.take_poll_rows()
+    if _asos_poll:
+        opp_log.log_asos_poll(_asos_poll)
 
     # ---- Crypto price log (mean reversion validation dataset) ---------------
     # Log YES bid/ask for KXBTC15M/KXETH15M/KXSOL15M alongside Coinbase spot
@@ -3063,6 +3069,21 @@ async def _fast_loop(
                     ledger.request_force_exit(_row_ticker, f"asos_ceiling_breach@{_cur_obs:.1f}F")
         except Exception as _exc:
             logging.debug("Fast loop: ASOS ceiling-breach check failed: %s", _exc)
+
+    # Log ASOS poll rows (cache hits and fresh fetches) gathered this fast-loop cycle.
+    try:
+        _fast_asos_poll = nws_asos.take_poll_rows()
+        if _fast_asos_poll:
+            opp_log.log_asos_poll(_fast_asos_poll)
+    except Exception as _exc:
+        logging.debug("Fast loop: ASOS poll log failed: %s", _exc)
+
+    # Write price snapshots for open positions at fast-loop cadence (~10s).
+    if TRADE_DRY_RUN and ledger is not None:
+        try:
+            ledger.write_fast_snapshots()
+        except Exception as _exc:
+            logging.debug("Fast loop: price snapshot write failed: %s", _exc)
 
     # Floor-breach exit for KXLOWT YES positions:
     # If the running daily min drops below band_lo_f - 0.5°F, the official low

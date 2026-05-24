@@ -69,6 +69,43 @@ RETENTION_PRICE_SNAPSHOTS_DAYS: int = env_int("RETENTION_PRICE_SNAPSHOTS_DAYS", 
 RETENTION_NBA_SNAPSHOTS_DAYS: int = env_int("RETENTION_NBA_SNAPSHOTS_DAYS", 90)
 RETENTION_CRYPTO_PRICE_LOG_DAYS: int = env_int("RETENTION_CRYPTO_PRICE_LOG_DAYS", 90)
 
+_CREATE_METAR_OBS_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS metar_obs_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    station    TEXT NOT NULL,   -- ICAO e.g. "KMIA"
+    metric     TEXT NOT NULL,   -- e.g. "temp_high_mia"
+    obs_at     TEXT NOT NULL,   -- UTC ISO-8601 timestamp of the individual observation
+    temp_f     REAL NOT NULL    -- temperature in °F (0.1°C precision, from ADDS API)
+)
+"""
+
+_CREATE_METAR_OBS_LOG_IDX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_metar_obs_station_obs_at
+    ON metar_obs_log (station, obs_at)
+"""
+
+_CREATE_ASOS_POLL_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS asos_poll_log (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    logged_at            TEXT    NOT NULL,
+    obs_at               TEXT,
+    station              TEXT    NOT NULL,
+    metric               TEXT    NOT NULL,
+    daily_max_f          REAL,
+    precise_max_f        REAL,
+    synoptic_celsius_max INTEGER,
+    obs_count            INTEGER,
+    cache_hit            INTEGER NOT NULL,
+    cache_age_s          REAL,
+    force_refresh        INTEGER
+)
+"""
+
+_CREATE_ASOS_POLL_LOG_IDX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_asos_poll_station_logged
+    ON asos_poll_log (station, logged_at)
+"""
+
 _CREATE_CRYPTO_PRICE_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS crypto_price_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,6 +301,8 @@ class OpportunityLog:
             ("price_snapshots",  "snapshot_at", RETENTION_PRICE_SNAPSHOTS_DAYS),
             ("nba_snapshots",    "logged_at",   RETENTION_NBA_SNAPSHOTS_DAYS),
             ("crypto_price_log", "logged_at",   RETENTION_CRYPTO_PRICE_LOG_DAYS),
+            ("metar_obs_log",    "obs_at",      RETENTION_RAW_FORECASTS_DAYS),
+            ("asos_poll_log",    "logged_at",   RETENTION_RAW_FORECASTS_DAYS),
         ]
         total = 0
         for table, ts_col, days in thresholds:
@@ -302,6 +341,10 @@ class OpportunityLog:
         self._conn.execute(_CREATE_SUPPRESSION_IDX_SQL)
         self._conn.execute(_CREATE_CRYPTO_PRICE_LOG_SQL)
         self._conn.execute(_CREATE_CRYPTO_PRICE_LOG_IDX_SQL)
+        self._conn.execute(_CREATE_METAR_OBS_LOG_SQL)
+        self._conn.execute(_CREATE_METAR_OBS_LOG_IDX_SQL)
+        self._conn.execute(_CREATE_ASOS_POLL_LOG_SQL)
+        self._conn.execute(_CREATE_ASOS_POLL_LOG_IDX_SQL)
 
     # -----------------------------------------------------------------------
     # Cross-cycle deduplication
@@ -449,6 +492,46 @@ class OpportunityLog:
                 """,
                 rows,
             )
+
+    def log_metar_obs(self, obs_rows: "list[tuple[str, str, str, float]]") -> None:
+        """Insert individual METAR observations into metar_obs_log.
+
+        Each row is (station, metric, obs_at_iso, temp_f).  Uses INSERT OR IGNORE
+        on the unique (station, obs_at) index so repeated calls across poll cycles
+        are safe — only new observations are written.
+
+        Args:
+            obs_rows: list of (station, metric, obs_at, temp_f) tuples.
+                      obs_at is UTC ISO-8601 string; temp_f is °F float.
+        """
+        if not obs_rows:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO metar_obs_log (station, metric, obs_at, temp_f) VALUES (?, ?, ?, ?)",
+            obs_rows,
+        )
+
+    def log_asos_poll(self, poll_rows: "list[tuple]") -> None:
+        """Insert one row per station per ASOS poll into asos_poll_log.
+
+        Each tuple: (logged_at, obs_at, station, metric, daily_max_f,
+                     precise_max_f, synoptic_celsius_max, obs_count,
+                     cache_hit, cache_age_s, force_refresh).
+
+        Args:
+            poll_rows: list of 11-tuples as described above.
+        """
+        if not poll_rows:
+            return
+        self._conn.executemany(
+            """
+            INSERT INTO asos_poll_log
+                (logged_at, obs_at, station, metric, daily_max_f, precise_max_f,
+                 synoptic_celsius_max, obs_count, cache_hit, cache_age_s, force_refresh)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            poll_rows,
+        )
 
     def log_crypto_prices(
         self,

@@ -1011,7 +1011,7 @@ class ExitManager:
                     _current_exit_price, BAND_ARB_NO_EXIT_PRICE_CENTS,
                 )
                 reason = "profit_take"
-                detail = "profit_take:band_arb_abs_price"
+                detail = f"profit_take:band_arb_abs_price:bid={getattr(trade, 'yes_bid', None)}:thresh={BAND_ARB_NO_EXIT_PRICE_CENTS}"
 
             # Absolute YES-bid profit-take for band_arb:yes.
             # Locks in near-settlement value and guards against a late market flip
@@ -1032,7 +1032,7 @@ class ExitManager:
                     trade.current_mid, BAND_ARB_YES_EXIT_PRICE_CENTS,
                 )
                 reason = "profit_take"
-                detail = "profit_take:band_arb_abs_price"
+                detail = f"profit_take:band_arb_abs_price:bid={getattr(trade, 'yes_bid', None)}:thresh={BAND_ARB_YES_EXIT_PRICE_CENTS}"
 
             # ---- NBA Pinnacle convergence exits --------------------------------
             # Applied before standard profit-take so the convergence target is
@@ -1079,10 +1079,12 @@ class ExitManager:
                 detail = f"profit_take:forecast_no@{FORECAST_NO_PROFIT_TAKE:.0%}"
             elif reason is None and not suppress_profit_take and pct >= profit_take_thresh:
                 reason = "profit_take"
-                detail = self._profit_take_detail(src, side, entry_cost)
+                _bid_pt = getattr(trade, "yes_bid", None)
+                detail = f"{self._profit_take_detail(src, side, entry_cost)}:bid={_bid_pt}:thresh={profit_take_thresh:.4g}"
             elif reason is None and stop_loss_thresh > 0 and pct <= -stop_loss_thresh:
                 reason = "stop_loss"
-                detail = _sl_detail
+                _bid_sl = getattr(trade, "yes_bid", None)
+                detail = f"{_sl_detail}:bid={_bid_sl}:thresh={stop_loss_thresh:.4g}"
             elif reason is None and (EXIT_TRAILING_DRAWDOWN > 0 or (src in EXIT_SOURCE_TRAILING_DRAWDOWN or f"{src}:{side}" in EXIT_SOURCE_TRAILING_DRAWDOWN)) and not ("KXLOWT" in _ticker and side == "yes"):
                 # Trailing stop is NOT gated by suppress_profit_take.
                 #
@@ -1136,7 +1138,8 @@ class ExitManager:
                         and pct < peak - drawdown_thresh  # drawn back by threshold
                     ):
                         reason = "trailing_stop"
-                        detail = "trailing_stop"
+                        _bid_ts = getattr(trade, "yes_bid", None)
+                        detail = f"trailing_stop:bid={_bid_ts}:thresh={drawdown_thresh:.4g}"
 
             if reason is None:
                 continue

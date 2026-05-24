@@ -2510,6 +2510,7 @@ class TradeExecutor:
             return
 
         # Kelly sizing: table-driven for warm-NO (KXLOWT), flat NOAA_OBSERVED_MAX_P otherwise.
+        gfs_clearance: float | None = None
         if signal.metric.startswith("temp_low_"):
             margin_f = signal.observed_max - signal.band_ceil
             gfs_clearance = (
@@ -2580,12 +2581,16 @@ class TradeExecutor:
 
         # Encode signal snapshot as JSON note for future analysis
         _note_data: dict = {
-            "metric":        signal.metric,
-            "observed_f":    round(signal.observed_max, 1),
-            "band_ceil_f":   round(signal.band_ceil,   1),
-            "margin_f":      round(signal.observed_max - signal.band_ceil, 2),
-            "corr_status":   signal.corr_status,
+            "metric":         signal.metric,
+            "observed_f":     round(signal.observed_max, 1),
+            "band_ceil_f":    round(signal.band_ceil,   1),
+            "margin_f":       round(signal.observed_max - signal.band_ceil, 2),
+            "corr_status":    signal.corr_status,
+            "is_rising":      signal.is_rising,
+            "hours_to_close": round(signal.hours_to_close, 2) if signal.hours_to_close is not None else None,
         }
+        if gfs_clearance is not None:
+            _note_data["gfs_clearance"] = round(gfs_clearance, 2)
         if signal.noaa_val is not None:
             _note_data["noaa_val_f"] = round(signal.noaa_val, 1)
         if signal.hrrr_val is not None:
@@ -2797,15 +2802,23 @@ class TradeExecutor:
 
         # Signal snapshot note
         _yes_note: dict = {
-            "metric":      signal.metric,
-            "observed_f":  round(signal.observed_max, 1),
-            "band_lo_f":   round(signal.strike_lo,    1),
-            "band_ceil_f": round(signal.band_ceil,    1),
-            "margin_lo_f": round(signal.observed_max - signal.strike_lo, 2),
-            "margin_hi_f": round(signal.band_ceil - signal.observed_max, 2),
-            "is_locked":   signal.is_locked,
-            "corr_status": signal.corr_status,
+            "metric":       signal.metric,
+            "observed_f":   round(signal.observed_max, 1),
+            "band_lo_f":    round(signal.strike_lo,    1),
+            "band_ceil_f":  round(signal.band_ceil,    1),
+            "margin_lo_f":  round(signal.observed_max - signal.strike_lo, 2),
+            "margin_hi_f":  round(signal.band_ceil - signal.observed_max, 2),
+            "is_locked":    signal.is_locked,
+            "corr_status":  signal.corr_status,
+            "is_rising":    signal.is_rising,
+            "hours_to_close": round(signal.hours_to_close, 2) if signal.hours_to_close is not None else None,
+            "kelly_scale":  round(_sizer_kelly_scale, 3),
         }
+        if overshoot_f is not None:
+            _yes_note["overshoot_f"] = round(overshoot_f, 2)
+        _asos_max = (signal.metadata or {}).get("asos_observed_max")
+        if _asos_max is not None:
+            _yes_note["asos_max_f"] = round(_asos_max, 1)
         if signal.noaa_val is not None:
             _yes_note["noaa_val_f"] = round(signal.noaa_val, 1)
         if signal.hrrr_val is not None:

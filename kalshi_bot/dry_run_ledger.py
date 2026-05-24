@@ -1061,6 +1061,15 @@ class DryRunLedger:
             len(rows), n_post,
         )
 
+    def write_fast_snapshots(self) -> None:
+        """Write price snapshot rows for all open positions at fast-loop cadence.
+
+        Uses the already-enriched _current_open_trades list (prices from the
+        last slow-loop _enrich call) so no additional API calls are made.
+        Called from _fast_loop() in main.py every ~10 seconds.
+        """
+        self._write_snapshots(self._current_open_trades)
+
     def _build_overview(self, trades: list[_Trade]) -> str:
         W = "=" * 68
         S = "-" * 68

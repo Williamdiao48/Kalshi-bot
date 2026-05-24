@@ -88,6 +88,23 @@ def _lst_tz(city_tz: ZoneInfo) -> timezone:
 _cache_time: float = 0.0
 _cache_points: list[DataPoint] = []
 
+# Staging buffer for individual METAR observations from the last fresh API fetch.
+# Populated inside fetch_city_forecasts() on cache misses; consumed by take_obs_rows().
+# Each entry: (station, metric, obs_at_iso, temp_f)
+_pending_obs_rows: list[tuple[str, str, str, float]] = []
+
+
+def take_obs_rows() -> list[tuple[str, str, str, float]]:
+    """Return individual METAR observation rows from the last fresh API fetch and clear the buffer.
+
+    Called by main.py after fetch_city_forecasts() to retrieve rows for
+    metar_obs_log.  Returns an empty list on cache hits or if no fresh data
+    is available.
+    """
+    rows = _pending_obs_rows[:]
+    _pending_obs_rows.clear()
+    return rows
+
 
 def _filter_cache_to_today(now_utc: datetime) -> list[DataPoint]:
     """Return only cached DataPoints still valid for today's local date.
@@ -131,6 +148,8 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
 
     if _cache_points and (now - _cache_time) < METAR_CACHE_SECONDS:
         return _cache_points
+
+    _pending_obs_rows.clear()
 
     station_ids = list(KALSHI_STATION_IDS.values())
     params = {
@@ -279,6 +298,11 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             f"{city_name}={daily_max_f:.1f}°F(hi) {daily_min_f:.1f}°F(lo)"
             f" {_six_max_label} {_six_min_label} [{_obs_label}]"
         )
+
+        # Stage individual observations for metar_obs_log (consumed by take_obs_rows).
+        for obs_epoch, obs_temp_f in obs_today:
+            obs_at_iso = datetime.fromtimestamp(obs_epoch, tz=timezone.utc).isoformat()
+            _pending_obs_rows.append((station_id, metric, obs_at_iso, obs_temp_f))
 
         points.append(DataPoint(
             source="metar",
