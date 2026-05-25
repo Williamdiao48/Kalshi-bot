@@ -31,7 +31,6 @@ Environment variables
 """
 
 import logging
-import os
 from ..utils import env_bool
 from datetime import date, datetime, timedelta, timezone
 
@@ -129,24 +128,19 @@ def kalshi_active_contract(today: date | None = None) -> tuple[str, date]:
     raise RuntimeError("Could not determine active WTI contract for today")
 
 
-async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
-    """Fetch the current WTI front-month futures price using the contract
-    that Kalshi will settle on today.
+async def _fetch_symbol(
+    session: aiohttp.ClientSession,
+    symbol: str,
+) -> tuple[float | None, int | None, str]:
+    """Fetch regularMarketPrice/Time/State for a Yahoo Finance symbol.
 
-    Returns a single-element list on success, empty list on any error or if
-    WTI_FUTURES_ENABLED is false.
+    Returns (price, timestamp_epoch, market_state).  price is None on any error.
     """
-    if not WTI_FUTURES_ENABLED:
-        return []
-
-    symbol, ltd = kalshi_active_contract()
     url = _BASE_URL.format(symbol=symbol)
-
-    params = {"interval": "1m", "range": "1d"}
     try:
         async with session.get(
             url,
-            params=params,
+            params={"interval": "1m", "range": "1d"},
             headers=_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
@@ -154,13 +148,13 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
             data = await resp.json()
     except aiohttp.ClientResponseError as exc:
         logging.warning("WTI Futures HTTP %s for %s: %s", exc.status, symbol, exc.message)
-        return []
+        return None, None, "UNKNOWN"
     except aiohttp.ClientError as exc:
         logging.warning("WTI Futures request error for %s: %s", symbol, exc)
-        return []
+        return None, None, "UNKNOWN"
 
     try:
-        result = data["chart"]["result"][0]
+        meta = data["chart"]["result"][0]["meta"]
     except (KeyError, IndexError, TypeError):
         error = (data.get("chart") or {}).get("error") or {}
         logging.warning(
@@ -168,33 +162,79 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
             symbol,
             error.get("description", "unknown error"),
         )
-        return []
+        return None, None, "UNKNOWN"
 
-    meta          = result.get("meta", {})
-    price: float | None = meta.get("regularMarketPrice")
-    ts:    int   | None = meta.get("regularMarketTime")
-    market_state: str   = meta.get("marketState", "UNKNOWN")
+    return (
+        meta.get("regularMarketPrice"),
+        meta.get("regularMarketTime"),
+        meta.get("marketState", "UNKNOWN"),
+    )
 
+
+def _is_fresh(price: float | None, ts: int | None) -> bool:
+    """Return True if this quote is usable (has a price and a recent timestamp).
+
+    market_state is intentionally ignored: NYMEX futures return None/UNKNOWN
+    between sessions (5PM–6PM ET), which is normal and not an indicator of
+    stale data.  The timestamp is the real freshness signal.
+    """
     if price is None:
-        logging.warning("WTI Futures: no regularMarketPrice for %s", symbol)
+        return False
+    if ts is not None:
+        age_hours = (
+            datetime.now(timezone.utc) - datetime.fromtimestamp(ts, tz=timezone.utc)
+        ).total_seconds() / 3600
+        if age_hours > 20:  # stale across more than one full session gap
+            return False
+    return True
+
+
+async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
+    """Fetch the current WTI front-month futures price.
+
+    Tries the specific CME contract that Kalshi settles on first (e.g. CLN26.NYM).
+    Falls back to CL=F (Yahoo's generic front-month) if the specific contract
+    returns UNKNOWN market state or a stale quote — which happens when Yahoo
+    hasn't yet started tracking a newly-active contract code.
+
+    Returns a single-element list on success, empty list on any error or if
+    WTI_FUTURES_ENABLED is false.
+    """
+    if not WTI_FUTURES_ENABLED:
         return []
+
+    now_utc = datetime.now(timezone.utc)
+    specific_symbol, ltd = kalshi_active_contract()
+    days_to_ltd = (ltd - now_utc.date()).days
+
+    # Try specific contract first, fall back to CL=F.
+    price, ts, market_state = await _fetch_symbol(session, specific_symbol)
+    used_symbol = specific_symbol
+    if not _is_fresh(price, ts):
+        logging.warning(
+            "WTI Futures [%s]: unusable (state=%s) — falling back to CL=F",
+            specific_symbol, market_state,
+        )
+        price, ts, market_state = await _fetch_symbol(session, "CL=F")
+        used_symbol = "CL=F"
+        if not _is_fresh(price, ts):
+            logging.warning("WTI Futures: CL=F also unusable (state=%s) — skipping", market_state)
+            return []
 
     as_of = (
         datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        if ts else
-        datetime.now(timezone.utc).isoformat()
+        if ts else now_utc.isoformat()
     )
 
-    days_to_ltd = (ltd - datetime.now(timezone.utc).date()).days
     if market_state == "CLOSED":
         logging.warning(
             "WTI Futures [%s]: market CLOSED — last close %.2f $/bbl (LTD in %d days)",
-            symbol, price, days_to_ltd,
+            used_symbol, price, days_to_ltd,
         )
     else:
         logging.debug(
             "WTI Futures [%s]: %.2f $/bbl  state=%s  (Kalshi LTD=%s, %d days)",
-            symbol, price, market_state, ltd, days_to_ltd,
+            used_symbol, price, market_state, ltd, days_to_ltd,
         )
 
     return [DataPoint(
@@ -203,5 +243,5 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
         value    = float(price),
         unit     = "$/bbl",
         as_of    = as_of,
-        metadata = {"symbol": symbol, "market_state": market_state, "ltd": str(ltd)},
+        metadata = {"symbol": used_symbol, "market_state": market_state, "ltd": str(ltd)},
     )]
