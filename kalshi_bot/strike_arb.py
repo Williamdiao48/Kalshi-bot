@@ -2029,6 +2029,7 @@ def find_forecast_nos(
                 # LOW market: NO settles when the daily low stays ABOVE the strike.
                 if parsed.direction == "between" and parsed.strike_hi is not None:
                     edge = value - parsed.strike_hi  # forecast too warm for YES
+                    no_dir = "NO_HIGH"  # qualifying sources are always warm-side for KXLOWT
                 elif parsed.direction == "under" and parsed.strike is not None:
                     edge = value - parsed.strike
                 elif parsed.direction == "over" and parsed.strike is not None:
