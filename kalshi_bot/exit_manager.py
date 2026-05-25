@@ -828,6 +828,18 @@ class ExitManager:
                 if (_sl_composite in EXIT_SOURCE_STOP_LOSS or src in EXIT_SOURCE_STOP_LOSS)
                 else "stop_loss:global"
             )
+            # Dynamic SL for band_arb YES: read sl_frac from trade note (set at entry
+            # time based on margin_hi_f: wide>=0.5°F→30%, tight<0.5°F→20%).
+            if src == "band_arb" and side == "yes":
+                _trade_note = getattr(trade, "note", None)
+                if _trade_note:
+                    try:
+                        _note_sl = json.loads(_trade_note).get("sl_frac")
+                        if _note_sl is not None:
+                            stop_loss_thresh = float(_note_sl)
+                            _sl_detail = "stop_loss:band_arb_dynamic"
+                    except (json.JSONDecodeError, AttributeError, ValueError):
+                        pass
             if is_forecast_no and FORECAST_NO_STOP_LOSS > 0:
                 stop_loss_thresh = FORECAST_NO_STOP_LOSS
                 _sl_detail = "stop_loss:forecast_no"

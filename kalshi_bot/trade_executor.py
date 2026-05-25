@@ -359,9 +359,9 @@ KELLY_HIGH_SCORE_THRESHOLD: float = env_float("KELLY_HIGH_SCORE_THRESHOLD", 0.8)
 # model has only ~65% directional accuracy — a corroboration signal, not a lock.
 # Historical "100% WR" was all trivially easy NO trades on far-OTM strikes;
 # the first genuinely contested signal (#32 YES on T91.99) produced a bad trade.
-LOCKED_OBS_MAX_POSITION_CENTS: int = env_int("LOCKED_OBS_MAX_POSITION_CENTS", 5000)
+LOCKED_OBS_MAX_POSITION_CENTS: int = env_int("LOCKED_OBS_MAX_POSITION_CENTS", 1000)
 LOCKED_OBS_KELLY_FRACTION: float    = env_float("LOCKED_OBS_KELLY_FRACTION", 0.75)
-LOCKED_OBS_MAX_CONTRACTS: int       = env_int("LOCKED_OBS_MAX_CONTRACTS", 50)
+LOCKED_OBS_MAX_CONTRACTS: int       = env_int("LOCKED_OBS_MAX_CONTRACTS", 10)
 _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
     "noaa_observed", "metar", "nws_climo", "nws_alert",
 })
@@ -2808,6 +2808,7 @@ class TradeExecutor:
             "band_ceil_f":  round(signal.band_ceil,    1),
             "margin_lo_f":  round(signal.observed_max - signal.strike_lo, 2),
             "margin_hi_f":  round(signal.band_ceil - signal.observed_max, 2),
+            "sl_frac":      0.30 if (signal.band_ceil - signal.observed_max) >= 0.5 else 0.20,
             "is_locked":    signal.is_locked,
             "corr_status":  signal.corr_status,
             "is_rising":    signal.is_rising,
@@ -2816,7 +2817,7 @@ class TradeExecutor:
         }
         if overshoot_f is not None:
             _yes_note["overshoot_f"] = round(overshoot_f, 2)
-        _asos_max = (signal.metadata or {}).get("asos_observed_max")
+        _asos_max = getattr(signal, "asos_observed_max", None)
         if _asos_max is not None:
             _yes_note["asos_max_f"] = round(_asos_max, 1)
         if signal.noaa_val is not None:
