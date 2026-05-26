@@ -463,11 +463,13 @@ FORECAST_NO_MODEL_SPREAD_F: float = float(
     os.environ.get("FORECAST_NO_MODEL_SPREAD_F", "8.0")
 )
 # Minimum model spread (°F) required to fire a forecast_no signal.
-# Backtest (May 2026): spread_min gate hurts — WR drops from 82.7% → 70.2% as
-# spread_min increases from 0 to 3°F.  Tight consensus is a feature, not a bug.
-# Disabled (0) per backtest findings.
+# Backtest (May 2026, n=285, best config):
+#   0–2°F bucket: WR=70.1%, avg=+2.3¢  (below average)
+#   2–4°F bucket: WR=76.9%, avg=+6.5¢  (best bucket)
+# A floor of 1°F cuts only degenerate full-consensus cases (all models within
+# 1°F of each other) where the market has likely already priced in the forecast.
 FORECAST_NO_MODEL_SPREAD_MIN_F: float = float(
-    os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "0.0")
+    os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "1.0")
 )
 
 

@@ -129,6 +129,16 @@ FORECAST_NO_PROFIT_TAKE: float = env_float("FORECAST_NO_PROFIT_TAKE", 0.0)
 # E.g. FORECAST_NO_STOP_LOSS=0.40 exits when down 40% on entry cost.
 FORECAST_NO_STOP_LOSS: float = env_float("FORECAST_NO_STOP_LOSS", 0.0)
 
+# Bucket-based SL/PT for forecast_no, split by no_ask entry price.
+# Backtest (May 2026, n=285):
+#   60–80¢ bucket (n=232): SL=90%/PT=20% → +1118¢ vs settlement +515¢ (2× gain)
+#   45–59¢ bucket (n=38):  settlement hold → +409¢ beats every SL/PT combo
+# The 45–59¢ bucket wins more per contract at settlement (larger payout when correct)
+# so early exit hurts.  The 60–80¢ bucket needs PT to lock gains before mean reversion.
+FORECAST_NO_HIGH_ASK_THRESHOLD: int   = env_int(  "FORECAST_NO_HIGH_ASK_THRESHOLD", 60)
+FORECAST_NO_HIGH_ASK_SL:        float = env_float("FORECAST_NO_HIGH_ASK_SL",        0.9)
+FORECAST_NO_HIGH_ASK_PT:        float = env_float("FORECAST_NO_HIGH_ASK_PT",        0.2)
+
 # Tight stop-loss for YES trades on KXLOWT (daily-low) markets backed by
 # observed sources (noaa_observed, metar).  Unlike KXHIGHT observed YES trades
 # (where a high above the strike is permanently locked in), a KXLOWT morning
@@ -843,6 +853,17 @@ class ExitManager:
             if is_forecast_no and FORECAST_NO_STOP_LOSS > 0:
                 stop_loss_thresh = FORECAST_NO_STOP_LOSS
                 _sl_detail = "stop_loss:forecast_no"
+            # Bucket-based SL for forecast_no (takes priority over FORECAST_NO_STOP_LOSS):
+            # 60–80¢ bucket: apply FORECAST_NO_HIGH_ASK_SL (default 90%).
+            # 45–59¢ bucket: disable SL — settlement hold outperforms any SL/PT combo.
+            if is_forecast_no:
+                if entry_cost >= FORECAST_NO_HIGH_ASK_THRESHOLD:
+                    if FORECAST_NO_HIGH_ASK_SL > 0:
+                        stop_loss_thresh = FORECAST_NO_HIGH_ASK_SL
+                        _sl_detail = f"stop_loss:forecast_no_{entry_cost}c_high_ask"
+                else:
+                    stop_loss_thresh = 0.0
+                    _sl_detail = "stop_loss:forecast_no_low_ask_disabled"
 
             # Tighter stop-loss for KXLOWT YES trades from observed sources.
             # A morning running-minimum above the strike does not lock in a YES
@@ -997,11 +1018,19 @@ class ExitManager:
 
             # Locked signals (observed/advisory): hold to settlement, no profit-take.
             # Forecast YES signals: profit-take enabled (model-projected, not locked).
-            # Forecast NO signals: stop-loss only by default; FORECAST_NO_PROFIT_TAKE
-            #   enables an early exit at a configurable threshold.
+            # Forecast NO signals: bucket-based PT by no_ask entry price:
+            #   60–80¢ bucket → PT=FORECAST_NO_HIGH_ASK_PT (default 20%)
+            #   45–59¢ bucket → no PT (settlement hold wins per backtest)
+            #   FORECAST_NO_PROFIT_TAKE > 0 overrides the low-ask bucket if set.
             is_locked = (src in _LOCKED_STOP_LOSS_ONLY) and not (src == "band_arb" and side == "yes")
             is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
-            suppress_profit_take = is_locked or (is_forecast_no and FORECAST_NO_PROFIT_TAKE <= 0)
+            _fno_pt_thresh = 0.0
+            if is_forecast_no:
+                if entry_cost >= FORECAST_NO_HIGH_ASK_THRESHOLD and FORECAST_NO_HIGH_ASK_PT > 0:
+                    _fno_pt_thresh = FORECAST_NO_HIGH_ASK_PT
+                elif FORECAST_NO_PROFIT_TAKE > 0:
+                    _fno_pt_thresh = FORECAST_NO_PROFIT_TAKE
+            suppress_profit_take = is_locked or (is_forecast_no and _fno_pt_thresh <= 0)
 
             reason: str | None = None
             detail: str | None = None
@@ -1086,9 +1115,10 @@ class ExitManager:
                     stop_loss_thresh = 0.50
                     _sl_detail = "stop_loss:nba_convergence"
 
-            if reason is None and is_forecast_no and FORECAST_NO_PROFIT_TAKE > 0 and pct >= FORECAST_NO_PROFIT_TAKE:
+            if reason is None and is_forecast_no and _fno_pt_thresh > 0 and pct >= _fno_pt_thresh:
                 reason = "profit_take"
-                detail = f"profit_take:forecast_no@{FORECAST_NO_PROFIT_TAKE:.0%}"
+                _fno_bucket = "high_ask" if entry_cost >= FORECAST_NO_HIGH_ASK_THRESHOLD else "low_ask"
+                detail = f"profit_take:forecast_no_{_fno_bucket}@{_fno_pt_thresh:.0%}:bid={getattr(trade, 'yes_bid', None)}"
             elif reason is None and not suppress_profit_take and pct >= profit_take_thresh:
                 reason = "profit_take"
                 _bid_pt = getattr(trade, "yes_bid", None)

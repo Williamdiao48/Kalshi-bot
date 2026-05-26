@@ -22,15 +22,39 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import io
 import itertools
 import json
 import re
 import sqlite3
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+
+class _Tee(io.TextIOBase):
+    """Write to both stdout and a file simultaneously."""
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = path.open("w", encoding="utf-8")
+        self._stdout = sys.__stdout__
+
+    def write(self, s: str) -> int:
+        self._stdout.write(s)
+        self._stdout.flush()
+        self._file.write(s)
+        self._file.flush()
+        return len(s)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self) -> None:
+        sys.stdout = self._stdout
+        self._file.close()
 
 import aiohttp
 import pandas as pd
@@ -455,19 +479,22 @@ def build_signal_snapshots(
     ])
     df_fc = df_fc.merge(meta_df, on="ticker", how="inner")
 
-    # Group by unique timezone and convert tick → local date
+    # Group by unique timezone and convert tick → local date.
+    # Include both mkt_date and mkt_date-1 to capture 20-25h entries that fire
+    # the day before market close (bulk of live forecast-NO entries).
     day_masks = []
     for tz_str, grp in df_fc.groupby("_tz_str"):
         tz_obj = ZoneInfo(tz_str)
         local_dates = grp["tick"].dt.tz_convert(tz_obj).dt.date
-        on_day = local_dates == grp["_mkt_date"]
+        prev_day = grp["_mkt_date"].apply(lambda d: d - timedelta(days=1))
+        on_day = (local_dates == grp["_mkt_date"]) | (local_dates == prev_day)
         day_masks.append(on_day)
 
     if not day_masks:
         return pd.DataFrame()
     combined_mask = pd.concat(day_masks).sort_index()
     df_day = df_fc[combined_mask].copy()
-    print(f"  Settlement-day rows: {len(df_day):,} (from {len(df_fc):,})", flush=True)
+    print(f"  Settlement-day + day-before rows: {len(df_day):,} (from {len(df_fc):,})", flush=True)
 
     if df_day.empty:
         return pd.DataFrame()
@@ -549,6 +576,192 @@ def build_signal_snapshots(
 
     print(f"  Snapshot rows: {len(snap):,}  ({time.time()-t0:.0f}s)", flush=True)
     return snap
+
+
+# ---------------------------------------------------------------------------
+# Kelly / re-entry helpers
+# ---------------------------------------------------------------------------
+
+def _normal_cdf_bt(z: float) -> float:
+    import math
+    return 0.5 * math.erfc(-z / math.sqrt(2))
+
+
+def _p_no_win_bt(band_number: float, no_direction: str | None, avg_edge: float,
+                 sigma: float = 4.0) -> float:
+    """Estimate P(NO wins) for a between-band temperature market.
+
+    Mirrors trade_executor._implied_p_yes() for the 'between' case:
+      eff_lo = strike_lo − 0.5,  eff_hi = strike_hi + 0.5
+      strike_lo = band_number − 0.5,  strike_hi = band_number + 0.5
+    Data value is reconstructed from the direction + avg qualifying edge.
+    """
+    eff_lo = band_number - 1.0   # (band_number - 0.5) - 0.5
+    eff_hi = band_number + 1.0   # (band_number + 0.5) + 0.5
+    if no_direction == "NO_HIGH":
+        data_value = band_number + 0.5 + max(avg_edge, 0.0)
+    elif no_direction == "NO_LOW":
+        data_value = band_number - 0.5 - max(avg_edge, 0.0)
+    else:
+        return 0.5
+    if sigma <= 0:
+        return 0.5
+    p_yes = (_normal_cdf_bt((eff_hi - data_value) / sigma)
+             - _normal_cdf_bt((eff_lo - data_value) / sigma))
+    return max(0.0, min(1.0, 1.0 - p_yes))
+
+
+def _kelly_n_bt(p_no_win: float, no_ask: float,
+                kelly_frac: float = 0.25,
+                max_cents: float = 10_000,
+                hard_cap: int = 10) -> int:
+    """Quarter-Kelly contract count for a NO bet (mirrors trade_executor)."""
+    import math
+    if no_ask <= 0 or no_ask >= 100:
+        return 0
+    raw_f = (p_no_win - no_ask / 100.0) / (1.0 - no_ask / 100.0)
+    if raw_f <= 0:
+        return 0
+    return min(math.floor(kelly_frac * raw_f * max_cents / no_ask), hard_cap)
+
+
+def _simulate_reentry_ticker(
+    ticker_snap: pd.DataFrame,
+    ticker: str,
+    fills_data: dict[str, dict],
+    sl_frac: float,
+    pt_frac: float,
+    edge_cols: list[str],
+    min_edge_f: float,
+    with_kelly: bool = False,
+    kelly_frac: float = 0.25,
+    kelly_max_cents: float = 10_000,
+    kelly_hard_cap: int = 10,
+    sigma: float = 4.0,
+    reentry_mode: str = "always",  # "always" | "price_recovery" | "none"
+) -> list[dict]:
+    """Simulate all entries (with re-entry after SL/PT) for a single ticker.
+
+    Returns one dict per trade executed.  Re-entry fires at the next
+    qualifying tick strictly after the exit tick; settlement exits terminate
+    the chain.
+    """
+    fills = fills_data.get(ticker, {}).get("fills", [])
+    settlement = fills_data.get(ticker, {}).get("settlement")
+    if settlement not in ("yes", "no"):
+        return []
+
+    fill_times  = [f[0] for f in fills]
+    qual_rows   = ticker_snap.sort_values("tick").to_dict("records")
+    trades: list[dict] = []
+    next_idx = 0
+
+    while next_idx < len(qual_rows):
+        row        = qual_rows[next_idx]
+        entry_tick = row["tick"]
+
+        # --- entry price ---
+        fidx = bisect.bisect_right(fill_times, entry_tick) - 1
+        yes_fill = fills[fidx][1] if fidx >= 0 else (fills[0][1] if fills else 50)
+        no_ask = float(min(max(100 - yes_fill, 0), 100))
+
+        if no_ask < MIN_NO_ASK or no_ask > MAX_NO_ASK:
+            next_idx += 1
+            continue
+
+        # --- contract count ---
+        if with_kelly:
+            qual_edges = [
+                row.get(c, float("nan"))
+                for c in edge_cols
+                if c != "edge_noaa_observed"
+                and pd.notna(row.get(c)) and row.get(c, 0) >= min_edge_f
+            ]
+            avg_edge = sum(qual_edges) / len(qual_edges) if qual_edges else 0.0
+            p_no = _p_no_win_bt(
+                float(row.get("band_number") or 0),
+                row.get("no_direction"),
+                avg_edge,
+                sigma=sigma,
+            )
+            n_c = _kelly_n_bt(p_no, no_ask, kelly_frac, kelly_max_cents, kelly_hard_cap)
+        else:
+            n_c = 1
+
+        if n_c == 0:
+            next_idx += 1
+            continue
+
+        # --- settlement PnL ---
+        pnl_sett = (100 - no_ask) * n_c if settlement == "no" else -no_ask * n_c
+
+        # --- SL/PT exit simulation ---
+        entry_fill_idx = bisect.bisect_right(fill_times, entry_tick)
+        exit_tick   = None
+        pnl_slpt    = pnl_sett
+        exit_reason = "settlement"
+
+        for ft, yes_price in fills[entry_fill_idx:]:
+            no_bid       = 100 - yes_price
+            pnl_if_exit  = (no_bid - no_ask) * n_c
+            if pnl_if_exit <= -sl_frac * no_ask * n_c:
+                pnl_slpt    = pnl_if_exit
+                exit_reason = "stop_loss"
+                exit_tick   = ft
+                break
+            if pnl_if_exit >= pt_frac * no_ask * n_c:
+                pnl_slpt    = pnl_if_exit
+                exit_reason = "profit_take"
+                exit_tick   = ft
+                break
+
+        trades.append({
+            "ticker":       ticker,
+            "entry_tick":   entry_tick,
+            "no_ask_entry": no_ask,
+            "n_contracts":  n_c,
+            "pnl_slpt":     pnl_slpt,
+            "pnl_sett":     pnl_sett,
+            "exit_reason":  exit_reason,
+            "entry_num":    len(trades) + 1,
+            "city":         row.get("city"),
+            "is_high":      row.get("is_high"),
+            "no_direction": row.get("no_direction"),
+        })
+
+        if exit_reason == "settlement" or exit_tick is None:
+            break
+
+        if reentry_mode == "none":
+            break
+
+        # advance past exit_tick before looking for re-entry
+        next_idx += 1
+        while next_idx < len(qual_rows) and qual_rows[next_idx]["tick"] <= exit_tick:
+            next_idx += 1
+
+        if reentry_mode == "price_recovery":
+            # Only re-enter once the YES price has come back below the YES price
+            # at this trade's entry — i.e., the stop was triggered by transient
+            # noise rather than a sustained market shift.
+            entry_yes_price = 100 - no_ask  # YES bid when we entered this trade
+            while next_idx < len(qual_rows):
+                candidate_tick = qual_rows[next_idx]["tick"]
+                fidx = bisect.bisect_right(fill_times, candidate_tick) - 1
+                yes_now = fills[fidx][1] if fidx >= 0 else (fills[0][1] if fills else 50)
+                if yes_now < entry_yes_price:
+                    break  # price has recovered — eligible for re-entry
+                next_idx += 1  # price still elevated — skip this tick
+
+        elif reentry_mode == "cooldown_30m":
+            # Don't re-enter for at least 30 minutes after the stop-loss exit.
+            # Filters out immediate noise re-entries; still allows re-entry if
+            # the signal re-qualifies after a model update (~1h cadence).
+            cooldown_end = exit_tick + timedelta(minutes=30)
+            while next_idx < len(qual_rows) and qual_rows[next_idx]["tick"] <= cooldown_end:
+                next_idx += 1
+
+    return trades
 
 
 # ---------------------------------------------------------------------------
@@ -737,14 +950,20 @@ def sweep(
     nonempty = sum(1 for v in entry_cache.values() if not v.empty)
     print(f"  Built {total_keys} base entry sets, {nonempty} non-empty", flush=True)
 
-    # For best (no SL/PT) exit: simulate settlement-only (already in pnl_settlement after
-    # find_first_entries — no, we compute it in simulate_exits)
-    # Pre-compute settlement PnL for each entry set
-    print("  Pre-computing settlement PnL…", flush=True)
+    # Pre-compute settlement PnL + one pnl_sl{x}_pt{y} column per SL/PT combo.
+    # The sweep then picks the best SL/PT combo per filter config as its primary metric.
+    slpt_combos = list(itertools.product(SL_FRACS, PT_FRACS))
+    n_slpt = len(slpt_combos)
+    print(f"  Pre-computing settlement PnL + {n_slpt} SL/PT combos…", flush=True)
     for key, df in entry_cache.items():
         if df.empty:
             continue
-        entry_cache[key] = simulate_exits(df, fills_data, sl_frac=999.0, pt_frac=999.0)
+        df_sett = simulate_exits(df, fills_data, sl_frac=999.0, pt_frac=999.0)
+        for sl, pt in slpt_combos:
+            col = f"pnl_sl{int(sl*100)}_pt{int(pt*100)}"
+            df_slpt = simulate_exits(df, fills_data, sl_frac=sl, pt_frac=pt)
+            df_sett[col] = df_slpt["pnl_slpt"].values
+        entry_cache[key] = df_sett
 
     # ----- Full sweep -----
     print("\n" + "=" * 78, flush=True)
@@ -796,34 +1015,51 @@ def sweep(
             continue
 
         # PnL from pre-computed settlement exit
-        wins    = int((df["pnl_settlement"] > 0).sum())
-        n       = len(df)
-        total_p = float(df["pnl_settlement"].sum())
-        avg_p   = total_p / n
+        wins       = int((df["pnl_settlement"] > 0).sum())
+        n          = len(df)
+        total_sett = float(df["pnl_settlement"].sum())
+        avg_sett   = total_sett / n
+
+        # Best SL/PT combo by total P&L across the filtered sub-df
+        best_slpt_total = total_sett
+        best_slpt_avg   = avg_sett
+        best_slpt_key   = "settlement"
+        for sl, pt in itertools.product(SL_FRACS, PT_FRACS):
+            col = f"pnl_sl{int(sl*100)}_pt{int(pt*100)}"
+            if col not in df.columns:
+                continue
+            slpt_total = float(df[col].sum())
+            if slpt_total > best_slpt_total:
+                best_slpt_total = slpt_total
+                best_slpt_avg   = slpt_total / n
+                best_slpt_key   = f"sl{int(sl*100)}_pt{int(pt*100)}"
 
         results.append({
-            "min_edge":    min_edge,
-            "min_src":     min_src,
-            "req_om":      req_om,
-            "spread_max":  spread_max,
-            "spread_min":  spread_min_f,
-            "hrrr_veto":   hrrr_veto,
-            "block_noh":   block_noh,
-            "dir":         dir_filter,
-            "n":           n,
-            "wins":        wins,
-            "wr":          wins / n,
-            "total_pnl":   total_p,
-            "avg_pnl":     avg_p,
+            "min_edge":       min_edge,
+            "min_src":        min_src,
+            "req_om":         req_om,
+            "spread_max":     spread_max,
+            "spread_min":     spread_min_f,
+            "hrrr_veto":      hrrr_veto,
+            "block_noh":      block_noh,
+            "dir":            dir_filter,
+            "n":              n,
+            "wins":           wins,
+            "wr":             wins / n,
+            "total_pnl":      total_sett,
+            "avg_pnl":        avg_sett,
+            "total_pnl_slpt": best_slpt_total,
+            "avg_pnl_slpt":   best_slpt_avg,
+            "best_slpt":      best_slpt_key,
         })
 
-    results.sort(key=lambda r: r["total_pnl"], reverse=True)
+    results.sort(key=lambda r: r["total_pnl_slpt"], reverse=True)
 
-    # ---- Top 25 configs by total P&L ----
-    print(f"\nTop 25 configs (hold-to-settlement exit, n ≥ 8):\n")
+    # ---- Top 25 configs by best SL/PT P&L ----
+    print(f"\nTop 25 configs (best SL/PT exit, n ≥ 8):\n")
     hdr = (f"{'mE':>4} {'src':>3} {'om':>5} {'spMx':>5} {'hv':>4} "
-           f"{'bNH':>4} {'dir':>12} | {'n':>4} {'wins':>5} {'WR':>6} "
-           f"{'total_¢':>9} {'avg_¢':>8}")
+           f"{'bNH':>4} {'dir':>12} | {'n':>4} {'WR':>6} "
+           f"{'sett_¢':>9} {'slpt_¢':>9} {'avg_slpt':>9} {'best_exit':>14}")
     print(hdr)
     print("-" * len(hdr))
     for r in results[:25]:
@@ -831,17 +1067,18 @@ def sweep(
         print(
             f"{r['min_edge']:4.1f} {r['min_src']:3d} {str(r['req_om']):>5} {sp_str:>5}"
             f" {str(r['hrrr_veto']):>4} {str(r['block_noh']):>4} {r['dir']:>12}"
-            f" | {r['n']:4d} {r['wins']:5d} {r['wr']:6.1%}"
-            f" {r['total_pnl']:+9.0f}¢ {r['avg_pnl']:+8.1f}¢"
+            f" | {r['n']:4d} {r['wr']:6.1%}"
+            f" {r['total_pnl']:+9.0f}¢ {r['total_pnl_slpt']:+9.0f}¢"
+            f" {r['avg_pnl_slpt']:+9.1f}¢ {r['best_slpt']:>14}"
         )
 
-    # ---- Top 15 by avg P&L (n ≥ 15) ----
+    # ---- Top 15 by avg SL/PT P&L (n ≥ 15) ----
     by_avg = sorted(
         [r for r in results if r["n"] >= 15],
-        key=lambda r: r["avg_pnl"],
+        key=lambda r: r["avg_pnl_slpt"],
         reverse=True,
     )
-    print(f"\nTop 15 configs by avg P&L (n ≥ 15):\n")
+    print(f"\nTop 15 configs by avg SL/PT P&L (n ≥ 15):\n")
     print(hdr)
     print("-" * len(hdr))
     for r in by_avg[:15]:
@@ -849,8 +1086,9 @@ def sweep(
         print(
             f"{r['min_edge']:4.1f} {r['min_src']:3d} {str(r['req_om']):>5} {sp_str:>5}"
             f" {str(r['hrrr_veto']):>4} {str(r['block_noh']):>4} {r['dir']:>12}"
-            f" | {r['n']:4d} {r['wins']:5d} {r['wr']:6.1%}"
-            f" {r['total_pnl']:+9.0f}¢ {r['avg_pnl']:+8.1f}¢"
+            f" | {r['n']:4d} {r['wr']:6.1%}"
+            f" {r['total_pnl']:+9.0f}¢ {r['total_pnl_slpt']:+9.0f}¢"
+            f" {r['avg_pnl_slpt']:+9.1f}¢ {r['best_slpt']:>14}"
         )
 
     # ---- Source count comparison (between_only, spread≤6, spread_min=0, averaged across other params) ----
@@ -865,7 +1103,7 @@ def sweep(
             continue
         avg_n  = sum(r["n"]   for r in subset) / len(subset)
         avg_wr = sum(r["wr"]  for r in subset) / len(subset)
-        avg_p  = sum(r["avg_pnl"] for r in subset) / len(subset)
+        avg_p  = sum(r["avg_pnl_slpt"] for r in subset) / len(subset)
         print(f"  {src:4d} | {len(subset):9d}  {avg_n:13.1f}  {avg_wr:7.1%}  {avg_p:+8.1f}¢")
 
     # ---- Min-edge sweep (between_only, src=4, spread≤6, spread_min=0, averaged across other params) ----
@@ -880,13 +1118,13 @@ def sweep(
             continue
         avg_n  = sum(r["n"]   for r in subset) / len(subset)
         avg_wr = sum(r["wr"]  for r in subset) / len(subset)
-        avg_p  = sum(r["avg_pnl"] for r in subset) / len(subset)
+        avg_p  = sum(r["avg_pnl_slpt"] for r in subset) / len(subset)
         print(f"  {me:4.1f} | {len(subset):9d}  {avg_n:13.1f}  {avg_wr:7.1%}  {avg_p:+8.1f}¢")
 
     # ---- Fixed-config edge comparison (exact trade counts, one pinned config) ----
     print("\n--- Fixed-config edge comparison (src=4, spread_max=4, spread_min=0, hv=False, bNH=False, between_only) ---")
-    print(f"  {'mE':>4} | {'n':>6}  {'WR':>7}  {'total_¢':>9}  {'avg_¢':>8}")
-    print(f"  {'-'*4}-+-{'-'*6}--{'-'*7}--{'-'*9}--{'-'*8}")
+    print(f"  {'mE':>4} | {'n':>6}  {'WR':>7}  {'sett_¢':>9}  {'slpt_¢':>9}  {'best_exit':>14}")
+    print(f"  {'-'*4}-+-{'-'*6}--{'-'*7}--{'-'*9}--{'-'*9}--{'-'*14}")
     for me in EDGE_LEVELS:
         match = next(
             (r for r in results
@@ -896,7 +1134,9 @@ def sweep(
             None,
         )
         if match:
-            print(f"  {me:4.1f} | {match['n']:6d}  {match['wr']:7.1%}  {match['total_pnl']:+9.0f}¢  {match['avg_pnl']:+8.1f}¢")
+            print(f"  {me:4.1f} | {match['n']:6d}  {match['wr']:7.1%}"
+                  f"  {match['total_pnl']:+9.0f}¢  {match['total_pnl_slpt']:+9.0f}¢"
+                  f"  {match['best_slpt']:>14}")
         else:
             print(f"  {me:4.1f} | {'(n<8)':>6}")
 
@@ -912,7 +1152,7 @@ def sweep(
             continue
         avg_n  = sum(r["n"]   for r in subset) / len(subset)
         avg_wr = sum(r["wr"]  for r in subset) / len(subset)
-        avg_p  = sum(r["avg_pnl"] for r in subset) / len(subset)
+        avg_p  = sum(r["avg_pnl_slpt"] for r in subset) / len(subset)
         print(f"  {smn:5.1f} | {len(subset):9d}  {avg_n:13.1f}  {avg_wr:7.1%}  {avg_p:+8.1f}¢")
 
     # ---- Cross-validation: current policy config ----
@@ -927,7 +1167,7 @@ def sweep(
         print(
             f"  Current policy (min_edge=3.0, min_src=2, req_om=True):"
             f" n={current_policy['n']}  WR={current_policy['wr']:.1%}"
-            f"  total={current_policy['total_pnl']:+.0f}¢  avg={current_policy['avg_pnl']:+.1f}¢"
+            f"  total_sett={current_policy['total_pnl']:+.0f}¢  total_slpt={current_policy['total_pnl_slpt']:+.0f}¢  avg_slpt={current_policy['avg_pnl_slpt']:+.1f}¢"
         )
     else:
         print("  (no matching current-policy config found in results)")
@@ -1115,12 +1355,234 @@ def sweep(
             total_ = float(grp["pnl_settlement"].sum())
             print(f"  {label}: n={n_:3d}  WR={wins_/n_:5.1%}  total={total_:+7.0f}¢  avg={total_/n_:+6.1f}¢")
 
+        # ---- Per-bucket SL/PT sweep ----
+        # Tests whether the global SL=90%/PT=20% optimum holds within each
+        # no_ask price range and each hours-to-close window, or whether
+        # different segments warrant different exit parameters.
+        def _bucket_slpt(sub_df: "pd.DataFrame", label_hdr: str) -> None:
+            n_b = len(sub_df)
+            if n_b < 10:
+                print(f"  {label_hdr}: n={n_b} — too few")
+                return
+            wins_s = int((sub_df["pnl_settlement"] > 0).sum())
+            tot_s  = float(sub_df["pnl_settlement"].sum())
+            print(f"\n  {label_hdr}  (n={n_b})")
+            print(f"    {'exit':>20} | {'total_¢':>9}  {'avg_¢':>7}  {'WR':>6}")
+            print(f"    {'─'*20}-+-{'─'*28}")
+            print(f"    {'settlement hold':>20} | {tot_s:+9.0f}¢  {tot_s/n_b:+7.1f}¢  {wins_s/n_b:6.1%}")
+            slpt_rows = []
+            for sl_f in SL_FRACS:
+                for pt_f in PT_FRACS:
+                    col = f"pnl_sl{int(sl_f*100)}_pt{int(pt_f*100)}"
+                    if col not in sub_df.columns:
+                        continue
+                    tp  = float(sub_df[col].sum())
+                    w_b = int((sub_df[col] > 0).sum())
+                    slpt_rows.append((sl_f, pt_f, tp, w_b))
+            if not slpt_rows:
+                return
+            best_tp_b = max(r[2] for r in slpt_rows)
+            for sl_f, pt_f, tp, w_b in slpt_rows:
+                lbl_  = f"SL={sl_f:.0%} PT={pt_f:.0%}"
+                mark  = " ◀ best" if tp == best_tp_b else ""
+                print(f"    {lbl_:>20} | {tp:+9.0f}¢  {tp/n_b:+7.1f}¢  {w_b/n_b:6.1%}{mark}")
+
+        print(f"\n--- Per no_ask-bucket SL/PT sweep (best config) ---")
+        for b_lo, b_hi, b_lbl in [(45, 60, "45–59¢ NO"), (60, 81, "60–80¢ NO")]:
+            grp_b = best_df[
+                (best_df["no_ask_entry"] >= b_lo) &
+                (best_df["no_ask_entry"] <  b_hi)
+            ]
+            _bucket_slpt(grp_b, b_lbl)
+
+        print(f"\n--- Per hours-to-close-bucket SL/PT sweep (best config) ---")
+        if "_h2c" not in best_df.columns:
+            best_df["_h2c"] = best_df.apply(_hours_to_close, axis=1)
+        for h_lo, h_hi, h_lbl in [(4, 12, "4–12h to close"), (12, 18, "12–18h to close"), (18, 25, "18–25h to close")]:
+            grp_h = best_df[
+                (best_df["_h2c"] >= h_lo) &
+                (best_df["_h2c"] <  h_hi)
+            ]
+            _bucket_slpt(grp_h, h_lbl)
+
+    # =========================================================================
+    # Combined-filter analysis
+    # Apply all findings together and re-run full SL/PT grid on that universe.
+    # Tests whether the SL=90%/PT=20% optimum holds once bad cities / KXLOW /
+    # cheap NO entries are removed — or whether those were driving the result.
+    # =========================================================================
+    BLOCK_CITIES  = {"den", "ny"}
+    NO_ASK_FLOOR  = 45.0   # ¢ — entries below this had 12.5% WR in breakdown
+    SPREAD_HARD_CAP = 8.0  # °F — 8°F+ bucket was 45% WR
+
+    # Iterate over a small set of representative base configs for the combined filter
+    combined_configs = [
+        # (label, min_edge, min_src, req_om)
+        ("current_policy",  3.0, 2, True),
+        ("liberal",         0.5, 2, False),
+        ("moderate",        2.0, 4, False),
+        ("tight",           3.0, 3, False),
+    ]
+
+    print("\n" + "=" * 78)
+    print("COMBINED FILTER ANALYSIS (block DEN/NY + KXLOW + no_ask<45¢ + spread≥8°F)")
+    print("=" * 78)
+    print("Verifying SL/PT optimum holds once all identified filters are applied together.\n")
+
+    for label, me, src, rom in combined_configs:
+        base_df = entry_cache.get((me, src, rom))
+        if base_df is None or base_df.empty:
+            print(f"\n{label} (edge={me}, src={src}): no entries — skipping")
+            continue
+
+        df = base_df.copy()
+
+        # Apply "between_only" (consistently best in sweep)
+        if "band_type" in df.columns:
+            df = df[df["band_type"] == "B"]
+
+        # Block bad cities
+        if "city" in df.columns:
+            df = df[~df["city"].isin(BLOCK_CITIES)]
+
+        # Block KXLOW markets
+        if "is_high" in df.columns:
+            df = df[df["is_high"]]
+
+        # Block cheap NO entries (high YES price = weak NO conviction)
+        if "no_ask_entry" in df.columns:
+            df = df[df["no_ask_entry"] >= NO_ASK_FLOOR]
+
+        # Hard cap on model spread
+        if "model_spread" in df.columns:
+            df = df[df["model_spread"] < SPREAD_HARD_CAP]
+
+        n = len(df)
+        if n < 5:
+            print(f"\n{label} (edge={me}, src={src}): n={n} after filters — too few")
+            continue
+
+        # Settlement baseline
+        wins_sett = int((df["pnl_settlement"] > 0).sum())
+        total_sett = float(df["pnl_settlement"].sum())
+
+        print(f"\n{label}  (edge={me}, src≥{src}, between_only | n={n} after all filters)")
+        print(f"  Settlement hold:  WR={wins_sett/n:.1%}  total={total_sett:+.0f}¢  avg={total_sett/n:+.1f}¢")
+        # Pre-compute all SL/PT results, then display with best marked
+        slpt_results = []
+        for sl_frac in SL_FRACS:
+            for pt_frac in PT_FRACS:
+                sim = simulate_exits(df, fills_data, sl_frac=sl_frac, pt_frac=pt_frac)
+                tp    = float(sim["pnl_slpt"].sum())
+                wins_ = int((sim["pnl_slpt"] > 0).sum())
+                slpt_results.append((sl_frac, pt_frac, tp, wins_))
+
+        best_tp = max(r[2] for r in slpt_results)
+
+        print(f"  {'exit':>20} | {'total_¢':>9} {'avg_¢':>8} {'WR':>6}")
+        print(f"  {'─'*20}-+-{'─'*9}-{'─'*8}-{'─'*6}")
+        for sl_frac, pt_frac, tp, wins_ in slpt_results:
+            wr_    = wins_ / n
+            label_ = f"SL={sl_frac:.0%} PT={pt_frac:.0%}"
+            marker = " ◀ best" if tp == best_tp else ""
+            print(f"  {label_:>20} | {tp:+9.0f}¢ {tp/n:+8.1f}¢ {wr_:6.1%}{marker}")
+
+    # =========================================================================
+    # Re-entry + Kelly sizing analysis
+    # For each representative config × SL/PT combo, compare:
+    #   (A) first-entry-only, flat 1 contract  ← current backtest baseline
+    #   (B) re-entry enabled,  flat 1 contract  ← isolates re-entry value
+    #   (C) first-entry-only,  quarter-Kelly    ← isolates Kelly value
+    #   (D) re-entry enabled,  quarter-Kelly    ← combined
+    # =========================================================================
+    print("\n" + "=" * 78)
+    print("RE-ENTRY + KELLY SIZING ANALYSIS  (between_only, $100/trade budget)")
+    print("=" * 78)
+    print("Comparing: first-entry-only vs re-entry; flat (1 contract) vs quarter-Kelly.\n")
+
+    ANALYSIS_CONFIGS = [
+        ("current_policy", 3.0, 2, True),
+        ("liberal",        0.5, 2, False),
+        ("moderate",       2.0, 4, False),
+    ]
+    ANALYSIS_SL_PT = [(0.7, 0.2), (0.9, 0.2), (0.5, 0.2)]
+    KELLY_FRAC     = 0.25
+    KELLY_MAX_CENTS = 10_000  # $100 max per trade
+    KELLY_HARD_CAP  = 10
+    TEMP_SIGMA      = 4.0     # °F forecast uncertainty (matches live bot default)
+
+    edge_cols_all = [c for c in snap.columns if c.startswith("edge_")]
+
+    for cfg_label, me, src, rom in ANALYSIS_CONFIGS:
+        # Build qualifying snap subset for this config (between_only)
+        q = snap.copy()
+        q["_n_qual"] = sum(
+            (q[c] >= me).astype(int)
+            for c in edge_cols_all
+            if c != "edge_noaa_observed"
+        )
+        if rom:
+            q = q[q["has_om"] == True]  # noqa: E712
+        q = q[q["_n_qual"] >= src]
+        q = q[q["band_type"] == "B"]
+
+        tickers = q["ticker"].unique()
+        n_tickers = len(tickers)
+
+        print(f"\n{'─'*78}")
+        print(f"{cfg_label}  (edge≥{me}, src≥{src}, between_only | {n_tickers} qualifying tickers)")
+        print(f"  A=first-entry-only  B=re-entry(always)  B2=re-entry(price-recovery)"
+              f"  B3=re-entry(30m-cooldown)  [+N = extra trades vs A]")
+        hdr = (f"  {'SL/PT':>14} │ {'A:1st':>8}"
+               f" {'B:always':>10} {'+N':>4}"
+               f" {'B2:recov':>10} {'+N':>4}"
+               f" {'B3:cool30':>10} {'+N':>4}")
+        print(hdr)
+        print("  " + "─" * (len(hdr) - 2))
+
+        for sl_frac, pt_frac in ANALYSIS_SL_PT:
+            exit_label = f"SL={sl_frac:.0%}/PT={pt_frac:.0%}"
+
+            trades_A, trades_B, trades_B2, trades_B3 = [], [], [], []
+            for ticker in tickers:
+                trows = q[q["ticker"] == ticker]
+                def _sim(mode):
+                    return _simulate_reentry_ticker(
+                        trows, ticker, fills_data, sl_frac, pt_frac,
+                        edge_cols_all, me, with_kelly=False, reentry_mode=mode,
+                    )
+                r = _sim("none");             trades_A.append(r[0]) if r else None
+                trades_B.extend(_sim("always"))
+                trades_B2.extend(_sim("price_recovery"))
+                trades_B3.extend(_sim("cooldown_30m"))
+
+            def _tot(ts): return sum(t["pnl_slpt"] for t in ts)
+
+            print(
+                f"  {exit_label:>14} │ {_tot(trades_A):>+8.0f}¢"
+                f" {_tot(trades_B):>+10.0f}¢ {len(trades_B)-len(trades_A):>+4d}"
+                f" {_tot(trades_B2):>+10.0f}¢ {len(trades_B2)-len(trades_A):>+4d}"
+                f" {_tot(trades_B3):>+10.0f}¢ {len(trades_B3)-len(trades_A):>+4d}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    out_path = Path("data/backtest") / f"forecast_no_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    tee = _Tee(out_path)
+    sys.stdout = tee
+    print(f"Output: {out_path}", flush=True)
+
+    try:
+        _main()
+    finally:
+        tee.close()
+
+
+def _main() -> None:
     # --- Phase A: Load data ---
     df_fc, df_obs = load_raw_forecasts()
 
