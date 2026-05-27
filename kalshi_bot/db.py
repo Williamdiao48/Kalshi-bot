@@ -127,3 +127,35 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(3)")
         logging.info("DB schema migration V3 applied (shadow_band_arb).")
+
+    if current < 4:
+        _add_col("trades", "settled_result",    "TEXT")
+        _add_col("trades", "settled_pnl_cents", "REAL")
+        conn.execute("INSERT INTO schema_version(version) VALUES(4)")
+        logging.info("DB schema migration V4 applied (settled_result, settled_pnl_cents).")
+
+    if current < 5:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forecast_shadow_log (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at         TEXT    NOT NULL,
+                city              TEXT    NOT NULL,
+                date_target       TEXT    NOT NULL,
+                is_high           INTEGER NOT NULL,
+                source            TEXT    NOT NULL,
+                forecast_f        REAL    NOT NULL,
+                actual_f          REAL,
+                actual_fetched_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fsl_dedup
+                ON forecast_shadow_log (city, date_target, is_high, source,
+                                        strftime('%Y-%m-%dT%H', logged_at))
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fsl_lookup
+                ON forecast_shadow_log (city, date_target, is_high, actual_f)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(5)")
+        logging.info("DB schema migration V5 applied (forecast_shadow_log).")

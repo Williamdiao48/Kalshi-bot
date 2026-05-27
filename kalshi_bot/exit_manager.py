@@ -105,7 +105,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 
 from .auth import generate_headers
-from .markets import KALSHI_API_BASE
+from .markets import KALSHI_API_BASE, fetch_market_detail
 
 if TYPE_CHECKING:
     import sqlite3
@@ -1866,6 +1866,71 @@ class ExitManager:
             pnl_cents  = pnl,
             reason     = reason,
         )
+
+    async def resolve_settlements(self, session: aiohttp.ClientSession) -> None:
+        """Back-fill settled_result / settled_pnl_cents for finalized markets.
+
+        Runs every cycle.  Queries Kalshi once per unique ticker that still has
+        trades with settled_result IS NULL in the past 7 days.  After a market
+        finalizes, every trade on that ticker is stamped — regardless of whether
+        it was exited early (profit_take / stop_loss / etc.) or held to settlement.
+
+        settled_pnl_cents is the hypothetical P&L that holding to settlement
+        would have produced, so it can be compared against exit_pnl_cents to
+        measure whether early exits added or destroyed value.
+        """
+        rows = self._conn.execute("""
+            SELECT id, ticker, side, count, limit_price, exit_pnl_cents
+            FROM trades
+            WHERE settled_result IS NULL
+              AND logged_at >= datetime('now', '-7 days')
+        """).fetchall()
+        if not rows:
+            return
+
+        # Group trade rows by ticker to avoid redundant API calls.
+        by_ticker: dict[str, list[tuple]] = {}
+        for row in rows:
+            ticker = row[1]
+            by_ticker.setdefault(ticker, []).append(row)
+
+        resolved = 0
+        for ticker, trade_rows in by_ticker.items():
+            market = await fetch_market_detail(session, ticker)
+            if not market or market.get("status") != "finalized":
+                continue
+
+            result: str | None = market.get("result")
+            if result not in ("yes", "no"):
+                continue
+
+            for (tid, _, side, count, entry, exit_pnl) in trade_rows:
+                if side == "no":
+                    settled_pnl = (entry * count) if result == "no" else (-(100 - entry) * count)
+                else:
+                    settled_pnl = ((100 - entry) * count) if result == "yes" else (-entry * count)
+
+                self._conn.execute(
+                    "UPDATE trades SET settled_result=?, settled_pnl_cents=? WHERE id=?",
+                    (result, float(settled_pnl), tid),
+                )
+
+                if exit_pnl is not None:
+                    delta = exit_pnl - settled_pnl
+                    logging.info(
+                        "[settle] trade #%d %s (%s): market=%s  captured=%.0f¢  "
+                        "settlement=%.0f¢  delta=%+.0f¢",
+                        tid, ticker, side, result, exit_pnl, settled_pnl, delta,
+                    )
+                else:
+                    logging.info(
+                        "[settle] trade #%d %s (%s): market=%s  settlement=%.0f¢  (no prior exit)",
+                        tid, ticker, side, result, settled_pnl,
+                    )
+                resolved += 1
+
+        if resolved:
+            logging.info("[settle] resolved %d trade(s) this cycle.", resolved)
 
     async def _place_sell_order(
         self,

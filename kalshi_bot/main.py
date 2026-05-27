@@ -63,6 +63,7 @@ from .release_schedule import is_within_release_window, next_release
 from .state import SeenDocuments
 from .win_rate_tracker import WinRateTracker, WIN_RATE_REPORT_INTERVAL
 from .analytics import run_attribution
+from .shadow_forecast import log_shadow_forecasts, backfill_iem_actuals
 from .weather_filter import (
     _ET,
     _filter_weather_opportunities,
@@ -1639,6 +1640,12 @@ async def _poll(
         _traj_dps = _compute_trajectory_projections(_metar_dps, datetime.now(timezone.utc))
         if _traj_dps:
             data_points.extend(_traj_dps)
+
+    # Log all temperature DataPoints to the shadow forecast table before any
+    # market-matching filter.  This captures ECMWF/ICON/GEM even when no
+    # active Kalshi market exists, giving an unbiased D+1 error dataset.
+    if data_points:
+        log_shadow_forecasts(opp_log._conn, data_points)
 
     numeric_opps: list[NumericOpportunity] = []
     if data_points and markets:
@@ -3413,6 +3420,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
         executor.set_ledger(ledger)
     connector = aiohttp.TCPConnector(limit=30)
     cycle = 0
+    _shadow_backfill_date: str = ""   # UTC date of last IEM actual backfill
 
     # Seed calibrated priors from any historical data already in the DB.
     executor.refresh_calibrated_priors(win_tracker)
@@ -3436,6 +3444,16 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                     logging.error("Unhandled error in poll cycle: %s", exc, exc_info=True)
 
                 cycle += 1
+
+                # IEM actual backfill — once per UTC calendar day.
+                _today_utc = datetime.now(timezone.utc).date().isoformat()
+                if _today_utc != _shadow_backfill_date:
+                    _shadow_backfill_date = _today_utc
+                    try:
+                        await backfill_iem_actuals(_shared_conn, session)
+                    except Exception as exc:
+                        logging.warning("shadow_forecast backfill error: %s", exc)
+
                 if WIN_RATE_REPORT_INTERVAL > 0 and cycle % WIN_RATE_REPORT_INTERVAL == 0:
                     try:
                         await win_tracker.settle_and_report(session)
