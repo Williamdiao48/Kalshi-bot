@@ -394,6 +394,12 @@ ADDON_MAX_TOTAL_CONTRACTS: int = env_int("ADDON_MAX_TOTAL_CONTRACTS", 20)
 # Locked (post-4:30 PM): flat LOCKED_P mirrors band_arb NO confidence level.
 BAND_ARB_YES_BASE_P: float = env_float("BAND_ARB_YES_BASE_P", 0.62)
 BAND_ARB_YES_LOCKED_P: float = env_float("BAND_ARB_YES_LOCKED_P", 0.88)
+# Dead-zone cap: backtest (n=828) shows 35–65¢ YES ask entries have negative EV
+# (-1.3¢ and -0.7¢ avg) vs +3.3¢ for 20–35¢ and +6.3¢ for >65¢.  Ceiling
+# breaches in this range wiped 34–50 contract positions at full entry cost.
+BAND_ARB_YES_DEAD_ZONE_LO: int   = env_int(  "BAND_ARB_YES_DEAD_ZONE_LO",   35)
+BAND_ARB_YES_DEAD_ZONE_HI: int   = env_int(  "BAND_ARB_YES_DEAD_ZONE_HI",   65)
+BAND_ARB_YES_DEAD_ZONE_CAP: int  = env_int(  "BAND_ARB_YES_DEAD_ZONE_CAP",   2)
 # Flat win probability for KXLOWT YES entries.
 # Backtest (Mar–May 2026, P75 entry, n=263): 85.6% WR → Laplace-smoothed 0.84.
 # Price is the dominant discriminative variable (Section 5); cold_gap and trend
@@ -2740,6 +2746,20 @@ class TradeExecutor:
                 p_win, signal.yes_ask, signal.ticker,
             )
             return
+
+        # Dead-zone size cap: 35–65¢ YES ask is negative EV per backtest.
+        if (
+            BAND_ARB_YES_DEAD_ZONE_CAP > 0
+            and BAND_ARB_YES_DEAD_ZONE_LO <= signal.yes_ask < BAND_ARB_YES_DEAD_ZONE_HI
+            and count > BAND_ARB_YES_DEAD_ZONE_CAP
+        ):
+            logging.info(
+                "BandArb YES dead-zone cap: %s yes_ask=%d¢ in [%d,%d)¢ → %d→%d contracts",
+                signal.ticker, signal.yes_ask,
+                BAND_ARB_YES_DEAD_ZONE_LO, BAND_ARB_YES_DEAD_ZONE_HI,
+                count, BAND_ARB_YES_DEAD_ZONE_CAP,
+            )
+            count = BAND_ARB_YES_DEAD_ZONE_CAP
 
         if not BAND_ARB_EXECUTION_ENABLED:
             if is_low_yes:
