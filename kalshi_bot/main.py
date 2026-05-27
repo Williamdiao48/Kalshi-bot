@@ -2653,19 +2653,12 @@ async def _poll(
             logging.info(
                 "ForecastNO: %d signal(s) found.", len(_forecast_no_signals),
             )
-            # Build set of city-date prefixes (e.g. "KXHIGHTSFO-26APR14") that
-            # already have a held or today-exited forecast_no position.  Adjacent
-            # strike bands in the same city are correlated — holding multiple
-            # bands doubles exposure with no diversification benefit.
-            _held_prefixes: set[str] = {
-                "-".join(t.split("-")[:2])
-                for t in (dry_run_held | _fno_exited_today)
-                if "KXHIGH" in t or "KXLOWT" in t
-            }
-            # Process highest-edge signal first so the best-conviction band wins
-            # when multiple bands from the same city qualify simultaneously.
+            # Enter every qualifying band independently.  Per-ticker dedup is
+            # sufficient: open-position check prevents re-entering a held band,
+            # and same-day re-entry check prevents re-entering one exited today.
+            # Multiple bands per city are allowed — they cover different
+            # temperature ranges and can settle differently.
             for _fno in sorted(_forecast_no_signals, key=lambda s: -s.min_edge_f):
-                _fno_prefix = "-".join(_fno.ticker.split("-")[:2])
                 if _fno.ticker in dry_run_held:
                     logging.info(
                         "ForecastNO skip: %s — open position held.", _fno.ticker,
@@ -2677,15 +2670,7 @@ async def _poll(
                         _fno.ticker,
                     )
                     continue
-                if _fno_prefix in _held_prefixes:
-                    logging.info(
-                        "ForecastNO skip: %s — city-date %s already has a position.",
-                        _fno.ticker, _fno_prefix,
-                    )
-                    continue
                 await executor.maybe_trade_forecast_no(session, _fno)
-                # Block further signals for this city-date within the same poll
-                _held_prefixes.add(_fno_prefix)
 
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)

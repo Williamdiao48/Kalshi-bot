@@ -301,6 +301,11 @@ FORECAST_NO_BLOCK_THRESHOLD_OVER: bool = env_bool("FORECAST_NO_BLOCK_THRESHOLD_O
 # Backtest (May 2026, 19 days): between_only → 88.6% WR, +16¢ avg (n=35);
 # T-markets (direction=under/over) drag current policy to -3.2¢ avg at 66.5% WR.
 FORECAST_NO_BETWEEN_ONLY: bool = env_bool("FORECAST_NO_BETWEEN_ONLY", True)
+# Maximum hours until market close at entry time.
+# Backtest (191 live trades): ≤20h → +573¢ / 75% WR; ≥24h → -1639¢ / 54% WR.
+# Overnight entries (00-10h UTC) produce long-horizon forecasts with high uncertainty;
+# the 20h cap keeps us in the same-day window where models are most reliable.
+FORECAST_NO_MAX_HOURS: float = float(os.environ.get("FORECAST_NO_MAX_HOURS", "20.0"))
 # City suffixes to skip (same default as band_arb YES — AUS has low hit rate)
 FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
     c.strip().lower() for c in
@@ -2177,6 +2182,15 @@ def find_forecast_nos(
         # Hours to close at signal time
         _close_time_str_fno = mkt.get("close_time") or mkt.get("expiration_time", "")
         _htc_fno = _hours_to_close(_close_time_str_fno)
+
+        # Reject signals too far from close.  Backtest: ≥24h trades are -1639¢ at 54% WR;
+        # ≤20h trades are +573¢ at 75% WR.  Skip if hours unknown (can't verify window).
+        if _htc_fno is None or _htc_fno > FORECAST_NO_MAX_HOURS:
+            logging.debug(
+                "ForecastNO skip %s: hours_to_close=%.1f > max=%.1f",
+                ticker, _htc_fno or -1, FORECAST_NO_MAX_HOURS,
+            )
+            continue
 
         # Calibration model: compute per-model edge vs actual Kalshi band ceiling.
         # Currently calibrated to filtered historical (35.7% WR) + live (67.7% WR).
