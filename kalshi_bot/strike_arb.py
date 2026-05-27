@@ -54,6 +54,7 @@ Environment variables
 from __future__ import annotations
 
 import logging
+import math
 import os
 from .utils import env_bool, env_float, env_int, parse_iso_dt
 import re
@@ -66,6 +67,7 @@ from pathlib import Path as _Path
 
 from .market_parser import parse_market
 from .cities import CITIES  # city timezone lookup for date-alignment guard
+from .calibration import forecast_no_win_prob as _cal_win_prob
 
 # Per-city/month p75/p90 peak-time thresholds (minutes since local midnight).
 # Loaded from data/peak_hour_p90.py; p75 is used by band_arb is_locked,
@@ -2152,12 +2154,13 @@ def find_forecast_nos(
             continue
 
         min_edge = min(e for _, _, e, _ in qualifying)
+        max_edge = max(e for _, _, e, _ in qualifying)
         source_names = [s for s, _, _, _ in qualifying]
 
         # Score: blend of source count and edge magnitude, capped at 0.95.
         raw_score = min(0.95, 0.60 + 0.05 * source_score + 0.01 * min_edge)
 
-        # p_estimate: direction-aware base calibrated to live day-ahead MAE (~3-4°F).
+        # p_estimate: direction-aware base (fallback if calibration model not loaded).
         # NO_HIGH is more reliable than NO_LOW per backtest (95%+ vs 80%+ at 2°F edge).
         # Source count bonus: each additional independent source raises confidence.
         _p_base = 0.80 if _signal_no_direction == "NO_HIGH" else 0.72
@@ -2174,6 +2177,31 @@ def find_forecast_nos(
         # Hours to close at signal time
         _close_time_str_fno = mkt.get("close_time") or mkt.get("expiration_time", "")
         _htc_fno = _hours_to_close(_close_time_str_fno)
+
+        # Calibration model: compute per-model edge vs actual Kalshi band ceiling.
+        # Currently calibrated to filtered historical (35.7% WR) + live (67.7% WR).
+        # Outputs ~0.50–0.65 for typical signals — conservative Kelly sizing vs hardcoded.
+        _src_vals = dict(corr_sources_map)
+        _cal_strike = parsed.strike_hi if _signal_no_direction == "NO_HIGH" else parsed.strike_lo
+        _cal_sign   = 1.0             if _signal_no_direction == "NO_HIGH" else -1.0
+
+        def _model_edge_f(src: str, _st=_cal_strike, _sg=_cal_sign) -> float:
+            v = _src_vals.get(src)
+            return round((v - _st) * _sg, 2) if v is not None else float("nan")
+
+        _cal_n_sup = sum(
+            1 for src in ("open_meteo_ecmwf", "open_meteo_icon", "open_meteo_gem", "hrrr")
+            if not math.isnan(_model_edge_f(src)) and _model_edge_f(src) > 0
+        )
+        _cal_p = _cal_win_prob(
+            edge_ecmwf=_model_edge_f("open_meteo_ecmwf"), edge_icon=_model_edge_f("open_meteo_icon"),
+            edge_gem=_model_edge_f("open_meteo_gem"),      edge_hrrr=_model_edge_f("hrrr"),
+            model_spread=_model_spread_fno or 0.0,         n_supporting=_cal_n_sup,
+            is_no_high=_signal_no_direction == "NO_HIGH",  is_high_market=parsed.metric.startswith("temp_high_"),
+            month_sin=math.sin(2*math.pi*_local_month/12), month_cos=math.cos(2*math.pi*_local_month/12),
+        )
+        if _cal_p is not None:
+            p_estimate = _cal_p
 
         logging.info(
             "ForecastNO signal: %s  no_ask=%d¢  edge=%.1f°F  dir=%s  sources=%s  score=%.2f",
