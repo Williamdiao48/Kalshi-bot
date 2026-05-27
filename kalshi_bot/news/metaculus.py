@@ -34,13 +34,17 @@ Thresholds (env-var overridable):
 
 import logging
 import os
-from ..utils import env_float, env_int
+from ..utils import env_bool, env_float, env_int
 from dataclasses import dataclass
 
 import aiohttp
 
 _API_URL = "https://www.metaculus.com/api2/questions/"
 _FETCH_LIMIT = 300   # broad enough to surface well-forecasted questions across topics
+
+# Metaculus blocks unauthenticated API access (403). Set METACULUS_ENABLED=true
+# in .env only if/when authenticated access is restored.
+METACULUS_ENABLED: bool = env_bool("METACULUS_ENABLED", False)
 
 META_MIN_DIVERGENCE: float  = env_float("META_MIN_DIVERGENCE", 0.2)
 META_MIN_FORECASTERS: int   = env_int("META_MIN_FORECASTERS", 20)
@@ -61,8 +65,11 @@ class MetaculusQuestion:
 async def fetch_questions(session: aiohttp.ClientSession) -> list[MetaculusQuestion]:
     """Fetch active binary Metaculus questions with community forecasts.
 
-    Returns an empty list on any fetch or parse failure.
+    Returns an empty list when disabled or on any fetch/parse failure.
     """
+    if not METACULUS_ENABLED:
+        return []
+
     params = {
         "format":   "json",
         "limit":    str(_FETCH_LIMIT),

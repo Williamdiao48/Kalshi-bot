@@ -31,7 +31,7 @@ Environment variables
 import asyncio
 import logging
 import os
-from ..utils import env_bool
+from ..utils import env_bool, get_with_retry
 from datetime import datetime, timezone
 
 import aiohttp
@@ -76,14 +76,12 @@ async def _fetch_pair(
     url = _BASE_URL.format(ticker=yf_ticker)
     params = {"interval": "1m", "range": "1d"}
     try:
-        async with session.get(
-            url,
+        data = await get_with_retry(
+            session, url,
             params=params,
             headers=_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+        )
     except aiohttp.ClientResponseError as exc:
         logging.warning(
             "Yahoo Forex HTTP %s for %s: %s", exc.status, yf_ticker, exc.message

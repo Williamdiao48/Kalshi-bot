@@ -31,7 +31,7 @@ Environment variables
 """
 
 import logging
-from ..utils import env_bool
+from ..utils import env_bool, get_with_retry
 from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
@@ -138,14 +138,12 @@ async def _fetch_symbol(
     """
     url = _BASE_URL.format(symbol=symbol)
     try:
-        async with session.get(
-            url,
+        data = await get_with_retry(
+            session, url,
             params={"interval": "1m", "range": "1d"},
             headers=_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+        )
     except aiohttp.ClientResponseError as exc:
         logging.warning("WTI Futures HTTP %s for %s: %s", exc.status, symbol, exc.message)
         return None, None, "UNKNOWN"

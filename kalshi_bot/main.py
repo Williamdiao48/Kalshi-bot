@@ -1171,7 +1171,7 @@ async def _poll(
         ("fred",         fred.fetch_rates(session)),
         ("eia",          eia.fetch_prices(session)),
         ("wti_futures",  wti_futures.fetch_futures(session)),
-        ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),
+        ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),  # no-op when CME_FEDWATCH_ENABLED=false
         ("box_office",   box_office.fetch_weekend_chart(session, seen)),
         ("polymarket",   polymarket.fetch_markets(session)),
         ("metaculus",    metaculus.fetch_questions(session)),
@@ -1217,7 +1217,7 @@ async def _poll(
     nba_markets_result = R["nba_markets"]
 
     if isinstance(fedwatch_result, Exception):
-        logging.error("CME FedWatch fetch error: %s", fedwatch_result)
+        logging.warning("CME FedWatch fetch error: %s", fedwatch_result)
 
     if isinstance(markets_result, Exception):
         logging.error("Failed to fetch markets: %s", markets_result)
@@ -1953,7 +1953,7 @@ async def _poll(
         poly_opps.extend(opps)
 
     if isinstance(metaculus_result, Exception):
-        logging.error("Metaculus fetch error: %s", metaculus_result)
+        logging.warning("Metaculus fetch error: %s", metaculus_result)
     elif metaculus_result and markets:
         opps = match_metaculus_to_kalshi(metaculus_result, markets)
         if opps:
@@ -2907,6 +2907,7 @@ def _adaptive_poll_interval(now_utc: datetime) -> int:
 async def _fast_loop(
     session: aiohttp.ClientSession,
     executor: "TradeExecutor",
+    opp_log: "OpportunityLog",
     ledger: "DryRunLedger | None" = None,
 ) -> None:
     """Lightweight band-arb check that runs between full poll cycles.
@@ -3451,7 +3452,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                     await asyncio.sleep(FAST_LOOP_INTERVAL)
                     _elapsed += FAST_LOOP_INTERVAL
                     try:
-                        await _fast_loop(session, executor, ledger=ledger)
+                        await _fast_loop(session, executor, opp_log, ledger=ledger)
                     except Exception as exc:
                         logging.debug("Fast loop error: %s", exc)
                 _remaining = _sleep - _elapsed

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Any
+
+import aiohttp
 
 
 # ---------------------------------------------------------------------------
@@ -69,3 +74,43 @@ def env_bool(name: str, default: bool) -> bool:
     raise ValueError(
         f"Environment variable {name}={raw!r} must be 'true' or 'false'"
     )
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+async def get_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: aiohttp.ClientTimeout | None = None,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> Any:
+    """GET *url*, retrying up to *retries* times on HTTP 429.
+
+    Sleeps backoff * 2^attempt seconds before each retry.
+    Raises aiohttp.ClientResponseError on non-429 HTTP errors or after all
+    retries are exhausted.  Returns the parsed JSON body on success.
+    """
+    kwargs: dict[str, Any] = {}
+    if params is not None:
+        kwargs["params"] = params
+    if headers is not None:
+        kwargs["headers"] = headers
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    for attempt in range(retries):
+        async with session.get(url, **kwargs) as resp:
+            if resp.status == 429 and attempt < retries - 1:
+                await asyncio.sleep(backoff * (2 ** attempt))
+                continue
+            resp.raise_for_status()
+            return await resp.json()
+
+    # Should not reach here, but satisfies type checker
+    raise aiohttp.ClientResponseError(None, (), status=429, message="Too Many Requests")  # type: ignore[arg-type]

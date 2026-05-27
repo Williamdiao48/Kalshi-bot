@@ -60,9 +60,7 @@ class Feed:
 
 FEEDS: list[Feed] = [
     # Breaking / general news
-    Feed("ap_top",      "AP News Top Stories", "https://feeds.apnews.com/rss/apf-topnews"),
-    Feed("ap_politics", "AP Politics",          "https://feeds.apnews.com/rss/apf-politics"),
-    Feed("reuters",     "Reuters Top News",     "https://feeds.reuters.com/reuters/topNews"),
+    # AP (feeds.apnews.com defunct 2024) and Reuters (feeds.reuters.com defunct) removed.
     Feed("bbc",         "BBC News",             "http://feeds.bbci.co.uk/news/rss.xml"),
     Feed("npr",         "NPR News",             "https://feeds.npr.org/1001/rss.xml"),
     # Politics (production Kalshi markets)
@@ -87,7 +85,7 @@ FEEDS: list[Feed] = [
     Feed("coindesk",      "CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),
     Feed("cointelegraph", "Cointelegraph", "https://cointelegraph.com/rss"),
     # Financial news (economics, earnings, macro)
-    Feed("cnbc_top",    "CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    # CNBC (403 Forbidden) removed.
     Feed("marketwatch", "MarketWatch",   "https://feeds.marketwatch.com/marketwatch/topstories/"),
 ]
 

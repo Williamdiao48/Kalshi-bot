@@ -28,7 +28,7 @@ FOMCMeeting.hike_prob  — probability of at least one 25bp hike
 
 import logging
 import os
-from ..utils import env_float
+from ..utils import env_bool, env_float
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +47,9 @@ _HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html",
 }
+
+# Set CME_FEDWATCH_ENABLED=true in .env to re-enable when trading KXFED* markets.
+CME_FEDWATCH_ENABLED: bool = env_bool("CME_FEDWATCH_ENABLED", False)
 
 CME_FEDWATCH_CACHE_MINUTES: float = float(
     os.environ.get("CME_FEDWATCH_CACHE_MINUTES", "60")
@@ -169,8 +172,11 @@ async def fetch_next_meeting(
 ) -> FOMCMeeting | None:
     """Fetch (or return cached) FOMC meeting probabilities.
 
-    Updates the module-level cache.  Returns None on any failure.
+    Updates the module-level cache.  Returns None on any failure or when disabled.
     """
+    if not CME_FEDWATCH_ENABLED:
+        return None
+
     global _cached, _cached_at
 
     now = time.monotonic()
@@ -207,6 +213,8 @@ async def fetch_fedwatch_datapoints(
     session: aiohttp.ClientSession,
 ) -> list[DataPoint]:
     """Convert CME FedWatch probabilities into a DataPoint for KXFED matching.
+
+    Returns empty list when CME_FEDWATCH_ENABLED is false.
 
     The KXFED market format is "Will the upper bound of the federal funds rate
     be above X% following the next FOMC meeting?"  The market prices the rate
