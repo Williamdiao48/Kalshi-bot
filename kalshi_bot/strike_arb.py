@@ -247,10 +247,11 @@ BAND_ARB_LOW_YES_MAX_HTC: float = env_float("BAND_ARB_LOW_YES_MAX_HTC", 6.0)
 # GFS daily min clearance gate for warm-side NO.
 # Backtest (2022–2026, Section 11): for pos=2/3 (affordable NO trades the bot
 # actually enters), a ≥+2°F GFS threshold adds ~1% WR lift while cutting 55–67%
-# of qualifying trades — net negative EV. The headline 94% WR at ≥+2°F is driven
-# by expensive pos=0/1 bands the bot skips. Gate is disabled (0.0) to preserve
-# volume; the 1.5°F METAR margin gate is the primary filter.
-# Set to a positive value to re-enable if GFS query is fixed to use temp_low_* metrics.
+# Buffer (°F) around the band used in the GFS in-band veto for KXLOWT warm-NO.
+# If GFS daily-low forecast falls within ±BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F of the
+# band [floor, ceil], the trade is blocked.  1°F ≈ half a NWS rounding step.
+# Set to 0.0 to disable. (Legacy clearance constant below kept for env-var compat.)
+BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F: float = env_float("BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F", 0.5)
 BAND_ARB_LOW_GFS_MIN_CLEARANCE_F: float = env_float("BAND_ARB_LOW_GFS_MIN_CLEARANCE_F", 0.0)
 
 # --- Forecast-driven NO signal configuration --------------------------------
@@ -1061,22 +1062,25 @@ def find_band_arbs(
                         )
                         continue
 
-                # GFS daily min clearance gate: GFS daily-min must exceed the
-                # band ceiling by BAND_ARB_LOW_GFS_MIN_CLEARANCE_F.  When GFS
-                # shows tight clearance the model thinks temp may still drop
-                # into the band — most May losing trades had clearance < 2°F.
+                # GFS in-band veto: if the GFS daily-low forecast lands inside the
+                # band (or within BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F of either
+                # boundary), block.  GFS predicting in-band means YES is likely;
+                # we should not bet warm-side NO when GFS disagrees.
+                # Note: this uses temp_low_* from gfs_morning_values (populated
+                # only after the first open_meteo_gfs reading of the day, typically
+                # ~18 UTC), so it only fires on late-afternoon/evening entries.
                 _warm_gfs_min: float | None = None  # carried into signal for sizer
-                if BAND_ARB_LOW_GFS_MIN_CLEARANCE_F > 0 and gfs_morning_values is not None:
+                if BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F >= 0 and gfs_morning_values is not None:
                     _gfs_low_min = gfs_morning_values.get(parsed.metric)
                     if _gfs_low_min is not None:
                         _warm_gfs_min = _gfs_low_min
-                        _gfs_clearance = _gfs_low_min - band_ceil
-                        if _gfs_clearance < BAND_ARB_LOW_GFS_MIN_CLEARANCE_F:
+                        _band_lo = parsed.strike_lo if parsed.strike_lo is not None else (band_ceil - 1.0)
+                        _buf = BAND_ARB_LOW_GFS_IN_BAND_BUFFER_F
+                        if _band_lo - _buf <= _gfs_low_min <= band_ceil + _buf:
                             logging.warning(
-                                "BandArb warm-NO skip (GFS clearance): %s —"
-                                " GFS_min=%.1f°F ceil=%.1f°F clearance=%.1f°F < %.1f°F",
-                                ticker, _gfs_low_min, band_ceil,
-                                _gfs_clearance, BAND_ARB_LOW_GFS_MIN_CLEARANCE_F,
+                                "BandArb warm-NO skip (GFS in-band): %s —"
+                                " GFS_low=%.1f°F in band [%.1f,%.1f]±%.1f°F",
+                                ticker, _gfs_low_min, _band_lo, band_ceil, _buf,
                             )
                             continue
 

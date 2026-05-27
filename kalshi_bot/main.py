@@ -192,7 +192,7 @@ def _refresh_gfs_morning_snap(conn) -> None:
                 SELECT metric, MIN(logged_at) AS first_at
                 FROM raw_forecasts
                 WHERE source = 'open_meteo_gfs'
-                  AND metric LIKE 'temp_high_%'
+                  AND (metric LIKE 'temp_high_%' OR metric LIKE 'temp_low_%')
                   AND date(logged_at) = ?
                 GROUP BY metric
             ) fv ON rf.metric = fv.metric AND rf.logged_at = fv.first_at
