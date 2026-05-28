@@ -131,10 +131,11 @@ def kalshi_active_contract(today: date | None = None) -> tuple[str, date]:
 async def _fetch_symbol(
     session: aiohttp.ClientSession,
     symbol: str,
-) -> tuple[float | None, int | None, str]:
-    """Fetch regularMarketPrice/Time/State for a Yahoo Finance symbol.
+) -> tuple[float | None, int | None, str, float | None]:
+    """Fetch regularMarketPrice/Time/State/prevClose for a Yahoo Finance symbol.
 
-    Returns (price, timestamp_epoch, market_state).  price is None on any error.
+    Returns (price, timestamp_epoch, market_state, prev_close).
+    price is None on any error; prev_close is None when unavailable.
     """
     url = _BASE_URL.format(symbol=symbol)
     try:
@@ -146,10 +147,10 @@ async def _fetch_symbol(
         )
     except aiohttp.ClientResponseError as exc:
         logging.warning("WTI Futures HTTP %s for %s: %s", exc.status, symbol, exc.message)
-        return None, None, "UNKNOWN"
+        return None, None, "UNKNOWN", None
     except aiohttp.ClientError as exc:
         logging.warning("WTI Futures request error for %s: %s", symbol, exc)
-        return None, None, "UNKNOWN"
+        return None, None, "UNKNOWN", None
 
     try:
         meta = data["chart"]["result"][0]["meta"]
@@ -160,12 +161,13 @@ async def _fetch_symbol(
             symbol,
             error.get("description", "unknown error"),
         )
-        return None, None, "UNKNOWN"
+        return None, None, "UNKNOWN", None
 
     return (
         meta.get("regularMarketPrice"),
         meta.get("regularMarketTime"),
         meta.get("marketState", "UNKNOWN"),
+        meta.get("chartPreviousClose"),
     )
 
 
@@ -187,13 +189,20 @@ def _is_fresh(price: float | None, ts: int | None) -> bool:
     return True
 
 
+_CLF_PREV_CLOSE_TOLERANCE = 0.15  # $/bbl — prevClose must match within this to confirm same contract
+
+
 async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
     """Fetch the current WTI front-month futures price.
 
-    Tries the specific CME contract that Kalshi settles on first (e.g. CLN26.NYM).
-    Falls back to CL=F (Yahoo's generic front-month) if the specific contract
-    returns UNKNOWN market state or a stale quote — which happens when Yahoo
-    hasn't yet started tracking a newly-active contract code.
+    Fetches the specific CME contract Kalshi settles on (e.g. CLN26.NYM) and
+    CL=F concurrently.  Uses the specific contract when available.  Falls back
+    to CL=F only after cross-validating that its prevClose matches the specific
+    contract's prevClose (within _CLF_PREV_CLOSE_TOLERANCE $/bbl) — confirming
+    CL=F hasn't rolled to a different contract month than Kalshi uses.
+
+    If the specific contract is unusable AND CL=F fails the prevClose cross-check,
+    returns an empty list rather than risk trading on the wrong contract price.
 
     Returns a single-element list on success, empty list on any error or if
     WTI_FUTURES_ENABLED is false.
@@ -201,23 +210,77 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
     if not WTI_FUTURES_ENABLED:
         return []
 
+    import asyncio
+
     now_utc = datetime.now(timezone.utc)
     specific_symbol, ltd = kalshi_active_contract()
     days_to_ltd = (ltd - now_utc.date()).days
 
-    # Try specific contract first, fall back to CL=F.
-    price, ts, market_state = await _fetch_symbol(session, specific_symbol)
-    used_symbol = specific_symbol
-    if not _is_fresh(price, ts):
-        logging.warning(
-            "WTI Futures [%s]: unusable (state=%s) — falling back to CL=F",
-            specific_symbol, market_state,
+    # Fetch specific contract and CL=F concurrently.
+    (price_s, ts_s, state_s, prev_s), (price_clf, ts_clf, state_clf, prev_clf) = (
+        await asyncio.gather(
+            _fetch_symbol(session, specific_symbol),
+            _fetch_symbol(session, "CL=F"),
         )
-        price, ts, market_state = await _fetch_symbol(session, "CL=F")
-        used_symbol = "CL=F"
-        if not _is_fresh(price, ts):
-            logging.warning("WTI Futures: CL=F also unusable (state=%s) — skipping", market_state)
-            return []
+    )
+
+    specific_fresh = _is_fresh(price_s, ts_s)
+    clf_fresh = _is_fresh(price_clf, ts_clf)
+
+    # Cross-validate CL=F against the specific contract using prevClose.
+    # prevClose is a fixed daily value — if both symbols are on the same contract
+    # month their prevClose values are identical.  A mismatch > tolerance means
+    # CL=F has rolled to a different month than Kalshi is using.
+    clf_contract_ok: bool
+    if specific_fresh and clf_fresh and prev_s is not None and prev_clf is not None:
+        delta = abs(prev_s - prev_clf)
+        if delta > _CLF_PREV_CLOSE_TOLERANCE:
+            logging.warning(
+                "WTI contract mismatch: %s prevClose=%.2f vs CL=F prevClose=%.2f "
+                "(Δ=%.2f $/bbl > %.2f threshold) — CL=F is on a different month; "
+                "will not use CL=F as fallback",
+                specific_symbol, prev_s, prev_clf, delta, _CLF_PREV_CLOSE_TOLERANCE,
+            )
+            clf_contract_ok = False
+        else:
+            clf_contract_ok = True
+    elif prev_s is not None and prev_clf is not None:
+        # Even if specific price is stale, prevClose cross-check still works.
+        delta = abs(prev_s - prev_clf)
+        clf_contract_ok = delta <= _CLF_PREV_CLOSE_TOLERANCE
+        if not clf_contract_ok:
+            logging.warning(
+                "WTI contract mismatch (specific price stale): %s prevClose=%.2f "
+                "vs CL=F prevClose=%.2f (Δ=%.2f $/bbl) — refusing CL=F fallback",
+                specific_symbol, prev_s, prev_clf, delta,
+            )
+    else:
+        # Cannot validate — allow CL=F fallback but log a warning.
+        clf_contract_ok = True
+        if not specific_fresh and clf_fresh:
+            logging.warning(
+                "WTI: %s unusable and prevClose unavailable for cross-check — "
+                "using CL=F unvalidated (caveat emptor)",
+                specific_symbol,
+            )
+
+    # Choose price source.
+    if specific_fresh:
+        price, ts, market_state, used_symbol = price_s, ts_s, state_s, specific_symbol
+    elif clf_fresh and clf_contract_ok:
+        logging.warning(
+            "WTI Futures [%s]: unusable (state=%s) — using CL=F (prevClose cross-check %s)",
+            specific_symbol,
+            state_s,
+            "passed" if (prev_s is not None and prev_clf is not None) else "skipped",
+        )
+        price, ts, market_state, used_symbol = price_clf, ts_clf, state_clf, "CL=F"
+    else:
+        logging.warning(
+            "WTI Futures: no usable price (specific=%s state=%s, CL=F ok=%s state=%s) — skipping",
+            specific_fresh, state_s, clf_contract_ok, state_clf,
+        )
+        return []
 
     as_of = (
         datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
