@@ -92,7 +92,6 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 | NWS climatological (CLI) | Official daily high/low from NWS CLI products | `KXHIGH*`, `KXLOWT*` |
 | Open-Meteo | Multi-model ensemble: blended, ECMWF IFS, ICON, GEM; per-source/city/month bias-corrected from 2-year historical backtest | `KXHIGH*`, `KXLOWT*` |
 | WeatherAPI | Cross-validation for forecast temperature signals | `KXHIGH*`, `KXLOWT*` |
-| OpenWeatherMap | Independent high/low temp cross-validation | `KXHIGH*`, `KXLOWT*` |
 | Box Office Mojo | Weekend domestic gross estimates | `KXBO*` |
 | Pinnacle | NBA game moneylines and spreads | `KXNBA*` |
 | Coinbase | BTC, ETH (USD) spot prices | `KXBTCD`, `KXBTC15M`, `KXETH15M` |
@@ -106,7 +105,7 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 | EIA Inventory | Weekly petroleum inventory report | `KXEIA*` |
 | CME FedWatch | Probability-weighted next Fed meeting outcome | `KXFED` |
 
-#### Temperature cities covered (20 cities, high and low)
+#### Temperature cities covered (21 cities, high and low)
 | City | High metric | Low metric | Station |
 |---|---|---|---|
 | Los Angeles | `temp_high_lax` | `temp_low_lax` | KLAX |
@@ -323,7 +322,6 @@ kalshi_bot/
     │                          blended best_match, ECMWF IFS, ICON, GEM
     │                          (high + low, all 20 cities; bias-corrected)
     ├── weatherapi.py        WeatherAPI.com cross-validation fetcher
-    ├── owm.py               OpenWeatherMap cross-validation fetcher
     ├── pinnacle.py          Pinnacle NBA moneyline/spread fetcher
     │                          (NBA game odds for KXNBA* markets)
     ├── coinbase.py          Coinbase spot price fetcher (BTC, ETH)
@@ -480,7 +478,7 @@ caffeinate -i venv/bin/python run.py
 | `BAND_ARB_NOAA_NONE_MAX_NO_ASK` | `40` | Max NO ask when NOAA absent (market soft-confirmation cap) |
 | `BAND_ARB_MAX_SOURCE_DIVERGENCE_F` | `4.0` | Max METAR vs NOAA divergence before suppressing signal |
 | `WATCH_THRESHOLD_F` | `2.0` | °F from a band ceiling to add city to fast-loop watchlist |
-| `BAND_ARB_LOW_CEIL_MIN_HOUR` | `12` | Earliest local hour for warm-side KXLOWT NO entries (overnight low established by noon) |
+| `BAND_ARB_LOW_CEIL_MIN_HOUR` | `6` | Fallback earliest local hour for warm-side KXLOWT NO entries (overridden by per-city/month P75 trough data when available) |
 | `BAND_ARB_LOW_CEIL_MAX_HOUR` | `15` | Latest local hour for warm-side KXLOWT NO entries (afternoon cooling window opens after 3 PM) |
 | `BAND_ARB_LOW_CEIL_MAX_NO_ASK` | `88` | Max NO ask for warm-side KXLOWT NO entries — ≤88¢ = 100% WR in backtest; ≥89¢ introduces losses |
 | `BAND_ARB_LOW_WARM_NO_BLOCK_CITIES` | `den` | Cities blocked from warm-side NO signals (DEN: alpine cold air pools persist past noon, 33% WR) |
@@ -554,6 +552,7 @@ Modules that exist in the codebase but are not yet wired into the live bot:
 | Module | Description | Status |
 |---|---|---|
 | `news/vlr.py` | VLR.gg live Valorant match data (map scores, round state) for esports markets | In development |
+| `news/manifold.py` | Manifold play-money prediction market divergence matching | Implemented, not integrated |
 | `news/binance.py` | Binance spot prices for BTC, ETH, SOL, XRP, DOGE and other crypto assets | Implemented, not integrated |
 | `news/adp.py` | ADP private-sector payrolls report — early NFP signal | Implemented, not integrated |
 | `news/chicago_pmi.py` | Chicago Business Barometer PMI — manufacturing pre-signal | Implemented, not integrated |
