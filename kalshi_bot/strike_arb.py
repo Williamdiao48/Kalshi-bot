@@ -973,6 +973,25 @@ def find_band_arbs(
                     is_definitive_no = True
                     band_ceil = parsed.strike
 
+        # ASOS shadow: record every KXHIGH ASOS crossing before gates filter them.
+        # Mirrors the warm-NO shadow pattern for KXLOWT blocked cities — lets us
+        # measure ungated ASOS signal performance vs. gated real trades.
+        if is_definitive_no and not is_low_market:
+            signals.append(BandArbSignal(
+                metric=parsed.metric,
+                ticker=ticker,
+                yes_bid=yes_bid,
+                no_ask=no_ask,
+                observed_max=observed_max,
+                band_ceil=band_ceil,
+                direction=parsed.direction,
+                city=mkt.get("subtitle", "") or ticker,
+                side="no",
+                hrrr_val=(hrrr_values or {}).get(parsed.metric),
+                corr_status="asos_shadow",
+                shadow=True,
+            ))
+
         # --- LOW-market NOAA confirmation guard ----------------------------
         # For KXLOWT NO signals: if noaa_observed has fresh data and shows
         # the running-min is within NWS rounding distance of the floor, the

@@ -2988,11 +2988,13 @@ class TradeExecutor:
         )
 
     def _log_shadow_band_arb(self, signal: "BandArbSignal") -> None:
-        """Log a warm-NO band_arb signal that was blocked by the city whitelist.
+        """Log a shadow band_arb signal (no real trade placed).
 
-        Records to shadow_band_arb with a hypothetical contract count so we can
-        track win/loss patterns for cities outside the whitelist without risking
-        capital.  Deduplicates: one open shadow row per ticker at a time.
+        Used for: (1) KXLOWT warm-NO signals blocked by city whitelist;
+        (2) KXHIGH ASOS crossing signals logged before any gates apply
+        (corr_status="asos_shadow"), so ungated ASOS performance can be
+        measured vs. gated real trades.  Deduplicates: one open shadow row
+        per ticker at a time.
         """
         existing = self._conn.execute(
             "SELECT id FROM shadow_band_arb WHERE ticker = ? AND outcome IS NULL",
