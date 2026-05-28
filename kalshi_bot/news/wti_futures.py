@@ -192,6 +192,32 @@ def _is_fresh(price: float | None, ts: int | None) -> bool:
 _CLF_PREV_CLOSE_TOLERANCE = 0.15  # $/bbl — prevClose must match within this to confirm same contract
 
 
+def _prev_contract_ticker(today: date | None = None) -> str:
+    """Return the Yahoo ticker for the WTI contract Kalshi just rolled FROM.
+
+    One delivery month before the current active contract.  Used as a reference
+    to detect when CL=F hasn't yet rolled to the new front month: if CL=F's
+    prevClose matches the *previous* contract's prevClose, Yahoo is still tracking
+    the old month while Kalshi has already moved on.
+    """
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    year, month = today.year, today.month
+    # Find the active delivery month (same loop as kalshi_active_contract)
+    for _ in range(10):
+        ltd = _LTD.get((year, month)) or _ltd_formula(year, month)
+        if today < ltd - timedelta(days=2):
+            break
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    # Back up one delivery month
+    month -= 1
+    if month == 0:
+        month, year = 12, year - 1
+    return f"CL{_MONTH_CODES[month]}{str(year)[-2:]}.NYM"
+
+
 async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
     """Fetch the current WTI front-month futures price.
 
@@ -255,13 +281,34 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
                 specific_symbol, prev_s, prev_clf, delta,
             )
     else:
-        # Cannot validate — allow CL=F fallback but log a warning.
-        clf_contract_ok = True
-        if not specific_fresh and clf_fresh:
+        # Cannot validate via specific contract — fetch the previous contract as a
+        # reference.  If CL=F's prevClose matches the OLD contract's prevClose, Yahoo
+        # hasn't rolled yet while Kalshi already has → reject CL=F.
+        prev_symbol = _prev_contract_ticker(now_utc.date())
+        _, _, _, prev_clf_close = await _fetch_symbol(session, prev_symbol)
+        if prev_clf_close is not None and prev_clf is not None:
+            old_delta = abs(prev_clf_close - prev_clf)
+            if old_delta <= _CLF_PREV_CLOSE_TOLERANCE:
+                logging.warning(
+                    "WTI contract mismatch: %s has no prevClose but CL=F prevClose=%.2f "
+                    "matches previous contract %s prevClose=%.2f (Δ=%.2f) — "
+                    "Yahoo hasn't rolled yet; refusing CL=F fallback",
+                    specific_symbol, prev_clf, prev_symbol, prev_clf_close, old_delta,
+                )
+                clf_contract_ok = False
+            else:
+                clf_contract_ok = True
+                logging.debug(
+                    "WTI: %s prevClose unavailable; CL=F cross-checked against "
+                    "previous contract %s (Δ=%.2f $/bbl) — OK",
+                    specific_symbol, prev_symbol, old_delta,
+                )
+        else:
+            # Both specific and previous contract prevClose unavailable — accept with warning.
+            clf_contract_ok = True
             logging.warning(
-                "WTI: %s unusable and prevClose unavailable for cross-check — "
-                "using CL=F unvalidated (caveat emptor)",
-                specific_symbol,
+                "WTI: %s and %s both lack prevClose — using CL=F unvalidated",
+                specific_symbol, prev_symbol,
             )
 
     # Choose price source.
