@@ -53,6 +53,7 @@ Environment variables
 import asyncio
 import logging
 import os
+import re
 from ..utils import env_int
 import time
 from collections import defaultdict
@@ -65,9 +66,14 @@ from ..data import DataPoint
 from ..cities import CITIES, KALSHI_STATION_IDS
 
 _BASE_URL = "https://aviationweather.gov/api/data/metar"
+# NWS raw METAR text files — published within ~2 min of observation vs ~20 min for
+# the FAA ADDS JSON maxT field.  Used to pull 6-hr synoptic groups (10TTT/20TTT) sooner.
+_RAW_METAR_BASE = "https://tgftp.nws.noaa.gov/data/observations/metar/stations"
 
 METAR_CACHE_SECONDS: int = env_int("METAR_CACHE_SECONDS", 30)
 METAR_LOOKBACK_HOURS: int = env_int("METAR_LOOKBACK_HOURS", 24)
+# Cache raw NWS text slightly shorter than ADDS so every ADDS refresh also re-checks raw.
+_RAW_SIX_HR_CACHE_SECS: int = env_int("RAW_METAR_CACHE_SECONDS", 25)
 
 # Reverse map: ICAO station ID → metric key (e.g. "KNYC" → "temp_high_ny")
 _STATION_TO_METRIC: dict[str, str] = {
@@ -93,6 +99,9 @@ _cache_points: list[DataPoint] = []
 # Each entry: (station, metric, obs_at_iso, temp_f)
 _pending_obs_rows: list[tuple[str, str, str, float]] = []
 
+# Per-station raw NWS text cache: station_id → (monotonic_ts, obs_utc|None, max_c|None, min_c|None)
+_raw_six_hr_cache: dict[str, tuple[float, "datetime | None", "float | None", "float | None"]] = {}
+
 
 def take_obs_rows() -> list[tuple[str, str, str, float]]:
     """Return individual METAR observation rows from the last fresh API fetch and clear the buffer.
@@ -104,6 +113,76 @@ def take_obs_rows() -> list[tuple[str, str, str, float]]:
     rows = _pending_obs_rows[:]
     _pending_obs_rows.clear()
     return rows
+
+
+def _parse_raw_six_hr_temps(
+    text: str,
+) -> tuple["datetime | None", "float | None", "float | None"]:
+    """Parse a NWS raw METAR text file into (obs_utc, max_c, min_c).
+
+    File format (two lines):
+        YYYY/MM/DD HH:MM
+        KXXX DDHHMMZ ... RMK ... 10TTT 20TTT ...
+
+    Remarks groups 10TTT / 11TTT (6-hr max) and 20TTT / 21TTT (6-hr min)
+    encode temperature in tenths of °C; second digit is sign (0=+, 1=-).
+    Returns (None, None, None) if the header cannot be parsed.
+    max_c / min_c are None when the group is absent (e.g. non-synoptic obs).
+    """
+    lines = text.strip().splitlines()
+    if len(lines) < 2:
+        return None, None, None
+    try:
+        obs_utc = datetime.strptime(lines[0].strip(), "%Y/%m/%d %H:%M").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None, None, None
+
+    metar_line = lines[1]
+    rmk_idx = metar_line.find(" RMK ")
+    if rmk_idx == -1:
+        return obs_utc, None, None
+
+    max_c = min_c = None
+    for token in metar_line[rmk_idx + 5 :].split():
+        if re.fullmatch(r"1[01]\d{3}", token):
+            sign = int(token[1])
+            max_c = int(token[2:]) / 10.0 * (-1 if sign else 1)
+        elif re.fullmatch(r"2[01]\d{3}", token):
+            sign = int(token[1])
+            min_c = int(token[2:]) / 10.0 * (-1 if sign else 1)
+
+    return obs_utc, max_c, min_c
+
+
+async def _fetch_raw_six_hr(
+    session: aiohttp.ClientSession,
+    station_id: str,
+) -> tuple["datetime | None", "float | None", "float | None"]:
+    """Fetch and parse the NWS raw METAR text for a single station.
+
+    Returns (obs_utc, max_c, min_c); None values when unavailable or when the
+    observation is not a synoptic report.  Cached per station for
+    _RAW_SIX_HR_CACHE_SECS seconds.
+    """
+    now = time.monotonic()
+    cached = _raw_six_hr_cache.get(station_id)
+    if cached is not None and (now - cached[0]) < _RAW_SIX_HR_CACHE_SECS:
+        return cached[1], cached[2], cached[3]
+
+    url = f"{_RAW_METAR_BASE}/{station_id}.TXT"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return None, None, None
+            text = await resp.text()
+    except Exception:
+        return None, None, None
+
+    obs_utc, max_c, min_c = _parse_raw_six_hr_temps(text)
+    _raw_six_hr_cache[station_id] = (now, obs_utc, max_c, min_c)
+    return obs_utc, max_c, min_c
 
 
 def _filter_cache_to_today(now_utc: datetime) -> list[DataPoint]:
@@ -158,19 +237,27 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
         "hours":  str(METAR_LOOKBACK_HOURS),
     }
 
-    try:
+    # Run ADDS JSON fetch and per-station raw NWS text fetches concurrently.
+    # Raw text (tgftp.nws.noaa.gov) typically publishes 6-hr synoptic groups
+    # within ~2-5 min of the observation vs ~20 min for the ADDS JSON maxT field.
+    async def _do_adds() -> tuple[list[dict], datetime]:
         async with session.get(
             _BASE_URL,
             params=params,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             resp.raise_for_status()
-            records: list[dict] = await resp.json()
-        # Wall-clock time the HTTP response was fully received — this is when
-        # the bot actually had the data, regardless of what obsTime says.
-        fetch_wall_utc = datetime.now(timezone.utc)
-    except Exception as exc:
-        logging.warning("METAR fetch failed: %s", exc)
+            data: list[dict] = await resp.json()
+        return data, datetime.now(timezone.utc)
+
+    _gather = await asyncio.gather(
+        _do_adds(),
+        *[_fetch_raw_six_hr(session, sid) for sid in station_ids],
+        return_exceptions=True,
+    )
+    _adds_result = _gather[0]
+    if isinstance(_adds_result, Exception):
+        logging.warning("METAR fetch failed: %s", _adds_result)
         if _cache_points:
             stale = _filter_cache_to_today(now_utc)
             logging.debug(
@@ -180,6 +267,13 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             )
             return stale
         return _cache_points
+    records, fetch_wall_utc = _adds_result
+
+    # Build raw six-hr dict: station → (obs_utc, max_c, min_c)
+    _raw_six_hr: dict[str, tuple[datetime | None, float | None, float | None]] = {}
+    for _sid, _res in zip(station_ids, _gather[1:]):
+        if not isinstance(_res, Exception):
+            _raw_six_hr[_sid] = _res  # type: ignore[assignment]
 
     # Group observations by station ID
     by_station: dict[str, list[dict]] = defaultdict(list)
@@ -270,6 +364,31 @@ async def fetch_city_forecasts(session: aiohttp.ClientSession) -> list[DataPoint
             and datetime.fromtimestamp(obs["obsTime"] - 6 * 3600, tz=timezone.utc).astimezone(lst).date() == local_today
         ]
         six_hr_min_f: float | None = min(six_hr_lows_f) if six_hr_lows_f else None
+
+        # Overlay raw NWS text 6-hr groups — same data, but published ~2-5 min
+        # after the observation vs ~20 min for the FAA ADDS JSON maxT field.
+        # Apply the same date guard (both obsTime and obsTime-6h on local_today).
+        _raw = _raw_six_hr.get(station_id)
+        if _raw:
+            _raw_obs_utc, _raw_max_c, _raw_min_c = _raw
+            if _raw_obs_utc is not None:
+                _raw_local = _raw_obs_utc.astimezone(lst).date()
+                _raw_m6h_local = (_raw_obs_utc - timedelta(hours=6)).astimezone(lst).date()
+                if _raw_local == local_today and _raw_m6h_local == local_today:
+                    if _raw_max_c is not None:
+                        _raw_max_f = round(_raw_max_c * 9 / 5 + 32, 2)
+                        if six_hr_max_f is None or _raw_max_f > six_hr_max_f:
+                            logging.info(
+                                "METAR raw %s: 6hr max %.2f°F (ADDS JSON had %s)",
+                                station_id,
+                                _raw_max_f,
+                                f"{six_hr_max_f:.2f}°F" if six_hr_max_f is not None else "none",
+                            )
+                            six_hr_max_f = _raw_max_f
+                    if _raw_min_c is not None:
+                        _raw_min_f = round(_raw_min_c * 9 / 5 + 32, 2)
+                        if six_hr_min_f is None or _raw_min_f < six_hr_min_f:
+                            six_hr_min_f = _raw_min_f
 
         # Anchor as_of to noon LST on the observation date — same convention as
         # forecast sources — so numeric_matcher's DateGuard agrees on which market
