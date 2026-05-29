@@ -140,6 +140,11 @@ POSITION_WATCHER_INTERVAL: float = env_float("POSITION_WATCHER_INTERVAL", 5.0)
 #   Used to detect stale cache after a poll gap; if older than NOAA_OBS_MAX_AGE_S
 #   the fast loop falls back to NOAA-None mode (market-price confirmation only).
 _near_threshold_cities: set[str] = set()
+
+# Daily YES bid high tracker for KXLOWT momentum shadow trader.
+# Keys: ticker. Value: max YES bid seen today.  Reset once per UTC day.
+_kxlowt_yes_daily_high: dict[str, int] = {}
+_kxlowt_yes_daily_high_date: str = ""  # YYYY-MM-DD UTC; reset trigger
 _last_noaa_obs: dict[str, float] = {}
 _last_noaa_obs_time: float = 0.0  # time.monotonic(); 0 = never populated
 # _last_noaa_day1: NOAA day-1 forecast highs cached from the last full cycle.
@@ -3269,6 +3274,8 @@ async def _fast_loop(
         await executor.maybe_trade_band_arb(session, signal)
 
     await _settle_shadow_band_arbs(conn=executor._conn, session=session)
+    _update_yes_momentum_shadows(conn=executor._conn, markets=markets)
+    await _check_yes_momentum_exits(conn=executor._conn, markets=markets, session=session)
 
 
 async def _position_watcher(
@@ -3341,6 +3348,136 @@ async def _position_watcher(
             raise
         except Exception as exc:
             logging.debug("Position watcher error: %s", exc)
+
+
+def _update_yes_momentum_shadows(conn, markets: list[dict]) -> None:
+    """Update daily YES bid highs and log shadow entries for the price-dip strategy.
+
+    Entry condition (from backtest, Strategy C at bid model, +3.2¢ EV):
+      - YES_bid was ≥ 20¢ earlier today (prior_high ≥ 20)
+      - YES_bid is now ≤ 20¢ (dip)
+      - Spread (ask − bid) ≤ 15¢
+      - Entry time: 06:00–10:00 UTC on observation day
+    Entry cost = YES_bid (limit order assumption).  PT target = 40¢.
+    """
+    global _kxlowt_yes_daily_high, _kxlowt_yes_daily_high_date
+
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date().isoformat()
+    if _kxlowt_yes_daily_high_date != today:
+        _kxlowt_yes_daily_high = {}
+        _kxlowt_yes_daily_high_date = today
+
+    in_entry_window = 6 <= now_utc.hour < 10  # 06:00–10:00 UTC
+
+    for mkt in markets:
+        ticker = mkt.get("ticker", "")
+        if not ticker.startswith("KXLOWT"):
+            continue
+        yes_bid = mkt.get("yes_bid") or 0
+        yes_ask = mkt.get("yes_ask") or 100
+        if yes_bid < 2:
+            continue
+
+        # Update daily high
+        prev = _kxlowt_yes_daily_high.get(ticker, 0)
+        _kxlowt_yes_daily_high[ticker] = max(prev, yes_bid)
+
+        if not in_entry_window:
+            continue
+
+        prior_high = _kxlowt_yes_daily_high[ticker]
+        spread = yes_ask - yes_bid
+        if prior_high < 20 or yes_bid > 20 or spread > 15:
+            continue
+
+        existing = conn.execute(
+            "SELECT id FROM shadow_yes_momentum WHERE ticker=? AND exit_reason IS NULL",
+            (ticker,),
+        ).fetchone()
+        if existing:
+            continue
+
+        series = ticker.rsplit("-", 2)[0]
+        contracts = min(max(1, 750 // yes_bid), 10)
+        conn.execute(
+            """INSERT INTO shadow_yes_momentum
+               (logged_at, ticker, series, entry_bid, prior_high_bid, contracts, pt_target)
+               VALUES (?, ?, ?, ?, ?, ?, 40)""",
+            (now_utc.isoformat(), ticker, series, yes_bid, prior_high, contracts),
+        )
+        logging.info(
+            "[shadow_yes_mom] Entry %s  bid=%d¢  prior_high=%d¢  qty=%d",
+            ticker, yes_bid, prior_high, contracts,
+        )
+
+
+async def _check_yes_momentum_exits(
+    conn,
+    markets: list[dict],
+    session: "aiohttp.ClientSession",
+) -> None:
+    """Check open shadow_yes_momentum rows for PT or settlement, and record exits."""
+    from .markets import KALSHI_API_BASE
+
+    rows = conn.execute(
+        "SELECT id, ticker, entry_bid, contracts, pt_target FROM shadow_yes_momentum WHERE exit_reason IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+
+    prices = {m["ticker"]: m for m in markets if isinstance(m, dict)}
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    for row_id, ticker, entry_bid, contracts, pt_target in rows:
+        # PT check via current poll-cycle price
+        mkt_price = prices.get(ticker)
+        if mkt_price:
+            yes_bid = mkt_price.get("yes_bid") or 0
+            if yes_bid >= pt_target:
+                pnl = float((yes_bid - entry_bid) * contracts)
+                conn.execute(
+                    """UPDATE shadow_yes_momentum
+                       SET exit_reason='profit_take', exited_at=?, outcome='won', pnl_cents=?
+                       WHERE id=?""",
+                    (now_utc, pnl, row_id),
+                )
+                logging.info(
+                    "[shadow_yes_mom] PT %s  bid=%d¢  pnl=%+.0f¢ ($%+.2f)",
+                    ticker, yes_bid, pnl, pnl / 100,
+                )
+                continue
+
+        # Settlement check
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/markets/{ticker}",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception:
+            continue
+        mkt = data.get("market", data)
+        if mkt.get("status") not in ("settled", "finalized"):
+            continue
+        result = mkt.get("result")
+        if result not in ("yes", "no"):
+            continue
+        settle_val = 100 if result == "yes" else 0
+        pnl = float((settle_val - entry_bid) * contracts)
+        outcome = "won" if result == "yes" else "lost"
+        conn.execute(
+            """UPDATE shadow_yes_momentum
+               SET exit_reason='settled', exited_at=?, outcome=?, pnl_cents=?
+               WHERE id=?""",
+            (now_utc, outcome, pnl, row_id),
+        )
+        logging.info(
+            "[shadow_yes_mom] Settled %s → %s  pnl=%+.0f¢ ($%+.2f)",
+            ticker, outcome.upper(), pnl, pnl / 100,
+        )
 
 
 async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> None:

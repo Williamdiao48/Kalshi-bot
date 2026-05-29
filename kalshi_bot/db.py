@@ -159,3 +159,27 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(5)")
         logging.info("DB schema migration V5 applied (forecast_shadow_log).")
+
+    if current < 6:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_yes_momentum (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at      TEXT    NOT NULL,
+                ticker         TEXT    NOT NULL,
+                series         TEXT,
+                entry_bid      INTEGER NOT NULL,
+                prior_high_bid INTEGER,
+                contracts      INTEGER NOT NULL DEFAULT 1,
+                pt_target      INTEGER NOT NULL DEFAULT 40,
+                exit_reason    TEXT,
+                exited_at      TEXT,
+                outcome        TEXT,
+                pnl_cents      REAL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sym_open
+                ON shadow_yes_momentum (ticker, exit_reason)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(6)")
+        logging.info("DB schema migration V6 applied (shadow_yes_momentum).")
