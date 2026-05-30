@@ -362,6 +362,13 @@ KELLY_HIGH_SCORE_THRESHOLD: float = env_float("KELLY_HIGH_SCORE_THRESHOLD", 0.8)
 LOCKED_OBS_MAX_POSITION_CENTS: int = env_int("LOCKED_OBS_MAX_POSITION_CENTS", 1000)
 LOCKED_OBS_KELLY_FRACTION: float    = env_float("LOCKED_OBS_KELLY_FRACTION", 0.75)
 LOCKED_OBS_MAX_CONTRACTS: int       = env_int("LOCKED_OBS_MAX_CONTRACTS", 10)
+
+# WTI high-conviction sizing: applied only when edge >= $3.00 AND entry cost <= 40¢.
+# Backtest (738 markets, Mar–May 2026): 89 qualifying trades, 97.8% win rate at these params.
+# Other WTI trades (smaller edge or higher cost) remain at MAX_POSITION_CENTS.
+WTI_OPT_MAX_POSITION_CENTS: int = env_int("WTI_OPT_MAX_POSITION_CENTS", 2000)
+WTI_OPT_MIN_EDGE: float         = env_float("WTI_OPT_MIN_EDGE", 3.0)
+WTI_OPT_MAX_COST: int           = env_int("WTI_OPT_MAX_COST", 40)
 _LOCKED_OBS_SOURCES: frozenset[str] = frozenset({
     "noaa_observed", "metar", "nws_climo", "nws_alert",
 })
@@ -1593,6 +1600,21 @@ class TradeExecutor:
         # suppress Dallas or crypto sizing.
         _cat_dd_factor = _get_dd_factor(opp.metric)
         pos_max_cents  = min(max(1, int(pos_max_cents * _cat_dd_factor)), self._remaining_exposure_cents())
+
+        # WTI high-conviction boost: edge >= $3.00 AND cheap entry (≤40¢).
+        # Only overrides upward — never reduces below the standard cap.
+        if (
+            opp.source == "yahoo_wti_futures"
+            and opp.edge >= WTI_OPT_MIN_EDGE
+            and cost_cents <= WTI_OPT_MAX_COST
+        ):
+            _wti_cap = min(WTI_OPT_MAX_POSITION_CENTS, self._remaining_exposure_cents())
+            if _wti_cap > pos_max_cents:
+                logging.info(
+                    "[WTI opt] High-conviction sizing: edge=%.2f cost=%d¢ → cap %d¢→%d¢: %s",
+                    opp.edge, cost_cents, pos_max_cents, _wti_cap, opp.market_ticker,
+                )
+                pos_max_cents = _wti_cap
 
         count = kelly_contracts(
             win_prob=win_prob,
