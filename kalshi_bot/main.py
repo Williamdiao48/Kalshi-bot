@@ -38,7 +38,7 @@ from .arb_detector import (
     find_crossed_book_opportunities, CrossedBookArb, CROSSED_BOOK_MIN_PROFIT,
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
-from .strike_arb import find_band_arbs, find_forecast_nos, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
+from .strike_arb import find_band_arbs, find_forecast_nos, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, edgar, predictit
@@ -2576,6 +2576,7 @@ async def _poll(
         and dp.metric.startswith(("temp_high", "temp_low"))
     }
     _refresh_gfs_morning_snap(opp_log._conn)
+    refresh_forecast_bias(opp_log._conn)
     if _band_arb_obs_early:
         _early_band_arb_signals = find_band_arbs(
             markets,

@@ -480,6 +480,89 @@ FORECAST_NO_MODEL_SPREAD_MIN_F: float = float(
     os.environ.get("FORECAST_NO_MODEL_SPREAD_MIN_F", "1.0")
 )
 
+# Minimum bias-corrected edge required after per-city, per-source cold-bias adjustment.
+# Backtest (201 live trades, May 2026): corrected edge >= 1.0°F selects 59 trades at
+# 71.2% WR / +$4.35 vs baseline 64.2% / -$13.66.  Set to 0.0 to disable.
+FORECAST_NO_CORRECTED_MIN_EDGE_F: float = float(
+    os.environ.get("FORECAST_NO_CORRECTED_MIN_EDGE_F", "1.0")
+)
+
+# ---------------------------------------------------------------------------
+# Per-city, per-source cold-bias cache (populated by refresh_forecast_bias).
+# Keys: (source, metric) e.g. ("hrrr", "temp_high_bos").
+# Values: mean(source_forecast - noaa_observed) — negative = cold bias.
+# Corrected edge = raw_edge + bias  (bias negative → reduces apparent edge).
+# ---------------------------------------------------------------------------
+_FORECAST_BIAS: dict[tuple[str, str], float] = {}
+_FORECAST_BIAS_SOURCES: tuple[str, ...] = (
+    "hrrr", "noaa", "nws_hourly", "open_meteo",
+    "open_meteo_ecmwf", "open_meteo_gem", "open_meteo_gfs", "open_meteo_icon",
+)
+
+
+def refresh_forecast_bias(conn) -> None:
+    """Compute per-city, per-source forecast cold bias and cache in _FORECAST_BIAS.
+
+    Call once at startup from main.py (and optionally daily at UTC midnight).
+    Uses raw_forecasts midday readings (11-13 UTC) vs noaa_observed daily max.
+    Requires at least 5 city-day pairs per (source, metric) to store an entry.
+    """
+    global _FORECAST_BIAS
+    new_map: dict[tuple[str, str], float] = {}
+
+    try:
+        obs_rows = conn.execute("""
+            SELECT metric, date(logged_at) AS d, MAX(data_value) AS obs
+            FROM raw_forecasts
+            WHERE source='noaa_observed' AND metric LIKE 'temp_high%'
+            GROUP BY metric, d
+        """).fetchall()
+        obs_lookup: dict[tuple[str, str], float] = {(r[0], r[1]): r[2] for r in obs_rows}
+
+        from collections import defaultdict
+        for src in _FORECAST_BIAS_SOURCES:
+            src_rows = conn.execute("""
+                SELECT metric, date(logged_at) AS d, AVG(data_value) AS f
+                FROM raw_forecasts
+                WHERE source=? AND metric LIKE 'temp_high%'
+                  AND CAST(strftime('%H', logged_at) AS INTEGER) BETWEEN 11 AND 13
+                GROUP BY metric, d
+                HAVING COUNT(*) >= 2
+            """, (src,)).fetchall()
+
+            errors: dict[str, list[float]] = defaultdict(list)
+            for metric, d, f in src_rows:
+                obs = obs_lookup.get((metric, d))
+                if obs is not None:
+                    errors[metric].append(f - obs)
+
+            for metric, errs in errors.items():
+                if len(errs) >= 5:
+                    new_map[(src, metric)] = sum(errs) / len(errs)
+
+        _FORECAST_BIAS = new_map
+        logging.info(
+            "ForecastNO bias map refreshed: %d city/source entries across %d sources",
+            len(new_map), len(_FORECAST_BIAS_SOURCES),
+        )
+    except Exception as exc:
+        logging.warning("ForecastNO bias map: refresh failed (%s) — using zero bias", exc)
+
+
+def _corrected_edge(source: str, metric: str, raw_edge: float) -> float:
+    """Return bias-corrected edge for a forecast source.
+
+    corrected_edge = raw_edge + bias  (bias is negative for cold-biased models)
+    Falls back to overall source mean bias if no per-city entry exists.
+    Returns raw_edge unchanged if no bias data is available.
+    """
+    bias = _FORECAST_BIAS.get((source, metric))
+    if bias is None:
+        # Fall back to mean bias across all cities for this source
+        all_biases = [v for (s, _), v in _FORECAST_BIAS.items() if s == source]
+        bias = sum(all_biases) / len(all_biases) if all_biases else 0.0
+    return raw_edge + bias
+
 
 def _synoptic_celsius_band(
     celsius_c: int,
@@ -2081,7 +2164,8 @@ def find_forecast_nos(
                 _edge_required = FORECAST_NO_MIN_EDGE_F
 
             if edge >= _edge_required:
-                qualifying.append((source, value, edge, no_dir))
+                corr = _corrected_edge(source, parsed.metric, edge)
+                qualifying.append((source, value, edge, no_dir, corr))
 
         if not qualifying:
             continue
@@ -2090,7 +2174,7 @@ def find_forecast_nos(
         # If any qualifying sources say NO_HIGH and others say NO_LOW, the models
         # disagree on which side of the band the temperature will land — suppress.
         if parsed.direction == "between":
-            _dirs = {d for _, _, _, d in qualifying if d is not None}
+            _dirs = {d for _, _, _, d, _ in qualifying if d is not None}
             if "NO_HIGH" in _dirs and "NO_LOW" in _dirs:
                 logging.debug(
                     "ForecastNO skip (directional conflict): %s — "
@@ -2100,14 +2184,14 @@ def find_forecast_nos(
                 continue
             # All qualifying sources agree; record which direction
             _signal_no_direction: str | None = next(
-                (d for _, _, _, d in qualifying if d is not None), None
+                (d for _, _, _, d, _ in qualifying if d is not None), None
             )
         else:
             _signal_no_direction = None
 
         # Count unique qualifying sources.  Deduplicate by source name so that
         # sources emitting multiple hourly forecasts per poll cannot inflate count.
-        source_score = len({src for src, _, _, _ in qualifying})
+        source_score = len({src for src, _, _, _, _ in qualifying})
         # KXLOWT uses a higher threshold — overnight lows harder to forecast.
         _fno_min_sources = (
             FORECAST_NO_LOWT_MIN_SOURCES
@@ -2130,7 +2214,7 @@ def find_forecast_nos(
             "open_meteo", "open_meteo_gfs", "open_meteo_ecmwf",
             "open_meteo_icon", "open_meteo_gem",
         }
-        _qualifying_sources = {s for s, _, _, _ in qualifying}
+        _qualifying_sources = {s for s, _, _, _, _ in qualifying}
         if FORECAST_NO_REQUIRE_OPEN_METEO:
             if not (_qualifying_sources & _open_meteo_family):
                 logging.debug(
@@ -2181,9 +2265,19 @@ def find_forecast_nos(
             )
             continue
 
-        min_edge = min(e for _, _, e, _ in qualifying)
-        max_edge = max(e for _, _, e, _ in qualifying)
-        source_names = [s for s, _, _, _ in qualifying]
+        min_edge = min(e for _, _, e, _, _ in qualifying)
+        max_edge = max(e for _, _, e, _, _ in qualifying)
+        source_names = [s for s, _, _, _, _ in qualifying]
+
+        # Bias-corrected edge gate: block if no source clears corrected threshold.
+        if FORECAST_NO_CORRECTED_MIN_EDGE_F > 0:
+            _min_corr = min(c for _, _, _, _, c in qualifying)
+            if _min_corr < FORECAST_NO_CORRECTED_MIN_EDGE_F:
+                logging.debug(
+                    "ForecastNO skip (bias-corrected edge %.2f°F < %.2f°F): %s",
+                    _min_corr, FORECAST_NO_CORRECTED_MIN_EDGE_F, ticker,
+                )
+                continue
 
         # Score: blend of source count and edge magnitude, capped at 0.95.
         raw_score = min(0.95, 0.60 + 0.05 * source_score + 0.01 * min_edge)
@@ -2275,7 +2369,7 @@ def find_forecast_nos(
             sources=source_names,
             score=raw_score,
             p_estimate=p_estimate,
-            source_details=[(s, v, e) for s, v, e, _ in qualifying],
+            source_details=[(s, v, e) for s, v, e, _, _ in qualifying],
             yes_ask=yes_ask_fno,
             hours_to_close=_htc_fno,
             model_spread_f=_model_spread_fno,
