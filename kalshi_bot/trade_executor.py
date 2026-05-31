@@ -415,6 +415,11 @@ BAND_ARB_YES_DEAD_ZONE_CAP: int  = env_int(  "BAND_ARB_YES_DEAD_ZONE_CAP",   2)
 # are 82%+ WR. Sized at KELLY_FRACTION (0.25) — conservative for a new tier.
 BAND_ARB_LOW_YES_P: float = env_float("BAND_ARB_LOW_YES_P", 0.84)
 
+# Flat win probability for KXHIGH lower T-band YES signals (direction="under").
+# Backtest (Feb–May 2026, n=118 HRRR-gated): 74.6% WR → Laplace-smoothed to 0.74.
+# Sized at LOCKED_OBS (post-P75): same tier as B-band locked YES.
+BAND_ARB_LOWER_T_YES_P: float = env_float("BAND_ARB_LOWER_T_YES_P", 0.74)
+
 # Maximum total cost basis across all currently open positions (cents).
 # Guards against correlated blowup when many weather markets are open
 # simultaneously (e.g. LAX + LAS + PHX all NO on a heat-dome day — all
@@ -2706,7 +2711,8 @@ class TradeExecutor:
         if self._circuit_breaker_tripped(signal.ticker, "BandArb YES"):
             return
 
-        is_low_yes = signal.metric.startswith("temp_low_")
+        is_low_yes    = signal.metric.startswith("temp_low_")
+        is_lower_t    = (not is_low_yes) and signal.direction == "under"
 
         if is_low_yes:
             # KXLOWT YES: flat probability calibrated from backtest (Section 5,
@@ -2717,6 +2723,16 @@ class TradeExecutor:
             kelly_frac       = KELLY_FRACTION
             max_cents        = max(1, int(MAX_POSITION_CENTS * _dd_factor))
             hard_cap         = TRADE_MAX_CONTRACTS
+            overshoot_f      = None
+            _sizer_kelly_scale = 1.0
+        elif is_lower_t:
+            # KXHIGH lower T-band YES: flat probability from backtest.
+            # Post-P75 lock only; HRRR gate already applied in strike_arb.
+            # Uses LOCKED_OBS sizing (same tier as locked B-band YES).
+            p_win            = BAND_ARB_LOWER_T_YES_P
+            kelly_frac       = LOCKED_OBS_KELLY_FRACTION
+            max_cents        = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
+            hard_cap         = LOCKED_OBS_MAX_CONTRACTS
             overshoot_f      = None
             _sizer_kelly_scale = 1.0
         else:

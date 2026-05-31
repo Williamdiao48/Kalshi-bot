@@ -43,12 +43,31 @@ GFS_CACHE   = DATA_DIR / "cache" / "continued_heat"  # re-use existing GFS cache
 
 HIGH_IEM = {k: v for k, v in IEM_STATIONS.items() if k.startswith("temp_high_")}
 
-BAND_START = "2026-02-01"
-BAND_END   = "2026-05-21"
+BAND_START    = "2026-02-01"
+BAND_END      = "2026-05-21"
+OMFC_CSV      = DATA_DIR / "openmeteo_forecasts.csv"  # gfs_hrrr daily max forecasts
 
 _parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 _parser.add_argument("--refresh", action="store_true", help="Re-fetch METAR from IEM (ignores cache)")
+_parser.add_argument("--require-price", action="store_true",
+                     help="Only include observations that have candle price data")
+_parser.add_argument("--out", default="data/backtest_band_arb_yes.txt",
+                     help="Write full output to this file (default: data/backtest_band_arb_yes.txt)")
 _args = _parser.parse_args()
+
+# Tee stdout to file throughout the run
+import io as _io
+class _Tee:
+    def __init__(self, *streams): self._streams = streams
+    def write(self, s):
+        for st in self._streams: st.write(s)
+    def flush(self):
+        for st in self._streams: st.flush()
+
+_out_path = Path(_args.out)
+_out_path.parent.mkdir(parents=True, exist_ok=True)
+_out_file = open(_out_path, "w")
+sys.stdout = _Tee(sys.__stdout__, _out_file)
 
 # ── METAR parsing ─────────────────────────────────────────────────────────────
 
@@ -79,8 +98,13 @@ async def _fetch_metar(
     session: aiohttp.ClientSession,
     station: str,
     cache_key: str,
+    city_tz: ZoneInfo | None = None,
 ) -> dict[str, list[tuple[datetime, float]]]:
-    """Returns {date_str: [(utc_dt, temp_f), ...]} sorted by time."""
+    """Returns {LOCAL_date_str: [(utc_dt, temp_f), ...]} sorted by time.
+
+    Observations are grouped by LOCAL date (not UTC date) so the running max
+    correctly reflects midnight-to-midnight local time — matching NWS settlement.
+    """
     cache_path = CACHE_DIR / f"metar_{cache_key}_{BAND_START}_{BAND_END}.csv"
     if cache_path.exists() and not _args.refresh:
         raw = cache_path.read_text()
@@ -123,7 +147,9 @@ async def _fetch_metar(
         other_count += not has_tgroup
         temp_f = _parse_metar_temp_f(metar_str)
         if temp_f is not None:
-            result[dt.date().isoformat()].append((dt, temp_f))
+            local_dt   = dt.astimezone(city_tz) if city_tz else dt
+            local_date = local_dt.date().isoformat()
+            result[local_date].append((dt, temp_f))
 
     # sort each day's observations by time
     for d in result:
@@ -148,6 +174,19 @@ def _load_gfs_cache(city_short: str) -> dict[str, float]:
     return merged
 
 
+def load_hrrr_forecasts() -> dict[tuple[str, str], float]:
+    """Load openmeteo_forecasts.csv (gfs_hrrr model) → {(metric, local_date): forecast_high_f}."""
+    data: dict[tuple[str, str], float] = {}
+    if not OMFC_CSV.exists():
+        return data
+    with OMFC_CSV.open(newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("model") != "gfs_hrrr":
+                continue
+            data[(row["city_metric"], row["date"])] = float(row["forecast_high_f"])
+    return data
+
+
 # ── Band / candle loaders ─────────────────────────────────────────────────────
 
 _TICKER_PREFIX_MAP: dict[str, str] = {
@@ -170,18 +209,48 @@ def _ticker_to_metric(ticker: str) -> str | None:
     return None
 
 
-def load_bands() -> dict[tuple[str, str], list[dict]]:
-    index: dict[tuple[str, str], list[dict]] = defaultdict(list)
+def load_bands() -> tuple[
+    dict[tuple[str, str], list[dict]],
+    dict[tuple[str, str], dict],
+    dict[tuple[str, str], dict],
+]:
+    """Return (between_index, t_upper, t_lower).
+
+    between_index: (metric, local_date) → list of B-band rows
+    t_upper:       (metric, local_date) → single "over" T-band row
+    t_lower:       (metric, local_date) → single "under" T-band row
+    """
+    between_index: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    t_upper: dict[tuple[str, str], dict] = {}
+    t_lower: dict[tuple[str, str], dict] = {}
+
     with BANDS_CSV.open() as f:
         for row in csv.DictReader(f):
-            if row.get("direction") != "between":
-                continue
-            row["strike_lo"] = float(row["strike_lo"])
-            row["strike_hi"] = float(row["strike_hi"])
+            direction = row.get("direction", "between")
             utc_close  = date.fromisoformat(row["date"])
             local_date = (utc_close - timedelta(days=1)).isoformat()
-            index[(row["metric"], local_date)].append(row)
-    return dict(index)
+            key = (row["metric"], local_date)
+
+            if direction == "between":
+                if not row.get("strike_lo") or not row.get("strike_hi"):
+                    continue
+                row["strike_lo"] = float(row["strike_lo"])
+                row["strike_hi"] = float(row["strike_hi"])
+                between_index[key].append(row)
+            elif direction == "over":
+                if not row.get("strike_lo"):
+                    continue
+                row["strike_lo"] = float(row["strike_lo"])
+                row["strike_hi"] = None
+                t_upper[key] = row
+            elif direction == "under":
+                if not row.get("strike_hi"):
+                    continue
+                row["strike_lo"] = None
+                row["strike_hi"] = float(row["strike_hi"])
+                t_lower[key] = row
+
+    return dict(between_index), t_upper, t_lower
 
 
 def load_candles() -> dict[str, dict[int, float]]:
@@ -287,17 +356,25 @@ def _fmt(s: dict) -> str:
 
 async def main() -> None:
     print("Loading bands and candles…")
-    bands_index = load_bands()
-    candles     = load_candles()
-    print(f"  {sum(len(v) for v in bands_index.values()):,} band rows")
+    bands_index, t_upper, t_lower = load_bands()
+    candles       = load_candles()
+    hrrr_forecast = load_hrrr_forecasts()
+    n_between = sum(len(v) for v in bands_index.values())
+    print(f"  {n_between:,} between-band rows")
+    print(f"  {len(t_upper):,} upper T-band rows  {len(t_lower):,} lower T-band rows")
     print(f"  {len(candles):,} tickers with candle data")
+    print(f"  {len(hrrr_forecast):,} HRRR city-day forecasts")
 
-    # Flat lookup: (metric, local_date, int(strike_lo)) → band row
-    # One band per temperature rounded value — no overlap possible.
+    # Flat lookup: (metric, local_date, rounded_temp) → B-band row
+    # Index by BOTH strike_lo and strike_hi so entries in the upper half of a band
+    # (where round(rmax) == strike_hi) are captured.  Bands skip values
+    # (e.g. 66–67, 68–69) so strike_hi of one band never collides with
+    # strike_lo of another.
     bands_flat: dict[tuple[str, str, int], dict] = {}
     for (metric, local_date), band_list in bands_index.items():
         for band in band_list:
             bands_flat[(metric, local_date, int(band["strike_lo"]))] = band
+            bands_flat[(metric, local_date, int(band["strike_hi"]))] = band
 
     # ── Fetch METAR per city ─────────────────────────────────────────────────
     print(f"\nFetching METAR ({BAND_START} → {BAND_END})…")
@@ -305,15 +382,16 @@ async def main() -> None:
 
     async with aiohttp.ClientSession() as session:
         for metric, (station, _) in sorted(HIGH_IEM.items()):
-            short = metric.replace("temp_high_", "")
+            short    = metric.replace("temp_high_", "")
+            city_tz  = CITIES[metric][3] if metric in CITIES else None
             print(f"  {short:<6} ({station}) …", end=" ", flush=True)
-            data = await _fetch_metar(session, station, short)
+            data = await _fetch_metar(session, station, short, city_tz=city_tz)
             metar_by_metric[metric] = data
             await asyncio.sleep(0.5)
 
     # ── Build records ────────────────────────────────────────────────────────
-    # For each (city, date, entry_timing), observe running_max, round to nearest °F,
-    # find the ONE band where strike_lo == rounded. No double-counting across bands.
+    # For each (city, date, entry_timing), observe running_max, round to nearest °F.
+    # First try B-band (between) flat lookup; fall back to T-bands (over/under).
 
     ENTRY_KEYS    = ["p75m2", "p75m1", "p75", "p75p1", "p75p2"]
     ENTRY_OFFSETS = {"p75m2": -2, "p75m1": -1, "p75": 0, "p75p1": 1, "p75p2": 2}
@@ -349,20 +427,41 @@ async def main() -> None:
                 if rmax is None:
                     continue
 
-                rounded = round(rmax)
-                band    = bands_flat.get((metric, local_date, rounded))
+                rounded   = round(rmax)
+                band      = bands_flat.get((metric, local_date, rounded))
+                direction = "between"
+
+                # T-band fallback when no B-band matches at this temperature
+                if band is None:
+                    city_key = (metric, local_date)
+                    upper = t_upper.get(city_key)
+                    lower = t_lower.get(city_key)
+                    # Upper T-band: running max has EXCEEDED the floor threshold.
+                    # round(rmax) == strike means the temp is in the highest B-band's
+                    # territory, not the upper T-band. Need strictly > strike to be in
+                    # T-band territory (i.e. round(rmax) >= strike + 1).
+                    if upper is not None and rounded > int(upper["strike_lo"]):
+                        band      = upper
+                        direction = "over"
+                    # Lower T-band: running max is still below the ceiling threshold
+                    elif lower is not None and rounded < int(lower["strike_hi"]):
+                        band      = lower
+                        direction = "under"
+
                 if band is None:
                     continue
 
-                lo          = band["strike_lo"]
-                hi          = band["strike_hi"]
-                result      = band["result"]
-                ticker      = band["ticker"]
+                lo     = band["strike_lo"]   # None for "under" T-bands
+                hi     = band["strike_hi"]   # None for "over" T-bands
+                result = band["result"]
+                ticker = band["ticker"]
                 hourly_asks = candles.get(ticker, {})
                 local_hour  = cutoff.astimezone(tz).hour
                 cents       = _ask_at_hour(hourly_asks, local_hour)
-                margin_hi   = (hi + 0.5) - rmax
-                overshoot   = (rmax - gfs_fcst) if gfs_fcst is not None else None
+
+                # margin_hi: distance from running max to band ceiling (None if no ceiling)
+                margin_hi = ((hi + 0.5) - rmax) if hi is not None else None
+                overshoot = (rmax - gfs_fcst) if gfs_fcst is not None else None
 
                 rmax_1h_ago   = _running_max_at(obs, cutoff - timedelta(hours=1))
                 rmax_2h_ago   = _running_max_at(obs, cutoff - timedelta(hours=2))
@@ -372,10 +471,19 @@ async def main() -> None:
                 plateau_2h    = rmax_2h_ago is not None and rmax == rmax_2h_ago
                 temp_delta_1h = (spot_now - spot_1h_ago) if spot_now is not None and spot_1h_ago is not None else None
 
+                hrrr_fc = hrrr_forecast.get((metric, local_date))
+                # hrrr_vs_ceil: positive = HRRR above band ceiling (overshoot risk).
+                # Only meaningful for between and under; None for over (no ceiling).
+                hrrr_vs_ceil = (hrrr_fc - hi) if (hrrr_fc is not None and hi is not None) else None
+
+                if _args.require_price and cents is None:
+                    continue
+
                 records.append({
                     "metric":        metric,
                     "date":          local_date,
                     "entry_key":     key,
+                    "direction":     direction,
                     "rmax":          rmax,
                     "band_lo":       lo,
                     "band_hi":       hi,
@@ -389,6 +497,8 @@ async def main() -> None:
                     "plateau_1h":    plateau_1h,
                     "plateau_2h":    plateau_2h,
                     "temp_delta_1h": temp_delta_1h,
+                    "hrrr_fc":       hrrr_fc,
+                    "hrrr_vs_ceil":  hrrr_vs_ceil,
                 })
 
     total = len(records)
@@ -406,7 +516,7 @@ async def main() -> None:
     # ── Section 1: WR by entry timing ────────────────────────────────────────
     print()
     print("=" * 70)
-    print("  1. WIN RATE AND PNL BY ENTRY TIMING  (hold to settle)")
+    print("  1. WIN RATE AND PNL BY ENTRY TIMING  (hold to settle, B-bands only)")
     print("     Each row = independent entries at that timing; running_max rounded")
     print("     to nearest °F determines which single band qualifies.")
     print("=" * 70)
@@ -419,7 +529,7 @@ async def main() -> None:
     print("  " + "-" * 105)
 
     for key in ENTRY_KEYS:
-        grp    = [r for r in records if r["entry_key"] == key]
+        grp    = [r for r in records if r["entry_key"] == key and r.get("direction", "between") == "between"]
         grp_ov = [r for r in grp if _overshoot_flag(r) is True]
         grp_la = [r for r in grp if _overshoot_flag(r) is False]
         s_all  = grid_stats(grp, None, None)
@@ -442,7 +552,9 @@ async def main() -> None:
         (">2",     2.0, 99.0),
     ]
 
-    p75_recs = [r for r in records if r["entry_key"] == "p75"]
+    # B-bands only — T-band records have None margin_hi which breaks many sections below.
+    # T-band analysis is in its own section at the end.
+    p75_recs = [r for r in records if r["entry_key"] == "p75" and r.get("direction", "between") == "between"]
     print(f"\n  {'Margin':>8}  {'ALL':>32}  {'OVERSHOT':>32}  {'LAGGING':>32}")
     print(f"  {'':>8}{hdr_cols}{hdr_cols}{hdr_cols}")
     print("  " + "-" * 110)
@@ -457,16 +569,20 @@ async def main() -> None:
     # ── Section 3: PT/SL grid at P75 ─────────────────────────────────────────
     print()
     print("=" * 70)
-    print("  3. PT/SL GRID AT P75  (priced trades only)")
+    print("  3. PT/SL GRID AT P75  (priced trades only, exit simulated on hourly candles)")
     print("=" * 70)
 
-    PT_VALS  = [80.0, 85.0, 90.0, 95.0, None]
-    SL_FRACS = [0.3, 0.5, 0.7, None]
-    pt_label = {80.0: "PT=80¢", 85.0: "PT=85¢", 90.0: "PT=90¢", 95.0: "PT=95¢", None: "hold  "}
-    sl_label = {0.3: "SL=30%", 0.5: "SL=50%", 0.7: "SL=70%", None: "no-SL"}
+    PT_VALS  = [75.0, 80.0, 85.0, 88.0, 90.0, 92.0, 95.0, None]
+    SL_FRACS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, None]
+    pt_label = {75.0: "PT=75¢", 80.0: "PT=80¢", 85.0: "PT=85¢", 88.0: "PT=88¢",
+                90.0: "PT=90¢", 92.0: "PT=92¢", 95.0: "PT=95¢", None: "hold  "}
+    sl_label = {0.2: "SL=20%", 0.3: "SL=30%", 0.4: "SL=40%", 0.5: "SL=50%",
+                0.6: "SL=60%", 0.7: "SL=70%", None: "no-SL"}
 
     groups_3 = [
         ("ALL",      p75_recs),
+        ("TIGHT (<1F margin)",  [r for r in p75_recs if r["margin_hi"] < 1.0]),
+        ("WIDE  (>=1F margin)", [r for r in p75_recs if r["margin_hi"] >= 1.0]),
         ("OVERSHOT", [r for r in p75_recs if _overshoot_flag(r) is True]),
         ("LAGGING",  [r for r in p75_recs if _overshoot_flag(r) is False]),
     ]
@@ -481,6 +597,20 @@ async def main() -> None:
         for pt in PT_VALS:
             row_parts = [_fmt(grid_stats(sub_grp, pt, sl)) for sl in SL_FRACS]
             print(f"  {pt_label[pt]:14}  " + "  ".join(row_parts))
+
+        # Best combo for this group
+        best_pnl, best_pt, best_sl = float("-inf"), None, None
+        for pt in PT_VALS:
+            for sl in SL_FRACS:
+                s = grid_stats(sub_grp, pt, sl)
+                if s["n"] > 0 and s["total"] > best_pnl:
+                    best_pnl, best_pt, best_sl = s["total"], pt, sl
+        if best_pt is not None or best_sl is not None:
+            best_s = grid_stats(sub_grp, best_pt, best_sl)
+            pt_str = f"PT={best_pt:.0f}¢" if best_pt else "hold"
+            sl_str = f"SL={int(best_sl*100)}%" if best_sl else "no-SL"
+            print(f"\n  ★ Best combo: {pt_str} + {sl_str}  →  "
+                  f"WR={100*best_s['wr']:.1f}%  avg={best_s['avg']:+.1f}¢  net=${best_s['total']/100:+.2f}")
 
     # ── Section 4: METAR precision check ─────────────────────────────────────
     print()
@@ -676,6 +806,18 @@ async def main() -> None:
     def _grising(r: dict) -> bool:
         return not r["plateau_1h"]
 
+    def _ghrrr_safe(r: dict) -> bool:
+        """HRRR forecasts below band ceiling (temp likely done rising)."""
+        return r.get("hrrr_vs_ceil") is not None and r["hrrr_vs_ceil"] < 0
+
+    def _ghrrr_risky(r: dict) -> bool:
+        """HRRR forecasts at or above band ceiling (overshoot risk)."""
+        return r.get("hrrr_vs_ceil") is not None and r["hrrr_vs_ceil"] >= 0
+
+    def _ghrrr_done(r: dict) -> bool:
+        """HRRR forecasts ≤ running max (model says temp already peaked)."""
+        return r.get("hrrr_fc") is not None and r["hrrr_fc"] <= r["rmax"]
+
     combos: list[tuple[str, object]] = [
         ("ALL (baseline)",              lambda _: True),
         ("price ≥ 40¢",                lambda r: _gp(r, 40)),
@@ -696,6 +838,15 @@ async def main() -> None:
         ("rising + price ≥ 40¢",       lambda r: _grising(r) and _gp(r, 40)),
         ("price ≥ 40¢ + delta > 0",    lambda r: _gp(r, 40) and r.get("temp_delta_1h") is not None and r["temp_delta_1h"] > 0),
         ("price ≥ 40¢ + delta ≤ 0",    lambda r: _gp(r, 40) and r.get("temp_delta_1h") is not None and r["temp_delta_1h"] <= 0),
+        # ── HRRR gate filters ──────────────────────────────────────────────────
+        ("HRRR < ceil (safe)",         lambda r: _ghrrr_safe(r)),
+        ("HRRR < ceil + p≥40",         lambda r: _ghrrr_safe(r) and _gp(r, 40)),
+        ("HRRR < ceil + overshot",     lambda r: _ghrrr_safe(r) and _gov(r)),
+        ("HRRR < ceil + ov + p≥40",    lambda r: _ghrrr_safe(r) and _gov(r) and _gp(r, 40)),
+        ("HRRR ≥ ceil (risky)",        lambda r: _ghrrr_risky(r)),
+        ("HRRR ≤ rmax (peak done)",    lambda r: _ghrrr_done(r)),
+        ("HRRR ≤ rmax + p≥40",         lambda r: _ghrrr_done(r) and _gp(r, 40)),
+        ("HRRR ≤ rmax + ov + p≥40",    lambda r: _ghrrr_done(r) and _gov(r) and _gp(r, 40)),
     ]
 
     print(f"\n  {'Filter':>38}  {'n(all)':>6} {'n(prc)':>6} {'WR':>6} {'avg¢':>8} {'$total':>9}")
@@ -819,6 +970,225 @@ async def main() -> None:
     sp_ng = grid_stats(plat_ng, None, None)
     print(f"  {'no_gfs':>22}  {rising_ng_p:>14}  {plat_ng_p:>16}  "
           f"{sr_ng['n']:>6} / {sp_ng['n']:<6}")
+
+    print()
+
+    # ── Section 13: HRRR forecast gate analysis ──────────────────────────────
+    print()
+    print("=" * 70)
+    print("  13. HRRR FORECAST GATE AT P75  (hold to settle)")
+    print("      hrrr_vs_ceil = HRRR_daily_high_forecast − band_ceiling")
+    print("      Negative = HRRR says temp peaks below ceiling (safer YES)")
+    print("      Positive = HRRR says temp will overshoot ceiling (risky YES)")
+    print("=" * 70)
+
+    p75_hrrr = [r for r in p75_recs if r.get("hrrr_vs_ceil") is not None]
+    print(f"\n  n with HRRR data: {len(p75_hrrr)} / {len(p75_recs)}")
+
+    hrrr_buckets = [
+        ("HRRR ≤ ceil-2",  -99, -2),
+        ("HRRR = ceil-1",   -2,  -1),
+        ("HRRR = ceil",     -1,   0),
+        ("HRRR = ceil+1",    0,   1),
+        ("HRRR ≥ ceil+2",    1,  99),
+    ]
+    print(f"\n  {'HRRR vs ceil':>14}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 50)
+    for lbl, lo_h, hi_h in hrrr_buckets:
+        grp = [r for r in p75_hrrr if lo_h <= r["hrrr_vs_ceil"] < hi_h]
+        print(f"  {lbl:>14}  {_fmt(grid_stats(grp, None, None))}")
+
+    # HRRR ≤ running max (model says temp already peaked)
+    hrrr_done = [r for r in p75_hrrr if r["hrrr_fc"] <= r["rmax"]]
+    hrrr_still= [r for r in p75_hrrr if r["hrrr_fc"] >  r["rmax"]]
+    print(f"\n  {'Group':>22}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 58)
+    for lbl, grp in [("HRRR ≤ rmax (peaked)", hrrr_done), ("HRRR > rmax (rising)", hrrr_still)]:
+        print(f"  {lbl:>22}  {_fmt(grid_stats(grp, None, None))}")
+
+    # ── Section 14: T-band (terminal band) analysis ───────────────────────────
+    print()
+    print("=" * 70)
+    print("  14. T-BAND (TERMINAL BAND) ANALYSIS  (P75 entry, hold to settle)")
+    print("     Upper T-band (over): YES if daily high ≥ threshold — entered when")
+    print("     running_max ≥ threshold at P75 (already locked in).")
+    print("     Lower T-band (under): YES if daily high < threshold — entered when")
+    print("     running_max < threshold at P75 (has not yet hit ceiling).")
+    print("=" * 70)
+
+    t_p75 = [r for r in records if r["entry_key"] == "p75" and r.get("direction") in ("over", "under")]
+    t_over  = [r for r in t_p75 if r["direction"] == "over"]
+    t_under = [r for r in t_p75 if r["direction"] == "under"]
+
+    def _t_fmt(grp: list[dict]) -> str:
+        if not grp:
+            return f"{'n/a':>5} {'—':>6} {'—':>8} {'—':>9}"
+        wins  = sum(1 for r in grp if r["result"] == "yes")
+        wr    = wins / len(grp)
+        priced = [r for r in grp if r["cents"] is not None]
+        if not priced:
+            return f"{len(grp):>5} {100*wr:>5.1f}% {'(no $)':>8} {'(no $)':>9}"
+        total = sum((100 if r["result"] == "yes" else 0) - r["cents"] for r in priced)
+        avg_c = total / len(priced)
+        return f"{len(grp):>5} {100*wr:>5.1f}% {avg_c:>+7.1f}¢ ${total/100:>+8.2f}"
+
+    print(f"\n  {'Band type':>16}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 52)
+    print(f"  {'upper (over)':>16}  {_t_fmt(t_over)}")
+    print(f"  {'lower (under)':>16}  {_t_fmt(t_under)}")
+    print(f"  {'combined':>16}  {_t_fmt(t_p75)}")
+
+    # HRRR gate for T-bands
+    t_over_safe  = [r for r in t_over  if r.get("hrrr_fc") is not None and r["hrrr_fc"] >= r["band_lo"]]
+    t_over_risky = [r for r in t_over  if r.get("hrrr_fc") is not None and r["hrrr_fc"] <  r["band_lo"]]
+    t_under_safe = [r for r in t_under if r.get("hrrr_vs_ceil") is not None and r["hrrr_vs_ceil"] < 0]
+    t_under_risk = [r for r in t_under if r.get("hrrr_vs_ceil") is not None and r["hrrr_vs_ceil"] >= 0]
+
+    # Price-gated upper T-band: only enter when market hasn't fully priced the win
+    print(f"\n  Upper T-band price filter (ask < threshold):")
+    print(f"  {'Price gate':>16}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 52)
+    for ceil_p in (95, 90, 85, 80, 75, 70):
+        grp = [r for r in t_over if r["cents"] is not None and r["cents"] < ceil_p]
+        print(f"  {'ask < '+str(ceil_p)+'¢':>16}  {_t_fmt(grp)}")
+
+    print(f"\n  HRRR gate analysis:")
+    print(f"  {'Group':>28}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 62)
+    print(f"  {'upper: HRRR ≥ threshold (locked)':>28}  {_t_fmt(t_over_safe)}")
+    print(f"  {'upper: HRRR < threshold (risky)':>28}  {_t_fmt(t_over_risky)}")
+    print(f"  {'lower: HRRR < ceiling  (safe)':>28}  {_t_fmt(t_under_safe)}")
+    print(f"  {'lower: HRRR ≥ ceiling  (risky)':>28}  {_t_fmt(t_under_risk)}")
+
+    # GFS lagging analysis for lower T-band
+    # overshoot > 0 → running max already exceeded GFS morning forecast (peaked)
+    # overshoot < 0 → running max still below GFS forecast (lagging, still rising)
+    t_under_ov  = [r for r in t_under if r.get("overshoot") is not None and r["overshoot"] >= 0]
+    t_under_lag = [r for r in t_under if r.get("overshoot") is not None and r["overshoot"] < 0]
+
+    print(f"\n  GFS morning forecast vs running max (lower T-band):")
+    print(f"  {'Group':>30}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 64)
+    print(f"  {'overshot GFS (peaked, safer)':>30}  {_t_fmt(t_under_ov)}")
+    print(f"  {'lagging GFS (still rising, risky)':>30}  {_t_fmt(t_under_lag)}")
+
+    # Combined HRRR + GFS gate for lower T-band
+    t_under_both_safe = [r for r in t_under_safe if r.get("overshoot") is not None and r["overshoot"] >= 0]
+    t_under_hrrr_safe_gfs_lag = [r for r in t_under_safe if r.get("overshoot") is not None and r["overshoot"] < 0]
+    print(f"\n  Combined gate (HRRR-safe only):")
+    print(f"  {'Group':>36}  {'n':>5} {'WR':>6} {'avg¢':>8} {'$total':>9}")
+    print("  " + "-" * 70)
+    print(f"  {'HRRR-safe + overshot GFS':>36}  {_t_fmt(t_under_both_safe)}")
+    print(f"  {'HRRR-safe + lagging GFS':>36}  {_t_fmt(t_under_hrrr_safe_gfs_lag)}")
+
+    # ── Section 15: Daily P&L chart ───────────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  15. DAILY P&L  (P75 priced entries, hold to settle, B-bands only)")
+    print("=" * 70)
+
+    from collections import OrderedDict
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent.parent))
+    from kalshi_bot.band_arb_sizer import win_prob as _sizer_win_prob, kelly_scale as _sizer_kelly_scale
+
+    _BASE_KELLY = 0.75  # matches LOCKED_OBS_KELLY_FRACTION in trade_executor.py
+
+    def _rec_pnl(r: dict) -> float:
+        """Hold-to-settle P&L in cents for one flat ($1) contract."""
+        return (100 - r["cents"]) if r["result"] == "yes" else -r["cents"]
+
+    def _kelly_frac(r: dict) -> float:
+        """Effective Kelly fraction (0–1) for this entry."""
+        is_rising = not r.get("plateau_1h", False)
+        overshoot = r.get("overshoot")
+        p = _sizer_win_prob(overshoot, is_rising)
+        if p is None:
+            return 0.0
+        cents = r["cents"]
+        if not cents or cents >= 100:
+            return 0.0
+        f_raw = p - (1 - p) * (cents / (100 - cents))
+        ks = _sizer_kelly_scale(overshoot, is_rising)
+        return max(f_raw, 0.0) * _BASE_KELLY * ks
+
+    daily: dict[str, float] = OrderedDict()
+    daily_kelly: dict[str, float] = OrderedDict()
+    for r in sorted(p75_priced, key=lambda r: r["date"]):
+        d = r["date"]
+        flat_pnl  = _rec_pnl(r)
+        kelly_pnl = flat_pnl * _kelly_frac(r)
+        daily[d]       = daily.get(d, 0.0) + flat_pnl
+        daily_kelly[d] = daily_kelly.get(d, 0.0) + kelly_pnl
+
+    cum_flat = cum_kelly = 0.0
+    print(f"\n  {'Date':>12}  {'Flat P&L':>9}  {'Flat Cum':>9}  {'Kelly P&L':>10}  {'Kelly Cum':>10}  Trades")
+    print("  " + "-" * 74)
+    for d in daily:
+        pnl_f  = daily[d]
+        pnl_k  = daily_kelly.get(d, 0.0)
+        cum_flat  += pnl_f
+        cum_kelly += pnl_k
+        n = sum(1 for r in p75_priced if r["date"] == d)
+        print(f"  {d}  ${pnl_f/100:>+7.2f}  ${cum_flat/100:>+7.2f}  "
+              f"${pnl_k/100:>+8.2f}  ${cum_kelly/100:>+8.2f}  n={n}")
+    print(f"\n  Kelly sizing: base={_BASE_KELLY:.2f} × kelly_scale × raw_f*  "
+          f"(win_prob from band_arb_sizer lookup table)")
+
+    # Save chart
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import numpy as np
+
+        dates       = list(daily.keys())
+        pnls        = [v / 100.0 for v in daily.values()]
+        pnls_k      = [daily_kelly.get(d, 0.0) / 100.0 for d in dates]
+        cumsum      = list(np.cumsum(pnls))
+        cumsum_k    = list(np.cumsum(pnls_k))
+        x           = range(len(dates))
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+        fig.suptitle("Band-Arb YES Backtest — Daily P&L (P75 priced, hold to settle)", fontsize=13)
+
+        colors = ["#2ecc71" if p >= 0 else "#e74c3c" for p in pnls]
+        ax1.bar(x, pnls, color=colors, width=0.7, label="Flat (1 contract)")
+        ax1.plot(x, pnls_k, color="#e67e22", linewidth=1.5, marker=".", markersize=5,
+                 label="Kelly-sized", zorder=3)
+        ax1.axhline(0, color="black", linewidth=0.8)
+        ax1.set_ylabel("Daily P&L ($)")
+        ax1.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.2f"))
+        ax1.set_title("Daily P&L  [bars = flat; orange line = Kelly-sized]")
+        ax1.legend(fontsize=8)
+
+        ax2.plot(x, cumsum,   color="#3498db", linewidth=2, marker="o", markersize=4,
+                 label=f"Flat  total=${cumsum[-1]:+.2f}" if cumsum else "Flat")
+        ax2.plot(x, cumsum_k, color="#e67e22", linewidth=2, marker="s", markersize=4,
+                 linestyle="--",
+                 label=f"Kelly total=${cumsum_k[-1]:+.2f}" if cumsum_k else "Kelly")
+        ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax2.fill_between(x, cumsum, 0,
+                         where=[c >= 0 for c in cumsum], alpha=0.12, color="#2ecc71")
+        ax2.fill_between(x, cumsum, 0,
+                         where=[c < 0 for c in cumsum], alpha=0.12, color="#e74c3c")
+        ax2.set_ylabel("Cumulative P&L ($)")
+        ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.2f"))
+        ax2.set_title("Cumulative P&L")
+        ax2.legend(fontsize=9)
+
+        step = max(1, len(dates) // 20)
+        ax2.set_xticks(list(x)[::step])
+        ax2.set_xticklabels(dates[::step], rotation=45, ha="right", fontsize=8)
+
+        plt.tight_layout()
+        chart_path = Path(__file__).parent.parent / "data" / "backtest_band_arb_daily_pnl.png"
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        print(f"\n  Chart saved → {chart_path}")
+    except Exception as e:
+        print(f"\n  (Chart generation failed: {e})")
 
     print()
 

@@ -234,6 +234,16 @@ BAND_ARB_YES_HRRR_GATE: bool = env_bool("BAND_ARB_YES_HRRR_GATE", True)
 # Local hour + minute at which daily high is considered locked (matches NOAA_OBS_PEAK_PAST)
 BAND_ARB_YES_LOCK_LOCAL_HOUR: int = env_int("BAND_ARB_YES_LOCK_LOCAL_HOUR", 16)
 BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = env_int("BAND_ARB_YES_LOCK_LOCAL_MINUTE", 30)
+
+# --- Lower T-band YES (KXHIGH "under" terminal markets) ---------------------
+# Buy YES on the lower terminal band after P75 lock when running max is still
+# below the threshold and HRRR forecasts it will stay there.
+# Backtest (Feb–May 2026, n=118 HRRR-gated): 74.6% WR, +4.6¢ avg.
+BAND_ARB_LOWER_T_ENABLED: bool     = env_bool("BAND_ARB_LOWER_T_ENABLED", True)
+BAND_ARB_LOWER_T_MAX_YES_ASK: int  = env_int("BAND_ARB_LOWER_T_MAX_YES_ASK", 85)
+# HRRR gate: block when HRRR daily-high forecast >= threshold (overshoot risk).
+# Backtest: hrrr<threshold → 74.6% WR; hrrr>=threshold → 10.3% WR.
+BAND_ARB_LOWER_T_HRRR_GATE: bool   = env_bool("BAND_ARB_LOWER_T_HRRR_GATE", True)
 # Synoptic Celsius band arb (5-minute NWS updates via integer-°C range math)
 SYNOPTIC_BAND_ARB_NO_ENABLED:  bool = env_bool("SYNOPTIC_BAND_ARB_NO_ENABLED", True)
 
@@ -1320,9 +1330,77 @@ def find_band_arbs(
             # --- YES signal: temperature inside band -----------------------
             if not BAND_ARB_YES_ENABLED:
                 continue
-            # Only "between" KXHIGH markets have a well-defined interior
-            if is_low_market or parsed.direction != "between":
+            # Allow "between" B-bands and "under" lower T-bands; skip everything else
+            if is_low_market or parsed.direction not in ("between", "under"):
                 continue
+
+            # --- Lower T-band YES (KXHIGH "under") -------------------------
+            if parsed.direction == "under":
+                if not BAND_ARB_LOWER_T_ENABLED or parsed.strike is None:
+                    continue
+                _city_suffix_lt = parsed.metric.replace("temp_high_", "")
+                if BAND_ARB_YES_BLACKLIST_CITIES and _city_suffix_lt in BAND_ARB_YES_BLACKLIST_CITIES:
+                    logging.debug("BandArb LowerT YES skip: %s — city %s blacklisted", ticker, _city_suffix_lt)
+                    continue
+                # In-band: running max strictly below threshold (round-aware)
+                if round(observed_max) >= int(parsed.strike):
+                    continue
+                # Post-P75 lock only
+                _city_info_lt = CITIES.get(parsed.metric)
+                if _city_info_lt is None:
+                    continue
+                if not _is_past_lock(_city_info_lt[3], metric=parsed.metric):
+                    logging.debug("BandArb LowerT YES skip: %s — not past P75 lock", ticker)
+                    continue
+                _lt_close_str = mkt.get("close_time") or mkt.get("expiration_time", "")
+                _lt_htc = _hours_to_close(_lt_close_str)
+                if _lt_htc is None:
+                    continue
+                # YES ask price gate
+                _lt_yes_ask_raw = mkt.get("yes_ask")
+                if _lt_yes_ask_raw is None:
+                    continue
+                _lt_yes_ask = int(_lt_yes_ask_raw)
+                if _lt_yes_ask > BAND_ARB_LOWER_T_MAX_YES_ASK:
+                    logging.debug(
+                        "BandArb LowerT YES skip: %s — yes_ask=%d > max=%d",
+                        ticker, _lt_yes_ask, BAND_ARB_LOWER_T_MAX_YES_ASK,
+                    )
+                    continue
+                # Spread gate: same 15¢ limit as B-band YES
+                _lt_spread = _lt_yes_ask - (yes_bid or 0)
+                if _lt_spread > 15:
+                    logging.debug("BandArb LowerT YES skip: %s — spread=%d¢ > 15¢", ticker, _lt_spread)
+                    continue
+                # HRRR gate: block if HRRR forecasts daily high >= threshold
+                _lt_hrrr = (hrrr_values or {}).get(parsed.metric)
+                if BAND_ARB_LOWER_T_HRRR_GATE and _lt_hrrr is not None and _lt_hrrr >= parsed.strike:
+                    logging.debug(
+                        "BandArb LowerT YES skip: %s — HRRR=%.1f ≥ threshold=%.1f",
+                        ticker, _lt_hrrr, parsed.strike,
+                    )
+                    continue
+                logging.info(
+                    "BandArb LowerT YES: %s  obs=%.1f°F < threshold=%.1f°F"
+                    "  YES_ask=%d¢  HRRR=%s  %.1fh to close",
+                    ticker, observed_max, parsed.strike, _lt_yes_ask,
+                    f"{_lt_hrrr:.1f}°F" if _lt_hrrr is not None else "n/a", _lt_htc,
+                )
+                signals.append(BandArbSignal(
+                    metric=parsed.metric, ticker=ticker, yes_bid=yes_bid, no_ask=no_ask,
+                    observed_max=observed_max, band_ceil=parsed.strike,
+                    direction="under", city=mkt.get("subtitle", "") or ticker,
+                    side="yes", yes_ask=_lt_yes_ask, hours_to_close=_lt_htc,
+                    is_locked=True,
+                    strike_lo=None,
+                    noaa_val=(noaa_obs_values or {}).get(parsed.metric),
+                    hrrr_val=_lt_hrrr,
+                    corr_status="metar_only",
+                    yes_ask_entry=_lt_yes_ask,
+                ))
+                continue  # don't fall through to B-band YES path
+
+            # --- B-band between YES (existing logic) -----------------------
             if parsed.strike_lo is None or parsed.strike_hi is None:
                 continue
             # City blacklist (data shows poor P&L in certain cities)
