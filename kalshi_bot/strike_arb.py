@@ -226,6 +226,11 @@ BAND_ARB_YES_MIN_YES_ASK: int = env_int("BAND_ARB_YES_MIN_YES_ASK", 50)
 BAND_ARB_YES_BUFFER_F: float = env_float("BAND_ARB_YES_BUFFER_F", 0.0)
 # Max METAR vs NOAA divergence. NOAA is required for YES (no market-price fallback).
 BAND_ARB_YES_MAX_DIVERGENCE_F: float = env_float("BAND_ARB_YES_MAX_DIVERGENCE_F", 3.0)
+# HRRR ceiling gate: block YES when HRRR daily-high forecast >= band ceiling.
+# Backtest (Feb–May 2026, 410 obs): hrrr>=ceil → 29–37% WR, -$11; hrrr<ceil → 70% WR, +$25.
+# Live trades (66 obs): hrrr>=ceil → 62% WR, -$53; hrrr<ceil → 85% WR, +$15.
+# Set BAND_ARB_YES_HRRR_GATE=false to disable.
+BAND_ARB_YES_HRRR_GATE: bool = env_bool("BAND_ARB_YES_HRRR_GATE", True)
 # Local hour + minute at which daily high is considered locked (matches NOAA_OBS_PEAK_PAST)
 BAND_ARB_YES_LOCK_LOCAL_HOUR: int = env_int("BAND_ARB_YES_LOCK_LOCAL_HOUR", 16)
 BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = env_int("BAND_ARB_YES_LOCK_LOCAL_MINUTE", 30)
@@ -1404,6 +1409,16 @@ def find_band_arbs(
                     " (METAR=%.1f NOAA=%.1f diff=%.1f°F > %.1f°F limit)",
                     ticker, observed_max, noaa_val_yes,
                     divergence_yes, BAND_ARB_YES_MAX_DIVERGENCE_F,
+                )
+                continue
+
+            # HRRR ceiling gate: if HRRR forecasts the daily high at or above the
+            # band ceiling, the temperature is likely still rising and will overshoot.
+            _hrrr_yes = (hrrr_values or {}).get(parsed.metric)
+            if BAND_ARB_YES_HRRR_GATE and _hrrr_yes is not None and _hrrr_yes >= parsed.strike_hi:
+                logging.debug(
+                    "BandArb YES skip: %s — HRRR=%.1f ≥ ceil=%.1f (overshoot risk)",
+                    ticker, _hrrr_yes, parsed.strike_hi,
                 )
                 continue
 
