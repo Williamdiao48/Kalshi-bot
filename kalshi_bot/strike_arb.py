@@ -59,7 +59,7 @@ import os
 from .utils import env_bool, env_float, env_int, parse_iso_dt
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Any
 
 import importlib.util as _ilu
@@ -231,6 +231,10 @@ BAND_ARB_YES_MAX_DIVERGENCE_F: float = env_float("BAND_ARB_YES_MAX_DIVERGENCE_F"
 # Live trades (66 obs): hrrr>=ceil → 62% WR, -$53; hrrr<ceil → 85% WR, +$15.
 # Set BAND_ARB_YES_HRRR_GATE=false to disable.
 BAND_ARB_YES_HRRR_GATE: bool = env_bool("BAND_ARB_YES_HRRR_GATE", True)
+# Minimum headroom to band ceiling required when still-rising.  Trade 537 lost
+# with margin_hi=0.08°F + is_rising=True — temperature trivially overshot.
+# Default 0.5°F: skip YES when obs is within 0.5°F of ceiling AND still rising.
+BAND_ARB_YES_MIN_MARGIN_HI_RISING_F: float = env_float("BAND_ARB_YES_MIN_MARGIN_HI_RISING_F", 0.1)
 # Local hour + minute at which daily high is considered locked (matches NOAA_OBS_PEAK_PAST)
 BAND_ARB_YES_LOCK_LOCAL_HOUR: int = env_int("BAND_ARB_YES_LOCK_LOCAL_HOUR", 16)
 BAND_ARB_YES_LOCK_LOCAL_MINUTE: int = env_int("BAND_ARB_YES_LOCK_LOCAL_MINUTE", 30)
@@ -502,6 +506,24 @@ FORECAST_NO_CORRECTED_MIN_EDGE_F: float = float(
     os.environ.get("FORECAST_NO_CORRECTED_MIN_EDGE_F", "1.0")
 )
 
+# --- Forecast-band YES signal (morning HRRR → B-band early YES entry) ------
+# Backtest (KXHIGH B-bands, Apr–May 2026, n=294):
+#   65.6% PT rate at 70¢, +15.0¢ avg, +$44.24 total over ~30 days.
+#   Signal: HRRR morning forecast rounds to target band → enter YES cheap at open,
+#   ride intraday price discovery as market reacts to the same HRRR signal.
+FORECAST_BAND_YES_ENABLED: bool = env_bool("FORECAST_BAND_YES_ENABLED", True)
+# YES ask entry window (¢). Backtest used 10–55¢; below 10 is noise.
+FORECAST_BAND_YES_MIN_ASK: int = env_int("FORECAST_BAND_YES_MIN_ASK", 10)
+FORECAST_BAND_YES_MAX_ASK: int = env_int("FORECAST_BAND_YES_MAX_ASK", 55)
+# UTC hour window for entries: 7–11 UTC = 2–6 AM ET (market open window).
+# Backtest: 97% of entries occur at hour 7; later hours are fallback only.
+FORECAST_BAND_YES_ENTRY_MIN_UTC_HOUR: int = env_int("FORECAST_BAND_YES_ENTRY_MIN_UTC_HOUR", 7)
+FORECAST_BAND_YES_ENTRY_MAX_UTC_HOUR: int = env_int("FORECAST_BAND_YES_ENTRY_MAX_UTC_HOUR", 11)
+# Same-day gate: only trade today's market (not tomorrow's or day-after).
+FORECAST_BAND_YES_MAX_HTC: float = env_float("FORECAST_BAND_YES_MAX_HTC", 20.0)
+# Backtest-calibrated win probability (65.6% PT hit rate at 70¢).
+FORECAST_BAND_YES_P_ESTIMATE: float = env_float("FORECAST_BAND_YES_P_ESTIMATE", 0.656)
+
 # ---------------------------------------------------------------------------
 # Per-city, per-source cold-bias cache (populated by refresh_forecast_bias).
 # Keys: (source, metric) e.g. ("hrrr", "temp_high_bos").
@@ -740,6 +762,32 @@ class ForecastNoSignal:
     # Not used for trade logic; stored in note for post-hoc analysis.
     obs_temp_f: float | None = None
     obs_gap_f:  float | None = None
+
+
+@dataclass
+class ForecastBandYesSignal:
+    """A KXHIGH B-band market where morning HRRR forecast rounds into this band.
+
+    Strategy: enter YES early at market open (7-11 UTC, 2-6 AM ET) before the
+    market prices in the HRRR signal. Profit-take at 70¢ YES bid as intraday
+    price discovery lifts the ask through the day.
+
+    Backtest (KXHIGH B-bands, Apr–May 2026, n=294):
+      65.6% PT rate @ 70¢, +15.0¢ avg PnL, +$44.24 total.
+      Median time to PT hit: 741 min (most exits in the 8-16h window).
+    """
+    ticker: str
+    metric: str
+    city: str
+    yes_ask: int        # entry price (current YES ask)
+    yes_bid: int        # current YES bid (for limit order = yes_bid + 1)
+    fc_hrrr: float      # HRRR daily-high forecast °F
+    band_lo: float      # band lower bound °F
+    band_hi: float      # band upper bound °F
+    hours_to_close: float
+    p_estimate: float   # calibrated win prob from backtest
+    score: float
+    opportunity_kind: str = "forecast_band_yes"
 
 
 def _hours_to_close(close_time_str: str) -> float | None:
@@ -1499,6 +1547,17 @@ def find_band_arbs(
                     ticker, _hrrr_yes, parsed.strike_hi,
                 )
                 continue
+
+            # Margin-to-ceiling gate: if still rising AND within min margin of ceiling, skip.
+            # Thin headroom + rising temp = near-certain overshoot (e.g. trade #537: 0.08°F margin, lost).
+            if parsed.strike_hi is not None and _is_rising_now and BAND_ARB_YES_MIN_MARGIN_HI_RISING_F > 0:
+                _margin_hi = parsed.strike_hi - observed_max
+                if _margin_hi < BAND_ARB_YES_MIN_MARGIN_HI_RISING_F:
+                    logging.debug(
+                        "BandArb YES skip: %s — margin_hi=%.2f°F < %.1f°F with rising temp (overshoot risk)",
+                        ticker, _margin_hi, BAND_ARB_YES_MIN_MARGIN_HI_RISING_F,
+                    )
+                    continue
 
             city_yes = mkt.get("subtitle", "") or ticker
             logging.info(
@@ -2472,6 +2531,132 @@ def find_forecast_nos(
             strike_hi=parsed.strike_hi,
             obs_temp_f=_obs_temp_fno,
             obs_gap_f=_obs_gap_fno,
+        ))
+
+    return signals
+
+
+# Regex to parse KXHIGH B-band tickers: e.g. KXHIGHCHI-26JUN03-B75.5
+# Group 1 = prefix (e.g. KXHIGHCHI), group 2 = mid float (e.g. 75.5)
+_BBAND_TICKER_RE = re.compile(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B([\d.]+)$")
+
+# Ticker-prefix → metric key (mirrors market_parser.TICKER_TO_METRIC for KXHIGH)
+_KXHIGH_PREFIX_TO_METRIC: dict[str, str] = {
+    "KXHIGHLAX": "temp_high_lax",
+    "KXHIGHDEN": "temp_high_den",
+    "KXHIGHCHI": "temp_high_chi",
+    "KXHIGHNY":  "temp_high_ny",
+    "KXHIGHMIA": "temp_high_mia",
+    "KXHIGHDAL": "temp_high_dal",
+    "KXHIGHBOS": "temp_high_bos",
+    "KXHIGHAUS": "temp_high_aus",
+    "KXHIGHOU":  "temp_high_hou",
+    "KXHIGHTSFO":  "temp_high_sfo",
+    "KXHIGHTSEA":  "temp_high_sea",
+    "KXHIGHTBOS":  "temp_high_bos",
+    "KXHIGHTPHX":  "temp_high_phx",
+    "KXHIGHPHIL":  "temp_high_phl",
+    "KXHIGHTATL":  "temp_high_atl",
+    "KXHIGHTMIN":  "temp_high_msp",
+    "KXHIGHTDC":   "temp_high_dca",
+    "KXHIGHTLV":   "temp_high_las",
+    "KXHIGHTMSP":  "temp_high_msp",
+    "KXHIGHTMSY":  "temp_high_msy",
+}
+
+
+def find_forecast_band_yes_signals(
+    markets: list[dict[str, Any]],
+    hrrr_highs: dict[str, float],
+) -> list[ForecastBandYesSignal]:
+    """Scan open KXHIGH B-band markets for early YES entries driven by HRRR morning forecast.
+
+    Fires when the HRRR daily-high forecast rounds to a specific B-band and the
+    YES ask is still cheap (10-55¢).  Enters YES at open before the market has
+    priced in the HRRR signal; exits via absolute PT at 70¢ YES bid.
+
+    Entry gates (all must pass):
+      1. FORECAST_BAND_YES_ENABLED is True
+      2. Current UTC hour is in [ENTRY_MIN_UTC_HOUR, ENTRY_MAX_UTC_HOUR]
+      3. Market ticker matches KXHIGH B-band pattern (B{mid}.5)
+      4. Market closes within FORECAST_BAND_YES_MAX_HTC hours (today's market only)
+      5. round(hrrr_forecast) falls within [band_lo, band_hi]
+      6. YES ask is in [FORECAST_BAND_YES_MIN_ASK, FORECAST_BAND_YES_MAX_ASK]
+
+    Args:
+        markets:    Open Kalshi market dicts (normalised with yes_bid/yes_ask).
+        hrrr_highs: HRRR daily-high forecasts per metric, e.g. {"temp_high_chi": 75.3}.
+
+    Returns:
+        List of ForecastBandYesSignal, one per qualifying market.
+    """
+    if not FORECAST_BAND_YES_ENABLED or not hrrr_highs:
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    if not (FORECAST_BAND_YES_ENTRY_MIN_UTC_HOUR <= now_utc.hour <= FORECAST_BAND_YES_ENTRY_MAX_UTC_HOUR):
+        return []
+
+    signals: list[ForecastBandYesSignal] = []
+
+    for mkt in markets:
+        ticker = mkt.get("ticker", "")
+
+        # Parse B-band ticker directly — parse_market() returns direction='under'
+        # for B-suffix tickers even when the title says "Between X and Y".
+        m = _BBAND_TICKER_RE.match(ticker)
+        if m is None:
+            continue
+
+        prefix, mid_str = m.group(1), m.group(2)
+        metric = _KXHIGH_PREFIX_TO_METRIC.get(prefix)
+        if metric is None:
+            continue
+
+        mid_f = float(mid_str)
+        band_lo = int(mid_f - 0.5)
+        band_hi = band_lo + 1
+
+        # Same-day gate: reject tomorrow's or multi-day markets
+        close_str = mkt.get("close_time") or mkt.get("expiration_time", "")
+        htc = _hours_to_close(close_str)
+        if htc is None or htc > FORECAST_BAND_YES_MAX_HTC:
+            continue
+
+        fc = hrrr_highs.get(metric)
+        if fc is None:
+            continue
+
+        # Core signal: does HRRR round to this band?
+        if not (band_lo <= round(fc) <= band_hi):
+            continue
+
+        yes_ask = mkt.get("yes_ask")
+        yes_bid = mkt.get("yes_bid")
+        if yes_ask is None or yes_bid is None:
+            continue
+        if not (FORECAST_BAND_YES_MIN_ASK <= yes_ask <= FORECAST_BAND_YES_MAX_ASK):
+            continue
+
+        city = metric.replace("temp_high_", "")
+
+        logging.debug(
+            "ForecastBandYES: %s  HRRR=%.1f°F → band[%d,%d]  yes_ask=%d¢  htc=%.1fh",
+            ticker, fc, band_lo, band_hi, yes_ask, htc,
+        )
+
+        signals.append(ForecastBandYesSignal(
+            ticker=ticker,
+            metric=metric,
+            city=city,
+            yes_ask=yes_ask,
+            yes_bid=yes_bid,
+            fc_hrrr=fc,
+            band_lo=float(band_lo),
+            band_hi=float(band_hi),
+            hours_to_close=htc,
+            p_estimate=FORECAST_BAND_YES_P_ESTIMATE,
+            score=FORECAST_BAND_YES_P_ESTIMATE,
         ))
 
     return signals

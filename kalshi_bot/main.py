@@ -38,7 +38,7 @@ from .arb_detector import (
     find_crossed_book_opportunities, CrossedBookArb, CROSSED_BOOK_MIN_PROFIT,
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
-from .strike_arb import find_band_arbs, find_forecast_nos, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED
+from .strike_arb import find_band_arbs, find_forecast_nos, find_forecast_band_yes_signals, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED, FORECAST_BAND_YES_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, edgar, predictit
@@ -2786,6 +2786,21 @@ async def _poll(
                     continue
                 await executor.maybe_trade_forecast_no(session, _fno)
 
+    # ---- forecast-band YES (morning HRRR → B-band early entry) -------------
+    if FORECAST_BAND_YES_ENABLED and hrrr_hourly_highs:
+        _fby_signals = find_forecast_band_yes_signals(markets, hrrr_hourly_highs)
+        if _fby_signals:
+            logging.info(
+                "ForecastBandYES: %d signal(s) found.", len(_fby_signals),
+            )
+            for _fby in _fby_signals:
+                if _fby.ticker in dry_run_held:
+                    logging.info(
+                        "ForecastBandYES skip: %s — open position held.", _fby.ticker,
+                    )
+                    continue
+                await executor.maybe_trade_forecast_band_yes(session, _fby)
+
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)
     if total == 0:
@@ -3783,8 +3798,11 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
             continue
         feat_map["city_enc"] = float(cmap.get(city, 0))
 
-        X       = _np.array([[feat_map.get(f, 0.0) for f in feats]])
-        raw_p   = lgbm.predict_proba(X)[0][1]
+        import warnings as _warnings
+        X = _np.array([[feat_map.get(f, 0.0) for f in feats]])
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            raw_p = lgbm.predict_proba(X)[0][1]
         model_p = float(iso.predict([raw_p])[0])
 
         if model_p < _MODEL_SHADOW_MIN_MODEL_P:

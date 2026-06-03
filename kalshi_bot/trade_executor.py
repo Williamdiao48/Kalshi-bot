@@ -125,7 +125,7 @@ from .arb_detector import (
     CrossedBookArb, CROSSED_BOOK_ARB_ENABLED,
 )
 from .bracket_arb import BracketSetArb, BRACKET_ARB_ENABLED
-from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90
+from .strike_arb import BandArbSignal, BAND_ARB_EXECUTION_ENABLED, ForecastNoSignal, FORECAST_NO_ENABLED, is_past_p90, ForecastBandYesSignal, FORECAST_BAND_YES_ENABLED
 from .nba_convergence import NBAConvergenceOpportunity
 from .band_arb_sizer import win_prob as band_arb_win_prob, kelly_scale as band_arb_kelly_scale
 from .band_arb_low_sizer import win_prob as band_arb_low_win_prob, kelly_scale as band_arb_low_kelly_scale
@@ -3206,6 +3206,95 @@ class TradeExecutor:
             yes_ask=signal.yes_ask or None,
             corroborating_sources=signal.sources,
             note=json.dumps(_fno_note),
+        )
+
+    async def maybe_trade_forecast_band_yes(
+        self,
+        session: aiohttp.ClientSession,
+        signal: "ForecastBandYesSignal",
+    ) -> None:
+        """Evaluate and optionally execute a morning HRRR B-band YES trade.
+
+        Enters YES early at market open (7-11 UTC) before the market prices in
+        the HRRR signal.  Exit is handled by exit_manager's absolute-price PT at
+        FORECAST_BAND_YES_EXIT_PRICE_CENTS (default 70¢ YES bid).
+
+        Backtest (Apr–May 2026, n=294): 65.6% PT rate, +15.0¢ avg, +$44.24 total.
+        Non-PT-hit trades hold to settlement (all settled NO → full entry loss).
+
+        Guards:
+          1. No existing open YES position on this ticker
+          2. Circuit breaker clear
+          3. Kelly recommends >= 1 contract
+          4. FORECAST_BAND_YES_ENABLED is True (else detect-only)
+        """
+        logging.info(
+            "ForecastBandYES: %s  yes_ask=%d¢  HRRR=%.1f°F → band[%.0f,%.0f]  htc=%.1fh",
+            signal.ticker, signal.yes_ask, signal.fc_hrrr,
+            signal.band_lo, signal.band_hi, signal.hours_to_close,
+        )
+
+        if self._circuit_breaker_tripped(signal.ticker, "ForecastBandYES"):
+            return
+
+        _existing = self._open_contracts_on_ticker(signal.ticker, "yes")
+        if _existing > 0:
+            logging.info(
+                "ForecastBandYES skip: %s — %d YES contract(s) already open",
+                signal.ticker, _existing,
+            )
+            return
+
+        count = kelly_contracts(
+            win_prob=signal.p_estimate,
+            cost_cents=signal.yes_ask,
+            max_cents=min(max(1, int(MAX_POSITION_CENTS * _dd_factor)), self._remaining_exposure_cents()),
+            kelly_fraction=KELLY_FRACTION,
+            hard_cap=TRADE_MAX_CONTRACTS,
+        )
+        if count == 0:
+            logging.info(
+                "ForecastBandYES skip (Kelly=0 at p=%.2f yes_ask=%d¢): %s",
+                signal.p_estimate, signal.yes_ask, signal.ticker,
+            )
+            return
+
+        if not FORECAST_BAND_YES_ENABLED:
+            logging.info(
+                "ForecastBandYES DETECT-ONLY (FORECAST_BAND_YES_ENABLED=false): "
+                "%s  YES×%d @ %d¢  HRRR=%.1f°F",
+                signal.ticker, count, signal.yes_ask, signal.fc_hrrr,
+            )
+            return
+
+        if await self._exposure_cap_exceeded(session, signal.ticker, count, signal.yes_ask, "ForecastBandYES"):
+            return
+
+        _note = {
+            "fc_hrrr":       round(signal.fc_hrrr, 1),
+            "band_lo":       signal.band_lo,
+            "band_hi":       signal.band_hi,
+            "metric":        signal.metric,
+            "hours_to_close": round(signal.hours_to_close, 1),
+            "pt_target_cents": 70,
+        }
+
+        self.stats.trades_attempted += 1
+        await self._execute(
+            session=session,
+            ticker=signal.ticker,
+            side="yes",
+            count=count,
+            limit_price=signal.yes_ask,
+            opportunity_kind="forecast_band_yes",
+            score=signal.score,
+            p_estimate=signal.p_estimate,
+            source="forecast_band_yes",
+            kelly_fraction=KELLY_FRACTION,
+            yes_bid=signal.yes_bid,
+            yes_ask=signal.yes_ask,
+            corroborating_sources=["hrrr"],
+            note=json.dumps(_note),
         )
 
     # -----------------------------------------------------------------------

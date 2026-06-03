@@ -477,6 +477,13 @@ BAND_ARB_YES_EXIT_PRICE_CENTS: int = int(
     os.environ.get("BAND_ARB_YES_EXIT_PRICE_CENTS", "99")
 )
 
+# Absolute YES-bid profit-take for forecast_band_yes positions.
+# Backtest (Apr–May 2026, n=294): 70¢ is the optimal PT target — 65.6% hit rate,
+# +15.0¢ avg PnL.  Exit when YES bid reaches this threshold regardless of entry.
+FORECAST_BAND_YES_EXIT_PRICE_CENTS: int = int(
+    os.environ.get("FORECAST_BAND_YES_EXIT_PRICE_CENTS", "70")
+)
+
 # Hours past market close_time before a still-pending trade is treated as stale.
 # Post-close markets show bid=0/ask=100 (pre-settlement), so normal exits can't
 # fire.  If the bot was shut down before settlement was detected, this sweep uses
@@ -1024,13 +1031,16 @@ class ExitManager:
             #   FORECAST_NO_PROFIT_TAKE > 0 overrides the low-ask bucket if set.
             is_locked = (src in _LOCKED_STOP_LOSS_ONLY) and not (src == "band_arb" and side == "yes")
             is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
+            is_forecast_band_yes = src == "forecast_band_yes" and side == "yes"
             _fno_pt_thresh = 0.0
             if is_forecast_no:
                 if entry_cost >= FORECAST_NO_HIGH_ASK_THRESHOLD and FORECAST_NO_HIGH_ASK_PT > 0:
                     _fno_pt_thresh = FORECAST_NO_HIGH_ASK_PT
                 elif FORECAST_NO_PROFIT_TAKE > 0:
                     _fno_pt_thresh = FORECAST_NO_PROFIT_TAKE
-            suppress_profit_take = is_locked or (is_forecast_no and _fno_pt_thresh <= 0)
+            # forecast_band_yes: use absolute-price PT only (70¢ bid); suppress standard
+            # percentage PT and stop-loss — hold to settlement on non-PT-hit trades.
+            suppress_profit_take = is_locked or (is_forecast_no and _fno_pt_thresh <= 0) or is_forecast_band_yes
 
             reason: str | None = None
             detail: str | None = None
@@ -1074,6 +1084,24 @@ class ExitManager:
                 )
                 reason = "profit_take"
                 detail = f"profit_take:band_arb_abs_price:bid={getattr(trade, 'yes_bid', None)}:thresh={BAND_ARB_YES_EXIT_PRICE_CENTS}"
+
+            # Absolute YES-bid profit-take for forecast_band_yes.
+            # Backtest optimal PT: 70¢ YES bid (65.6% hit rate, +15.0¢ avg).
+            # Standard percentage PT is suppressed (is_forecast_band_yes=True above).
+            if (
+                reason is None
+                and FORECAST_BAND_YES_EXIT_PRICE_CENTS > 0
+                and is_forecast_band_yes
+                and trade.current_mid is not None
+                and trade.current_mid >= FORECAST_BAND_YES_EXIT_PRICE_CENTS
+            ):
+                logging.info(
+                    "[forecast_band_yes-PT] trade #%d %s: YES bid %.0f¢ ≥ %d¢ — profit_take",
+                    trade.trade_id, getattr(trade, "ticker", "?"),
+                    trade.current_mid, FORECAST_BAND_YES_EXIT_PRICE_CENTS,
+                )
+                reason = "profit_take"
+                detail = f"profit_take:forecast_band_yes_abs_price:bid={getattr(trade, 'yes_bid', None)}:thresh={FORECAST_BAND_YES_EXIT_PRICE_CENTS}"
 
             # ---- NBA Pinnacle convergence exits --------------------------------
             # Applied before standard profit-take so the convergence target is
