@@ -176,6 +176,114 @@ _last_hrrr_lows: dict[str, float] = {}  # temp_low_* HRRR values, cached alongsi
 _gfs_morning_snap: dict[str, float] = {}
 _gfs_morning_snap_date: str = ""  # UTC date string (YYYY-MM-DD) of last refresh
 
+# ---------------------------------------------------------------------------
+# Model shadow-NO: LightGBM NO-signal model used as a broad scanner
+# ---------------------------------------------------------------------------
+_model_shadow_lgbm_h = None   # KXHIGH LightGBM model
+_model_shadow_iso_h  = None   # KXHIGH isotonic calibrator
+_model_shadow_feat_h: list[str] = []
+_model_shadow_city_h: dict[str, int] = {}
+_model_shadow_lgbm_l = None   # KXLOWT LightGBM model
+_model_shadow_iso_l  = None
+_model_shadow_feat_l: list[str] = []
+_model_shadow_city_l: dict[str, int] = {}
+_model_shadow_clim:   dict = {}   # climatology: city → month → hour → [further_drop...]
+_model_shadow_hrrr_lookup:   dict = {}   # (metric, date) → HRRR forecast °F
+_model_shadow_actual_lookup: dict = {}   # (obs_metric, date) → {high/low: °F}
+_model_shadow_loaded: bool = False
+
+
+def _load_model_shadow() -> None:
+    """Load NO-signal LightGBM models + build climatology + MAE lookups.  Called once at startup."""
+    global _model_shadow_lgbm_h, _model_shadow_iso_h, _model_shadow_feat_h, _model_shadow_city_h
+    global _model_shadow_lgbm_l, _model_shadow_iso_l, _model_shadow_feat_l, _model_shadow_city_l
+    global _model_shadow_clim, _model_shadow_hrrr_lookup, _model_shadow_actual_lookup
+    global _model_shadow_loaded
+    import pickle, json
+
+    def _load_pkl(path: str):
+        p = Path(path)
+        if not p.exists():
+            return None, None, [], {}
+        pl = pickle.loads(p.read_bytes())
+        return pl["lgbm"], pl["isotonic"], pl["features"], pl.get("city_map", {})
+
+    _model_shadow_lgbm_h, _model_shadow_iso_h, _model_shadow_feat_h, _model_shadow_city_h = \
+        _load_pkl("data/models/forecast_no_band_model_high.pkl")
+    _model_shadow_lgbm_l, _model_shadow_iso_l, _model_shadow_feat_l, _model_shadow_city_l = \
+        _load_pkl("data/models/forecast_no_band_model_low.pkl")
+
+    if _model_shadow_lgbm_h is None and _model_shadow_lgbm_l is None:
+        logging.warning("Model shadow-NO: no model files found — shadow trader disabled.")
+        return
+
+    # Build further-drop climatology from 4yr METAR cache
+    cache_path = Path("data/backtest/band_arb_hist_cache.json")
+    if cache_path.exists():
+        cache = json.loads(cache_path.read_text())
+        _STATION_TO_CITY = {
+            "LAX":"lax","DEN":"den","MDW":"chi","NYC":"ny","MIA":"mia",
+            "AUS":"aus","DAL":"dal","BOS":"bos","HOU":"hou","DFW":"dfw",
+            "SFO":"sfo","SEA":"sea","PHX":"phx","PHL":"phl","ATL":"atl",
+            "MSP":"msp","DCA":"dca","LAS":"las","OKC":"okc","SAT":"sat","MSY":"msy",
+        }
+        for station, city in _STATION_TO_CITY.items():
+            h_key = next((k for k in cache if k.startswith(f"hourly_{station}_")), None)
+            l_key = next((k for k in cache if k.startswith(f"actual_{station}_") and k.endswith("_low")), None)
+            if not h_key or not l_key:
+                continue
+            hourly_data = cache[h_key]
+            low_data    = cache[l_key]
+            _model_shadow_clim[city] = {}
+            for date_str, obs in hourly_data.items():
+                if not obs:
+                    continue
+                actual_low = low_data.get(date_str)
+                if actual_low is None:
+                    continue
+                actual_low  = float(actual_low)
+                month       = int(date_str[5:7])
+                running_min = None
+                for h in sorted(int(x) for x in obs):
+                    t = obs.get(str(h))
+                    if t is None:
+                        continue
+                    running_min = float(t) if running_min is None else min(running_min, float(t))
+                    drop = max(0.0, running_min - actual_low)
+                    _model_shadow_clim[city].setdefault(month, {}).setdefault(h, []).append(drop)
+
+        # HRRR and actual lookups for rolling MAE
+        for key, day_map in cache.items():
+            if not isinstance(day_map, dict):
+                continue
+            if key.startswith("hrrr_temp_high_"):
+                city = key.split("hrrr_temp_high_")[1].split("_")[0]
+                for d, v in day_map.items():
+                    if v is not None:
+                        _model_shadow_hrrr_lookup[(f"temp_high_{city}", d)] = float(v)
+            elif key.startswith("hrrr_temp_low_"):
+                city = key.split("hrrr_temp_low_")[1].split("_")[0]
+                for d, v in day_map.items():
+                    if v is not None:
+                        _model_shadow_hrrr_lookup[(f"temp_low_{city}", d)] = float(v)
+        for station, city in _STATION_TO_CITY.items():
+            for direction in ("high", "low"):
+                ak = next((k for k in cache if k.startswith(f"actual_{station}_") and k.endswith(f"_{direction}")), None)
+                if ak:
+                    obs_metric = f"temp_high_{city}"
+                    for d, v in cache[ak].items():
+                        if v is not None:
+                            _model_shadow_actual_lookup.setdefault((obs_metric, d), {})[direction] = float(v)
+
+    _model_shadow_loaded = True
+    logging.info(
+        "Model shadow-NO loaded: high=%s low=%s  clim_cities=%d  hrrr_entries=%d",
+        "ok" if _model_shadow_lgbm_h else "missing",
+        "ok" if _model_shadow_lgbm_l else "missing",
+        len(_model_shadow_clim),
+        len(_model_shadow_hrrr_lookup),
+    )
+
 
 def _refresh_gfs_morning_snap(conn) -> None:
     """Query DB for the first open_meteo_gfs value per metric logged today (UTC).
@@ -3275,8 +3383,10 @@ async def _fast_loop(
         await executor.maybe_trade_band_arb(session, signal)
 
     await _settle_shadow_band_arbs(conn=executor._conn, session=session)
-    _update_yes_momentum_shadows(conn=executor._conn, markets=markets)
-    await _check_yes_momentum_exits(conn=executor._conn, markets=markets, session=session)
+    _update_yes_momentum_shadows(conn=executor._conn, markets=fresh_markets)
+    await _check_yes_momentum_exits(conn=executor._conn, markets=fresh_markets, session=session)
+    _update_model_shadow_no(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
+    await _settle_model_shadow_no(conn=executor._conn, session=session)
 
 
 async def _position_watcher(
@@ -3481,6 +3591,276 @@ async def _check_yes_momentum_exits(
         )
 
 
+_MODEL_SHADOW_MIN_MARGIN   = 0.3   # °F above band_ceil to fire at all
+_MODEL_SHADOW_MIN_MODEL_P  = 0.80  # minimum calibrated model probability to log
+_MODEL_SHADOW_SERIES = {
+    # series prefix → (city_code, is_high)
+    "KXHIGHLAX":("lax",True), "KXHIGHDEN":("den",True), "KXHIGHCHI":("chi",True),
+    "KXHIGHNY":("ny",True),   "KXHIGHMIA":("mia",True), "KXHIGHDAL":("dal",True),
+    "KXHIGHBOS":("bos",True), "KXHIGHAUS":("aus",True), "KXHIGHOU":("hou",True),
+    "KXHIGHTSFO":("sfo",True),"KXHIGHTSEA":("sea",True),"KXHIGHTBOS":("bos",True),
+    "KXHIGHTPHX":("phx",True),"KXHIGHTPHIL":("phl",True),"KXHIGHTDC":("dca",True),
+    "KXHIGHTLV":("las",True), "KXHIGHTOKC":("okc",True),"KXHIGHTDAL":("dfw",True),
+    "KXHIGHTHOU":("hou",True),"KXHIGHTNOLA":("msy",True),"KXHIGHTATL":("atl",True),
+    "KXHIGHTMIN":("msp",True),"KXHIGHTDFW":("dfw",True),"KXHIGHTSATX":("sat",True),
+    "KXLOWTLAX":("lax",False),"KXLOWTDEN":("den",False),"KXLOWTCHI":("chi",False),
+    "KXLOWTNYC":("ny",False), "KXLOWTMIA":("mia",False),"KXLOWTAUS":("aus",False),
+    "KXLOWTBOS":("bos",False),"KXLOWTHOU":("hou",False),"KXLOWTDFW":("dfw",False),
+    "KXLOWTSFO":("sfo",False),"KXLOWTSEA":("sea",False),"KXLOWTPHX":("phx",False),
+    "KXLOWTPHIL":("phl",False),"KXLOWTATL":("atl",False),"KXLOWTMIN":("msp",False),
+    "KXLOWTDC":("dca",False), "KXLOWTLV":("las",False), "KXLOWTOKC":("okc",False),
+    "KXLOWTSATX":("sat",False),"KXLOWTNOLA":("msy",False),
+}
+
+
+def _model_shadow_features(
+    metric: str, city: str, is_high: bool,
+    band_ceil: int, margin_f: float,
+    hour_utc: int, month: int,
+    conn,
+) -> dict[str, float] | None:
+    """Build the feature dict for model inference.  Returns None if essential data missing."""
+    import numpy as _np
+    from datetime import timedelta as _td
+    from statistics import median as _median
+
+    direction = "high" if is_high else "low"
+    today     = datetime.now(timezone.utc).date().isoformat()
+
+    # Forecasts from DB
+    fc_rows = conn.execute("""
+        SELECT source, AVG(data_value)
+        FROM raw_forecasts
+        WHERE metric=? AND date(logged_at)=?
+          AND source IN ('hrrr','open_meteo_gfs','open_meteo_ecmwf','open_meteo_gem','open_meteo_icon')
+          AND data_value IS NOT NULL
+        GROUP BY source
+    """, (metric, today)).fetchall()
+    fc = {s: v for s, v in fc_rows}
+    if not fc:
+        return None
+
+    fc_vals   = list(fc.values())
+    hrrr_f    = fc.get("hrrr") or _last_hrrr_highs.get(metric) or _last_hrrr_lows.get(metric)
+    gfs_f     = fc.get("open_meteo_gfs") or (fc_vals[0] if fc_vals else None)
+    consensus = _median(fc_vals)
+    spread    = max(fc_vals) - min(fc_vals) if len(fc_vals) > 1 else 0.0
+    n_above   = sum(1 for v in fc_vals if v > band_ceil)
+
+    # delta_1h, delta_2h from metar_obs_log
+    obs_metric = metric.replace("temp_low_", "temp_high_")
+    fn         = max if is_high else min
+    from collections import defaultdict as _dd
+    obs_rows = conn.execute("""
+        SELECT obs_at, temp_f FROM metar_obs_log
+        WHERE metric=? AND obs_at >= ? ORDER BY obs_at ASC
+    """, (obs_metric, today + "T00:00:00")).fetchall()
+    by_hour: dict[int, list] = _dd(list)
+    for obs_at, tf in obs_rows:
+        h = datetime.fromisoformat(obs_at).hour
+        by_hour[h].append(tf)
+    running: dict[int, float] = {}
+    cur = None
+    for h in sorted(by_hour):
+        cur = fn([cur] + by_hour[h]) if cur is not None else fn(by_hour[h])
+        running[h] = cur
+    r_now = running.get(hour_utc, running.get(max(running), None) if running else None)
+    r_1h  = running.get(hour_utc - 1)
+    r_2h  = running.get(hour_utc - 2)
+    delta_1h = round(r_now - r_1h, 2) if r_now is not None and r_1h is not None else 0.0
+    delta_2h = round(r_now - r_2h, 2) if r_now is not None and r_2h is not None else 0.0
+
+    # hours_above_ceil
+    hours_above = 0
+    for h in sorted(running, reverse=True):
+        if h > hour_utc:
+            continue
+        if running[h] > band_ceil:
+            hours_above += 1
+        else:
+            break
+
+    # rolling 7-day HRRR MAE from pre-built lookup
+    errors = []
+    base_dt = datetime.now(timezone.utc)
+    for i in range(1, 8):
+        d = (base_dt - _td(days=i)).strftime("%Y-%m-%d")
+        hf = _model_shadow_hrrr_lookup.get((metric, d))
+        af_day = _model_shadow_actual_lookup.get((obs_metric, d))
+        af = af_day.get(direction) if af_day else None
+        if hf is not None and af is not None:
+            errors.append(abs(hf - af))
+    recent_mae = round(sum(errors) / len(errors), 2) if errors else 3.0
+
+    # climatological further-drop stats
+    drops = _model_shadow_clim.get(city, {}).get(month, {}).get(hour_utc, [])
+    if drops:
+        d_sorted = sorted(drops)
+        n = len(d_sorted)
+        clim_prob = sum(1 for x in d_sorted if x > margin_f) / n
+        clim_p50  = d_sorted[n // 2]
+        clim_p75  = d_sorted[int(n * 0.75)]
+    else:
+        clim_prob, clim_p50, clim_p75 = 0.15, 2.0, 3.0
+
+    return {
+        "margin_f":           float(margin_f),
+        "delta_1h":           delta_1h,
+        "delta_2h":           delta_2h,
+        "hours_above_ceil":   float(max(1, hours_above)),
+        "hour_utc":           float(hour_utc),
+        "hours_to_close":     float(max(0, 22 - hour_utc)),
+        "obs_vs_hrrr_h":      0.0,   # not available at runtime
+        "obs_vs_gfs_h":       0.0,
+        "hrrr_vs_ceil":       round((hrrr_f or consensus) - band_ceil, 2),
+        "gfs_vs_ceil":        round((gfs_f  or consensus) - band_ceil, 2),
+        "consensus_vs_ceil":  round(consensus - band_ceil, 2),
+        "model_spread":       round(spread, 2),
+        "n_models_above_ceil":float(n_above),
+        "recent_hrrr_mae_7d": recent_mae,
+        "clim_prob_exceed":   round(clim_prob, 4),
+        "clim_drop_p50":      round(clim_p50, 2),
+        "clim_drop_p75":      round(clim_p75, 2),
+        "city_enc":           0.0,   # filled in below by caller
+        "is_high":            1.0 if is_high else 0.0,
+        "month":              float(month),
+    }
+
+
+def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, float]) -> None:
+    """Scan all B-band markets; log shadow entry when model P(NO wins) > threshold."""
+    if not _model_shadow_loaded:
+        return
+    import numpy as _np
+    import re as _re
+
+    now_utc   = datetime.now(timezone.utc)
+    today     = now_utc.date().isoformat()
+    hour_utc  = now_utc.hour
+    month     = now_utc.month
+
+    # Open shadow tickers — skip if already tracked
+    open_tickers = {
+        row[0] for row in conn.execute(
+            "SELECT ticker FROM shadow_model_no WHERE exit_reason IS NULL"
+        ).fetchall()
+    }
+
+    for mkt in markets:
+        ticker = mkt.get("ticker", "")
+        m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B(\d+\.?\d*)$", ticker)
+        if not m:
+            continue
+        series = m.group(1)
+        mid    = float(m.group(2))
+        if series not in _MODEL_SHADOW_SERIES:
+            continue
+        city, is_high = _MODEL_SHADOW_SERIES[series]
+
+        metric    = f"temp_{'high' if is_high else 'low'}_{city}"
+        band_lo   = int(mid - 0.5)
+        band_ceil = band_lo + 1
+
+        running_obs = obs_values.get(metric)
+        if running_obs is None:
+            continue
+        margin_f = round(running_obs - band_ceil, 2)
+        if margin_f < _MODEL_SHADOW_MIN_MARGIN:
+            continue   # temp not above band yet
+        if ticker in open_tickers:
+            continue   # already have an open shadow row
+
+        # Select model
+        if is_high:
+            lgbm, iso, feats, cmap = _model_shadow_lgbm_h, _model_shadow_iso_h, _model_shadow_feat_h, _model_shadow_city_h
+        else:
+            lgbm, iso, feats, cmap = _model_shadow_lgbm_l, _model_shadow_iso_l, _model_shadow_feat_l, _model_shadow_city_l
+        if lgbm is None:
+            continue
+
+        feat_map = _model_shadow_features(metric, city, is_high, band_ceil, margin_f, hour_utc, month, conn)
+        if feat_map is None:
+            continue
+        feat_map["city_enc"] = float(cmap.get(city, 0))
+
+        X       = _np.array([[feat_map.get(f, 0.0) for f in feats]])
+        raw_p   = lgbm.predict_proba(X)[0][1]
+        model_p = float(iso.predict([raw_p])[0])
+
+        if model_p < _MODEL_SHADOW_MIN_MODEL_P:
+            continue
+
+        yes_ask   = mkt.get("yes_ask") or 100
+        market_p_no = (100 - yes_ask) / 100.0
+        edge      = round(model_p - market_p_no, 4)
+        hvc       = feat_map.get("hrrr_vs_ceil", 0.0)
+        clim_prob = feat_map.get("clim_prob_exceed", 0.0)
+
+        try:
+            conn.execute("""
+                INSERT INTO shadow_model_no
+                  (logged_at, ticker, series, is_high, model_p, market_p_no, edge,
+                   margin_f, hvc, clim_prob, hour_utc)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (now_utc.isoformat(), ticker, series, 1 if is_high else 0,
+                  round(model_p, 4), round(market_p_no, 4), edge,
+                  margin_f, round(hvc, 2), round(clim_prob, 4), hour_utc))
+            logging.info(
+                "[shadow_model_no] Entry: %s  model=%.0f%%  mkt_no=%.0f%%  edge=%+.0f%%"
+                "  m=%.1f  hvc=%+.1f  clim=%.0f%%",
+                ticker, 100*model_p, 100*market_p_no, 100*edge,
+                margin_f, hvc, 100*clim_prob,
+            )
+        except Exception:
+            pass   # unique index violation = already open; ignore
+
+
+async def _settle_model_shadow_no(conn, session: "aiohttp.ClientSession") -> None:
+    """Resolve open shadow_model_no rows once markets finalize."""
+    from .markets import KALSHI_API_BASE
+    rows = conn.execute(
+        "SELECT id, ticker FROM shadow_model_no WHERE exit_reason IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    for row_id, ticker in rows:
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/markets/{ticker}",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception:
+            continue
+        mkt    = data.get("market", data)
+        status = mkt.get("status", "")
+        result = mkt.get("result", "")
+        if status not in ("settled", "finalized") or result not in ("yes", "no"):
+            continue
+        outcome   = "won" if result == "no" else "lost"  # we're always on the NO side
+        yes_price = mkt.get("yes_ask") or (100 if result == "yes" else 0)
+        no_price  = 100 - yes_price
+        pnl       = no_price - 0   # shadow: 1 contract, no_price cents profit if won, else -no_entry_cost
+        # Simpler: pnl = (100 - entry_no_price) if won else -entry_no_price
+        # We stored market_p_no at entry; reconstruct entry no price
+        entry_row = conn.execute(
+            "SELECT market_p_no FROM shadow_model_no WHERE id=?", (row_id,)
+        ).fetchone()
+        entry_no_p = round((entry_row[0] * 100)) if entry_row else 50
+        pnl = (100 - entry_no_p) if outcome == "won" else -entry_no_p
+        conn.execute("""
+            UPDATE shadow_model_no
+            SET exit_reason='settled', exited_at=?, outcome=?, pnl_cents=?
+            WHERE id=?
+        """, (datetime.now(timezone.utc).isoformat(), outcome, float(pnl), row_id))
+        logging.info(
+            "[shadow_model_no] Settled: %s → %s  pnl=%+.0f¢ ($%+.2f)",
+            ticker, outcome.upper(), pnl, pnl / 100,
+        )
+
+
 async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> None:
     """Check open shadow_band_arb rows against live market data and record outcome."""
     from .markets import KALSHI_API_BASE
@@ -3541,9 +3921,16 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
     run_migrations(_shared_conn)
     if ledger is not None:
         executor.set_ledger(ledger)
-    connector = aiohttp.TCPConnector(limit=30)
+    connector = aiohttp.TCPConnector(
+        limit=30,
+        keepalive_timeout=30,       # drop idle connections before server does (~60s)
+        enable_cleanup_closed=True, # evict half-closed connections from the pool
+    )
     cycle = 0
     _shadow_backfill_date: str = ""   # UTC date of last IEM actual backfill
+
+    # Load NO-signal model + climatology for the shadow trader.
+    _load_model_shadow()
 
     # Seed calibrated priors from any historical data already in the DB.
     executor.refresh_calibrated_priors(win_tracker)

@@ -183,3 +183,31 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(6)")
         logging.info("DB schema migration V6 applied (shadow_yes_momentum).")
+
+    if current < 7:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_model_no (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at      TEXT    NOT NULL,
+                ticker         TEXT    NOT NULL,
+                series         TEXT,
+                is_high        INTEGER NOT NULL DEFAULT 0,
+                model_p        REAL    NOT NULL,
+                market_p_no    REAL    NOT NULL,
+                edge           REAL    NOT NULL,
+                margin_f       REAL,
+                hvc            REAL,
+                clim_prob      REAL,
+                hour_utc       INTEGER,
+                exit_reason    TEXT,
+                exited_at      TEXT,
+                outcome        TEXT,
+                pnl_cents      REAL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_model_no_open
+                ON shadow_model_no (ticker) WHERE exit_reason IS NULL
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(7)")
+        logging.info("DB schema migration V7 applied (shadow_model_no).")
