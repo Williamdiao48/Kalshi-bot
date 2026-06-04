@@ -38,7 +38,7 @@ from .arb_detector import (
     find_crossed_book_opportunities, CrossedBookArb, CROSSED_BOOK_MIN_PROFIT,
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
-from .strike_arb import find_band_arbs, find_forecast_nos, find_forecast_band_yes_signals, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED, FORECAST_BAND_YES_ENABLED
+from .strike_arb import find_band_arbs, find_forecast_nos, find_forecast_band_yes_signals, find_forecast_band_yes_carryover_signals, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED, FORECAST_BAND_YES_ENABLED, FORECAST_BAND_YES_CARRYOVER_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, edgar, predictit
@@ -1268,6 +1268,7 @@ async def _poll(
         ("nws",          nws_alerts.fetch_alerts(session)),
         ("nws_signals",  nws_alerts.fetch_city_alert_signals(session)),
         ("hrrr",         hrrr.fetch_hourly_temps(session)),
+        ("hrrr_tomorrow", hrrr.fetch_tomorrow_highs(session)),
         ("edgar",        edgar.fetch_filings(session)),
         ("noaa",         noaa.fetch_city_forecasts(session)),
         ("nws_climo",    nws_climo.fetch_city_climo(session)),
@@ -1303,8 +1304,9 @@ async def _poll(
     rss_result         = R["rss"]
     nws_result         = R["nws"]
     nws_signals_result = R["nws_signals"]
-    hrrr_result        = R["hrrr"]
-    edgar_result       = R["edgar"]
+    hrrr_result          = R["hrrr"]
+    hrrr_tomorrow_result = R["hrrr_tomorrow"]
+    edgar_result         = R["edgar"]
     noaa_result        = R["noaa"]
     nws_climo_result   = R["nws_climo"]
     metar_result       = R["metar"]
@@ -1458,6 +1460,12 @@ async def _poll(
     elif hrrr_result:
         hrrr_hourly_highs, hrrr_hourly_lows = hrrr_result  # type: ignore[misc]
         _update_hrrr_cache(hrrr_hourly_highs, hrrr_hourly_lows)
+
+    hrrr_tomorrow_highs: dict[str, float] = {}
+    if isinstance(hrrr_tomorrow_result, Exception):
+        logging.warning("HRRR tomorrow fetch error: %s", hrrr_tomorrow_result)
+    elif hrrr_tomorrow_result:
+        hrrr_tomorrow_highs = hrrr_tomorrow_result  # type: ignore[assignment]
 
     # ---- numeric matching (NOAA, Binance, Frankfurter, BLS, FRED, EIA) ------
     # Staleness gate for nws_hourly: drop DataPoints whose fetched_at timestamp
@@ -2800,6 +2808,34 @@ async def _poll(
                     )
                     continue
                 await executor.maybe_trade_forecast_band_yes(session, _fby)
+
+    # ---- forecast-band YES carryover (evening METAR+HRRR → next-day B-band) -
+    if FORECAST_BAND_YES_CARRYOVER_ENABLED and hrrr_tomorrow_highs:
+        # Build metar running-max dict from metar + nws_asos DataPoints
+        _metar_highs: dict[str, float] = {}
+        for _dp in data_points:
+            if _dp.source not in ("metar", "nws_asos"):
+                continue
+            if not _dp.metric.startswith("temp_high"):
+                continue
+            if _metar_highs.get(_dp.metric, float("-inf")) < _dp.value:
+                _metar_highs[_dp.metric] = _dp.value
+
+        if _metar_highs:
+            _fbyc_signals = find_forecast_band_yes_carryover_signals(
+                markets, hrrr_tomorrow_highs, _metar_highs
+            )
+            if _fbyc_signals:
+                logging.info(
+                    "ForecastBandYES-carryover: %d signal(s) found.", len(_fbyc_signals),
+                )
+                for _fbyc in _fbyc_signals:
+                    if _fbyc.ticker in dry_run_held:
+                        logging.info(
+                            "ForecastBandYES-carryover skip: %s — open position held.", _fbyc.ticker,
+                        )
+                        continue
+                    await executor.maybe_trade_forecast_band_yes_carryover(session, _fbyc)
 
     # ---- report + log ------------------------------------------------------
     total = len(scored_text) + len(scored_numeric) + len(scored_poly)

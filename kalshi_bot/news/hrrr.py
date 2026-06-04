@@ -30,7 +30,7 @@ is ever made per process lifetime.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -87,8 +87,11 @@ async def _fetch_hourly_temps(
     session: aiohttp.ClientSession,
     city_name: str,
     hourly_url: str,
+    day_offset: int = 0,
 ) -> tuple[float | None, float | None]:
-    """Return today's daytime high and daily low temperature (°F) from NWS hourly.
+    """Return the daytime high and daily low temperature (°F) from NWS hourly.
+
+    day_offset=0 → today (default); day_offset=1 → tomorrow.
 
     High: maximum across periods in [_DAY_START_HOUR, _DAY_END_HOUR) local time.
     Low:  minimum across ALL 24 hours — overnight lows occur before 8 AM so the
@@ -119,12 +122,14 @@ async def _fetch_hourly_temps(
         except (KeyError, ValueError, TypeError):
             continue
 
-        # Filter to periods that fall on today in the period's own local
-        # timezone (fromisoformat preserves the UTC offset).  Using the UTC
-        # date would incorrectly exclude late-evening periods for cities in
-        # negative UTC offsets (e.g. 8 PM ET = 1 AM UTC the next day).
-        today_local = datetime.now(start.tzinfo).date() if start.tzinfo else datetime.now(timezone.utc).date()
-        if start.date() != today_local:
+        # Filter to the target date in the period's own local timezone.
+        # Using the UTC date would incorrectly exclude late-evening periods for
+        # cities in negative UTC offsets (e.g. 8 PM ET = 1 AM UTC the next day).
+        if start.tzinfo:
+            target_local = (datetime.now(start.tzinfo) + timedelta(days=day_offset)).date()
+        else:
+            target_local = (datetime.now(timezone.utc) + timedelta(days=day_offset)).date()
+        if start.date() != target_local:
             continue
 
         unit = period.get("temperatureUnit", "F")
@@ -145,9 +150,9 @@ async def _fetch_hourly_temps(
             max_f = temp_f
 
     if max_f is not None:
-        logging.debug("HRRR [%s]: hourly daytime high = %.1f°F", city_name, max_f)
+        logging.debug("HRRR [%s] +%dd: daytime high = %.1f°F", city_name, day_offset, max_f)
     if min_f is not None:
-        logging.debug("HRRR [%s]: daily low = %.1f°F", city_name, min_f)
+        logging.debug("HRRR [%s] +%dd: daily low = %.1f°F", city_name, day_offset, min_f)
     return max_f, min_f
 
 
@@ -219,3 +224,48 @@ async def fetch_hourly_highs(
     """Backward-compatible wrapper — returns only the highs dict."""
     highs, _ = await fetch_hourly_temps(session)
     return highs
+
+
+async def fetch_tomorrow_highs(
+    session: aiohttp.ClientSession,
+) -> dict[str, float]:
+    """Return tomorrow's HRRR-derived daytime high (°F) for each city.
+
+    Uses the same NWS hourly endpoint as fetch_hourly_temps but filters
+    to tomorrow's local date.  Relies on the gridpoint cache populated by
+    noaa.py / fetch_hourly_temps running in the same poll cycle.
+
+    Returns:
+        dict mapping metric → temp_F (temp_high_* keys only).
+        Cities whose fetch fails are omitted.
+    """
+    async def fetch_one(
+        metric: str, city_name: str, lat: float, lon: float
+    ) -> tuple[str, float | None]:
+        gridpoint = await _resolve_gridpoint(session, metric, lat, lon)
+        if gridpoint is None:
+            return metric, None
+        hourly_url = gridpoint.get("forecast_hourly", "")
+        high, _ = await _fetch_hourly_temps(session, city_name, hourly_url, day_offset=1)
+        return metric, high
+
+    tasks = [
+        fetch_one(metric, city_name, lat, lon)
+        for metric, (city_name, lat, lon, *_) in CITIES.items()
+    ]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    tomorrow_highs: dict[str, float] = {}
+    for metric, result in zip(CITIES.keys(), raw):
+        if isinstance(result, Exception):
+            logging.error("HRRR tomorrow gather error for %s: %s", metric, result)
+        else:
+            _, high = result  # type: ignore[misc]
+            if high is not None:
+                tomorrow_highs[metric] = high
+
+    if tomorrow_highs:
+        logging.debug(
+            "HRRR tomorrow: resolved %d/%d cities.", len(tomorrow_highs), len(CITIES)
+        )
+    return tomorrow_highs

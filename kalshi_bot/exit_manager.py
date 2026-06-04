@@ -1031,7 +1031,7 @@ class ExitManager:
             #   FORECAST_NO_PROFIT_TAKE > 0 overrides the low-ask bucket if set.
             is_locked = (src in _LOCKED_STOP_LOSS_ONLY) and not (src == "band_arb" and side == "yes")
             is_forecast_no = src in _FORECAST_PROFIT_TAKE_SOURCES and side == "no"
-            is_forecast_band_yes = src == "forecast_band_yes" and side == "yes"
+            is_forecast_band_yes = src in ("forecast_band_yes", "forecast_band_yes_carryover") and side == "yes"
             _fno_pt_thresh = 0.0
             if is_forecast_no:
                 if entry_cost >= FORECAST_NO_HIGH_ASK_THRESHOLD and FORECAST_NO_HIGH_ASK_PT > 0:

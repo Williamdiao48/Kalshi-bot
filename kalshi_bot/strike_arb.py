@@ -525,6 +525,25 @@ FORECAST_BAND_YES_MAX_HTC: float = env_float("FORECAST_BAND_YES_MAX_HTC", 20.0)
 FORECAST_BAND_YES_P_ESTIMATE: float = env_float("FORECAST_BAND_YES_P_ESTIMATE", 0.656)
 
 # ---------------------------------------------------------------------------
+# forecast_band_yes_carryover — evening entry on NEXT-DAY B-band markets
+# Backtest (KXHIGH B-bands, Apr–May 2026, n=53):
+#   69.8% PT rate at 70¢, +18.7¢ avg, +$9.89 total over ~32 days.
+#   Signal: today's METAR confirmed max AND HRRR D+1 forecast both round to the
+#   same next-day band → enter YES at evening prices before next-day market opens.
+# ---------------------------------------------------------------------------
+FORECAST_BAND_YES_CARRYOVER_ENABLED: bool = env_bool("FORECAST_BAND_YES_CARRYOVER_ENABLED", True)
+FORECAST_BAND_YES_CARRYOVER_MIN_ASK: int = env_int("FORECAST_BAND_YES_CARRYOVER_MIN_ASK", 10)
+FORECAST_BAND_YES_CARRYOVER_MAX_ASK: int = env_int("FORECAST_BAND_YES_CARRYOVER_MAX_ASK", 55)
+# UTC hour window: 20–22 UTC = ~4–6 PM ET; late enough that today's high is confirmed.
+FORECAST_BAND_YES_CARRYOVER_ENTRY_MIN_UTC_HOUR: int = env_int("FORECAST_BAND_YES_CARRYOVER_ENTRY_MIN_UTC_HOUR", 20)
+FORECAST_BAND_YES_CARRYOVER_ENTRY_MAX_UTC_HOUR: int = env_int("FORECAST_BAND_YES_CARRYOVER_ENTRY_MAX_UTC_HOUR", 22)
+# HTC bounds for next-day markets: they close 14–36 h from the 20-22 UTC entry window.
+FORECAST_BAND_YES_CARRYOVER_MIN_HTC: float = env_float("FORECAST_BAND_YES_CARRYOVER_MIN_HTC", 14.0)
+FORECAST_BAND_YES_CARRYOVER_MAX_HTC: float = env_float("FORECAST_BAND_YES_CARRYOVER_MAX_HTC", 36.0)
+# Backtest-calibrated win probability (69.8% PT hit rate at 70¢).
+FORECAST_BAND_YES_CARRYOVER_P_ESTIMATE: float = env_float("FORECAST_BAND_YES_CARRYOVER_P_ESTIMATE", 0.698)
+
+# ---------------------------------------------------------------------------
 # Per-city, per-source cold-bias cache (populated by refresh_forecast_bias).
 # Keys: (source, metric) e.g. ("hrrr", "temp_high_bos").
 # Values: mean(source_forecast - noaa_observed) — negative = cold bias.
@@ -2657,6 +2676,118 @@ def find_forecast_band_yes_signals(
             hours_to_close=htc,
             p_estimate=FORECAST_BAND_YES_P_ESTIMATE,
             score=FORECAST_BAND_YES_P_ESTIMATE,
+        ))
+
+    return signals
+
+
+def find_forecast_band_yes_carryover_signals(
+    markets: list[dict[str, Any]],
+    hrrr_tomorrow_highs: dict[str, float],
+    metar_highs: dict[str, float],
+) -> list[ForecastBandYesSignal]:
+    """Scan next-day KXHIGH B-band markets for evening YES entries.
+
+    Fires when BOTH today's confirmed METAR max AND tomorrow's HRRR forecast
+    round to the same next-day B-band, and the YES ask is still cheap.
+    Entry is in the 20-22 UTC window (afternoon local time) before the next-day
+    market prices in the carryover signal.
+
+    Entry gates (all must pass):
+      1. FORECAST_BAND_YES_CARRYOVER_ENABLED is True
+      2. Current UTC hour is in [CARRYOVER_MIN_UTC_HOUR, CARRYOVER_MAX_UTC_HOUR]
+      3. Market ticker matches KXHIGH B-band pattern
+      4. Market closes in [CARRYOVER_MIN_HTC, CARRYOVER_MAX_HTC] hours (next-day only)
+      5. round(metar_high_today) falls within [band_lo, band_hi]
+      6. round(hrrr_tomorrow) falls within [band_lo, band_hi]
+      7. YES ask is in [CARRYOVER_MIN_ASK, CARRYOVER_MAX_ASK]
+
+    Args:
+        markets:             Open Kalshi market dicts (normalised with yes_bid/yes_ask).
+        hrrr_tomorrow_highs: HRRR next-day daytime-high forecasts per metric.
+        metar_highs:         Today's running METAR max per metric (temp_high_* keys).
+
+    Returns:
+        List of ForecastBandYesSignal with source tag "forecast_band_yes_carryover".
+    """
+    if not FORECAST_BAND_YES_CARRYOVER_ENABLED:
+        return []
+    if not hrrr_tomorrow_highs or not metar_highs:
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    if not (FORECAST_BAND_YES_CARRYOVER_ENTRY_MIN_UTC_HOUR
+            <= now_utc.hour
+            <= FORECAST_BAND_YES_CARRYOVER_ENTRY_MAX_UTC_HOUR):
+        return []
+
+    signals: list[ForecastBandYesSignal] = []
+
+    for mkt in markets:
+        ticker = mkt.get("ticker", "")
+
+        m = _BBAND_TICKER_RE.match(ticker)
+        if m is None:
+            continue
+
+        prefix, mid_str = m.group(1), m.group(2)
+        metric = _KXHIGH_PREFIX_TO_METRIC.get(prefix)
+        if metric is None:
+            continue
+
+        mid_f = float(mid_str)
+        band_lo = int(mid_f - 0.5)
+        band_hi = band_lo + 1
+
+        # Next-day gate: market must close in CARRYOVER_MIN_HTC..CARRYOVER_MAX_HTC hours
+        close_str = mkt.get("close_time") or mkt.get("expiration_time", "")
+        htc = _hours_to_close(close_str)
+        if htc is None:
+            continue
+        if not (FORECAST_BAND_YES_CARRYOVER_MIN_HTC <= htc <= FORECAST_BAND_YES_CARRYOVER_MAX_HTC):
+            continue
+
+        # Gate 1: today's METAR confirmed max rounds to this band
+        metar_max = metar_highs.get(metric)
+        if metar_max is None:
+            continue
+        if not (band_lo <= round(metar_max) <= band_hi):
+            continue
+
+        # Gate 2: tomorrow's HRRR forecast also rounds to this band
+        hrrr_fc = hrrr_tomorrow_highs.get(metric)
+        if hrrr_fc is None:
+            continue
+        if not (band_lo <= round(hrrr_fc) <= band_hi):
+            continue
+
+        yes_ask = mkt.get("yes_ask")
+        yes_bid = mkt.get("yes_bid")
+        if yes_ask is None or yes_bid is None:
+            continue
+        if not (FORECAST_BAND_YES_CARRYOVER_MIN_ASK <= yes_ask <= FORECAST_BAND_YES_CARRYOVER_MAX_ASK):
+            continue
+
+        city = metric.replace("temp_high_", "")
+
+        logging.debug(
+            "ForecastBandYES-carryover: %s  METAR=%.1f°F  HRRR_D1=%.1f°F → band[%d,%d]"
+            "  yes_ask=%d¢  htc=%.1fh",
+            ticker, metar_max, hrrr_fc, band_lo, band_hi, yes_ask, htc,
+        )
+
+        signals.append(ForecastBandYesSignal(
+            ticker=ticker,
+            metric=metric,
+            city=city,
+            yes_ask=yes_ask,
+            yes_bid=yes_bid,
+            fc_hrrr=hrrr_fc,
+            band_lo=float(band_lo),
+            band_hi=float(band_hi),
+            hours_to_close=htc,
+            p_estimate=FORECAST_BAND_YES_CARRYOVER_P_ESTIMATE,
+            score=FORECAST_BAND_YES_CARRYOVER_P_ESTIMATE,
         ))
 
     return signals
