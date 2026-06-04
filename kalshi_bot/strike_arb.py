@@ -511,7 +511,7 @@ FORECAST_NO_CORRECTED_MIN_EDGE_F: float = float(
 #   65.6% PT rate at 70¢, +15.0¢ avg, +$44.24 total over ~30 days.
 #   Signal: HRRR morning forecast rounds to target band → enter YES cheap at open,
 #   ride intraday price discovery as market reacts to the same HRRR signal.
-FORECAST_BAND_YES_ENABLED: bool = env_bool("FORECAST_BAND_YES_ENABLED", True)
+FORECAST_BAND_YES_ENABLED: bool = env_bool("FORECAST_BAND_YES_ENABLED", False)
 # YES ask entry window (¢). Backtest used 10–55¢; below 10 is noise.
 FORECAST_BAND_YES_MIN_ASK: int = env_int("FORECAST_BAND_YES_MIN_ASK", 10)
 FORECAST_BAND_YES_MAX_ASK: int = env_int("FORECAST_BAND_YES_MAX_ASK", 55)
@@ -531,7 +531,7 @@ FORECAST_BAND_YES_P_ESTIMATE: float = env_float("FORECAST_BAND_YES_P_ESTIMATE", 
 #   Signal: today's METAR confirmed max AND HRRR D+1 forecast both round to the
 #   same next-day band → enter YES at evening prices before next-day market opens.
 # ---------------------------------------------------------------------------
-FORECAST_BAND_YES_CARRYOVER_ENABLED: bool = env_bool("FORECAST_BAND_YES_CARRYOVER_ENABLED", True)
+FORECAST_BAND_YES_CARRYOVER_ENABLED: bool = env_bool("FORECAST_BAND_YES_CARRYOVER_ENABLED", False)
 FORECAST_BAND_YES_CARRYOVER_MIN_ASK: int = env_int("FORECAST_BAND_YES_CARRYOVER_MIN_ASK", 10)
 FORECAST_BAND_YES_CARRYOVER_MAX_ASK: int = env_int("FORECAST_BAND_YES_CARRYOVER_MAX_ASK", 55)
 # UTC hour window: 20–22 UTC = ~4–6 PM ET; late enough that today's high is confirmed.
