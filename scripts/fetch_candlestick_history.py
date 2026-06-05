@@ -185,49 +185,67 @@ async def _fetch_settled_markets(
     series: str,
     cutoff_ts: int,
 ) -> list[dict]:
-    """Return settled markets for one series settled after cutoff_ts."""
-    params = {"status": "settled", "limit": 100, "series_ticker": series}
-    path = _MARKETS_PATH
-    headers = generate_headers("GET", path)
-    async with _SEMAPHORE:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets",
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status == 429:
-                    log.warning("Rate-limited fetching %s — sleeping 5s", series)
-                    await asyncio.sleep(5.0)
-                    return []
-                resp.raise_for_status()
-                data = await resp.json()
-        except Exception as exc:
-            log.warning("Error fetching settled markets for %s: %s", series, exc)
-            return []
+    """Return settled markets for one series settled after cutoff_ts.
 
-    markets = []
-    for m in data.get("markets", []):
-        m = _normalize_market(m)
-        # Filter to markets that closed after cutoff
-        close_str = m.get("close_time") or m.get("expiration_time", "")
-        try:
-            close_ts = int(
-                datetime.fromisoformat(
-                    close_str.replace("Z", "+00:00")
-                ).timestamp()
-            )
-        except (ValueError, AttributeError):
-            continue
-        if close_ts < cutoff_ts:
-            continue
-        result = m.get("result", "")
-        if result not in ("yes", "no"):
-            continue
-        markets.append(m)
+    Paginates via cursor until all pages are consumed or a market older than
+    cutoff_ts is encountered (API returns newest-first).
+    """
+    markets: list[dict] = []
+    cursor: str | None = None
 
-    await asyncio.sleep(0.3)
+    while True:
+        params: dict = {
+            "status": "settled",
+            "limit": 100,
+            "series_ticker": series,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        path = _MARKETS_PATH
+        async with _SEMAPHORE:
+            headers = generate_headers("GET", path)
+            try:
+                async with session.get(
+                    f"{KALSHI_API_BASE}/markets",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status == 429:
+                        log.warning("Rate-limited fetching %s — sleeping 10s", series)
+                        await asyncio.sleep(10.0)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except Exception as exc:
+                log.warning("Error fetching settled markets for %s: %s", series, exc)
+                break
+
+        page = data.get("markets", [])
+        stop_early = False
+        for m in page:
+            m = _normalize_market(m)
+            close_str = m.get("close_time") or m.get("expiration_time", "")
+            try:
+                close_ts = int(
+                    datetime.fromisoformat(close_str.replace("Z", "+00:00")).timestamp()
+                )
+            except (ValueError, AttributeError):
+                continue
+            if close_ts < cutoff_ts:
+                stop_early = True
+                break
+            if m.get("result", "") not in ("yes", "no"):
+                continue
+            markets.append(m)
+
+        cursor = data.get("cursor")
+        if stop_early or not cursor or not page:
+            break
+
+        await asyncio.sleep(0.5)
+
     log.info("  %s: %d settled markets (since cutoff)", series, len(markets))
     return markets
 

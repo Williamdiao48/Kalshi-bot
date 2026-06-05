@@ -1,382 +1,441 @@
 """
-Backtest: Pre-METAR NO entry — price trajectory analysis.
+Backtest: HRRR-gated early NO entry — reworked to mirror forecast_yes logic.
 
-For every NO-settling band with hourly candle data, this script traces the
-NO_ask price from candle open (~12-18h before settlement) through settlement,
-and finds:
-  - T_metar: first local hour where METAR running_max crosses band ceiling
-  - T_entry: first candle where NO_ask <= each entry threshold
-  - Whether the entry was pre- or post-METAR confirmation
-  - Expected gain (hold to 100¢ settlement)
+Strategy being tested:
+  - Entry window: 7-11 UTC (same as forecast_yes morning window)
+  - Signal: HRRR forecast is ≥N°F OUTSIDE the band (clear NO)
+  - Enter when NO ask (= 100 - YES bid) is in entry range
+  - Exit at absolute NO bid PT (100 - YES ask) OR hold to settlement
 
-This answers: "how much alpha is available if we buy NO before METAR confirms?"
+Key insight from forecast_yes analysis:
+  The morning HRRR signal creates intraday price discovery that reliably
+  lifts/drops prices to exit levels. We want to capture the same mechanism
+  but on the NO side of "clearly wrong" bands.
 
-Also runs Report 5 on YES-settling bands to measure false-positive loss rate.
+Reports:
+  1. HRRR distance gate sweep — how does min HRRR distance affect signal quality?
+  2. UTC hour entry window sweep — does restricting to 7-11 UTC help?
+  3. Absolute NO bid PT sweep — at what PT level does PnL peak?
+  4. Combined strategy (best distance + window + PT) vs. old approach
+  5. False-positive rate on YES-settling bands (with HRRR gate)
+  6. City breakdown
 
 Usage:
     venv/bin/python scripts/backtest_forecast_no_entry.py
-    venv/bin/python scripts/backtest_forecast_no_entry.py --max-entry 60 --city mia
 """
-import argparse
+from __future__ import annotations
+
 import csv
 import json
-import datetime
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
-# --- paths ---
-ROOT = Path(__file__).parent.parent
-DATA = ROOT / "data"
+ROOT        = Path(__file__).parent.parent
+DATA        = ROOT / "data"
+BANDS_CSV   = DATA / "kxhigh_bands.csv"
+MESONET     = DATA / "mesonet_hourly_combined.csv"
+CANDLE_DB   = DATA / "candlesticks.db"
+HIST_CACHE  = DATA / "backtest" / "band_arb_hist_cache.json"
 
-BANDS_CSV      = DATA / "kxhigh_bands.csv"
-MESONET_CSV    = DATA / "mesonet_hourly.csv"
-CANDLE_CACHE   = DATA / "band_arb_candle_cache.json"
+# Strategy parameters to sweep
+HRRR_DISTANCE_THRESHOLDS = [0, 1, 2, 3, 4]   # min °F HRRR must be outside band
+ENTRY_NO_ASK_MAX         = 65                  # max NO ask cents (= YES bid ≥ 35¢)
+ENTRY_NO_ASK_MIN         = 20                  # min NO ask cents (= YES bid ≤ 80¢)
+UTC_ENTRY_HOURS          = set(range(7, 12))   # 7,8,9,10,11 UTC
+NO_BID_PT_TARGETS        = [75, 80, 85, 88, 90]  # absolute NO bid PT levels
 
-ENTRY_THRESHOLDS = [30, 40, 50, 60, 70, 80]
-
+# ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_bands() -> list[dict]:
-    with open(BANDS_CSV) as f:
-        return list(csv.DictReader(f))
+    """Load B-band market metadata from candlesticks.db markets table."""
+    import sqlite3, re
+    _MON = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+            "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    _RE = re.compile(r"^([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})-B([\d.]+)$")
+    _SERIES_TO_METRIC = {
+        "KXHIGHLAX":"temp_high_lax","KXHIGHDEN":"temp_high_den","KXHIGHCHI":"temp_high_chi",
+        "KXHIGHNY":"temp_high_ny","KXHIGHMIA":"temp_high_mia","KXHIGHDAL":"temp_high_dal",
+        "KXHIGHBOS":"temp_high_bos","KXHIGHAUS":"temp_high_aus","KXHIGHOU":"temp_high_hou",
+        "KXHIGHTSFO":"temp_high_sfo","KXHIGHTSEA":"temp_high_sea","KXHIGHTBOS":"temp_high_bos",
+        "KXHIGHTPHX":"temp_high_phx","KXHIGHTPHIL":"temp_high_phl","KXHIGHTDC":"temp_high_dca",
+        "KXHIGHTLV":"temp_high_las","KXHIGHTOKC":"temp_high_okc","KXHIGHTDAL":"temp_high_dfw",
+        "KXHIGHTHOU":"temp_high_hou","KXHIGHTNOLA":"temp_high_msy","KXHIGHTATL":"temp_high_atl",
+        "KXHIGHTMIN":"temp_high_msp","KXHIGHTDFW":"temp_high_dfw","KXHIGHTSATX":"temp_high_sat",
+    }
+    conn = sqlite3.connect(CANDLE_DB)
+    rows_db = conn.execute(
+        "SELECT ticker, result FROM markets WHERE ticker LIKE 'KXHIGH%B%'"
+    ).fetchall()
+    conn.close()
+    out = []
+    for ticker, result in rows_db:
+        m = _RE.match(ticker)
+        if not m:
+            continue
+        series, yy, mon, dd, mid = m.groups()
+        metric = _SERIES_TO_METRIC.get(series)
+        if not metric:
+            continue
+        try:
+            settle_date = f"20{yy}-{_MON[mon]:02d}-{int(dd):02d}"
+        except (KeyError, ValueError):
+            continue
+        mid_f = float(mid)
+        band_lo = int(mid_f - 0.5)
+        band_hi = band_lo + 1
+        out.append({
+            "ticker": ticker,
+            "metric": metric,
+            "date": settle_date,
+            "strike_lo": str(float(band_lo)),
+            "strike_hi": str(float(band_hi)),
+            "result": result or "unknown",
+        })
+    return out
+
+
+def load_hrrr() -> dict[str, dict[str, float]]:
+    """Return {city: {date_str: forecast_high_f}}."""
+    raw = json.loads(HIST_CACHE.read_text())
+    out: dict[str, dict[str, float]] = {}
+    for key, val in raw.items():
+        if not key.startswith("hrrr_temp_high_"):
+            continue
+        city = key.replace("hrrr_temp_high_", "").split("_")[0]
+        if isinstance(val, dict):
+            out[city] = {k: float(v) for k, v in val.items() if v is not None}
+    return out
 
 
 def load_mesonet() -> dict[tuple, float]:
-    """Returns {(metric, date_str, local_hour_int): running_max_f}"""
+    """Return {(metric, date_str, local_hour): running_max_f}."""
     lookup: dict[tuple, float] = {}
-    with open(MESONET_CSV) as f:
+    with open(MESONET) as f:
         for row in csv.DictReader(f):
             key = (row["city_metric"], row["date"], int(row["local_hour"]))
             lookup[key] = float(row["running_max_f"])
     return lookup
 
 
-def load_candles() -> dict[str, list[dict]]:
-    with open(CANDLE_CACHE) as f:
-        return json.load(f)
+def load_candles() -> dict[str, list[tuple[int, int, int]]]:
+    """Return {ticker: [(period_ts, bid_high, ask_open)]} from candlesticks.db."""
+    import sqlite3
+    conn = sqlite3.connect(CANDLE_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT ticker, period_ts, bid_high, ask_open "
+        "FROM candles WHERE ticker LIKE 'KXHIGH%B%' ORDER BY ticker, period_ts"
+    )
+    out: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
+    for ticker, ts, bh, ao in cur.fetchall():
+        out[ticker].append((ts, bh or 0, ao or 0))
+    conn.close()
+    return dict(out)
 
 
-def city_tz(metric: str):
-    """Return pytz timezone for a temp_high_* metric."""
-    import importlib
-    noaa = importlib.import_module("kalshi_bot.news.noaa")
-    info = noaa.CITIES.get(metric) or noaa.CITIES.get(metric.replace("temp_low_", "temp_high_"))
-    if info is None:
-        return None
-    return info[3]
+# ── Candle helpers ────────────────────────────────────────────────────────────
 
+def parse_candles(clist: list[tuple[int, int, int]]) -> list[tuple[int, int, int, int]]:
+    """Return [(utc_hour, ts, no_ask_cents, no_bid_cents)] sorted by ts.
 
-def candle_to_local_hour(ts: int, tz) -> tuple[str, int]:
-    """Convert end_period_ts to (local_date_str, local_hour)."""
-    dt_utc = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-    dt_local = dt_utc.astimezone(tz)
-    return dt_local.strftime("%Y-%m-%d"), dt_local.hour
-
-
-def trading_date_str(settlement_date_str: str) -> str:
+    From (period_ts, bid_high, ask_open) tuples from candlesticks.db:
+      no_ask = 100 - bid_high   (cost to BUY NO = 100 minus YES bid high)
+      no_bid = 100 - ask_open   (proceeds to SELL NO = 100 minus YES ask)
+    bid_high is the highest YES bid in the period — best price to infer NO ask.
+    ask_open is the YES ask at period open — conservative NO bid estimate.
     """
-    The CSV 'date' column is the settlement/resolution date (e.g. 2026-03-29).
-    Price action and METAR observations happen the day before (2026-03-28).
-    All candles and mesonet lookups should use trading_date, not settlement_date.
-    """
-    d = datetime.date.fromisoformat(settlement_date_str)
-    return (d - datetime.timedelta(days=1)).isoformat()
+    out = []
+    for ts, bid_high, ask_open in clist:
+        if bid_high <= 0 and ask_open <= 0:
+            continue
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        utc_hour = dt.hour
+        no_ask = 100 - bid_high if bid_high > 0 else 100
+        no_bid = 100 - ask_open if ask_open > 0 else 0
+        out.append((utc_hour, ts, no_ask, no_bid))
+    return out  # already sorted by ts from DB query
 
 
-def find_metar_cross_hour(metric: str, tdate: str, strike_hi: float,
-                          mesonet: dict) -> int | None:
-    """First local hour where running_max_f >= strike_hi on the trading date."""
-    for hour in range(0, 24):
-        val = mesonet.get((metric, tdate, hour))
-        if val is not None and val >= strike_hi:
-            return hour
+def find_entry(
+    candles: list[tuple[int, int, int, int]],
+    entry_date_ts_start: int,
+    entry_date_ts_end: int,
+    no_ask_max: int,
+    no_ask_min: int,
+    utc_hours: set[int],
+) -> tuple[int, int] | None:
+    """First (no_ask, ts) in the UTC window on entry_date within ask range."""
+    for utc_hour, ts, no_ask, _ in candles:
+        if ts < entry_date_ts_start or ts >= entry_date_ts_end:
+            continue
+        if utc_hour not in utc_hours:
+            continue
+        if no_ask_min <= no_ask <= no_ask_max:
+            return no_ask, ts
     return None
 
 
-def trace_no_ask(ticker: str, metric: str, tdate: str, candles: list[dict],
-                 tz) -> list[tuple[int, int]]:
-    """
-    Return list of (local_hour, no_ask_cents) for candles on the trading date.
-    no_ask = round((1 - yes_bid.close) * 100)
-    Settlement-day candles (100¢) are excluded.
-    """
-    result = []
-    for c in candles:
-        ts = c["end_period_ts"]
-        cdate, chour = candle_to_local_hour(ts, tz)
-        if cdate != tdate:
-            continue
-        yes_bid_close = float(c["yes_bid"]["close_dollars"])
-        no_ask = round((1 - yes_bid_close) * 100)
-        result.append((chour, no_ask))
-    return sorted(result)
+def max_no_bid_after(
+    candles: list[tuple[int, int, int, int]],
+    entry_ts: int,
+) -> int:
+    """Highest NO bid seen strictly after entry_ts (through settlement)."""
+    return max((c[3] for c in candles if c[1] > entry_ts), default=0)
 
 
-def find_entry_hour(hourly_no_ask: list[tuple[int, int]], threshold: int) -> tuple[int, int] | None:
-    """First (hour, price) where NO_ask <= threshold."""
-    for hour, price in hourly_no_ask:
-        if price <= threshold:
-            return hour, price
-    return None
+# ── Settlement date → trading date ────────────────────────────────────────────
+
+from datetime import date as _date, timedelta as _td
+
+def trading_date(settlement_date_str: str) -> _date:
+    # KXHIGH markets open ~midnight ET (4-5 UTC) on the settlement date and
+    # close after the afternoon temperature peak on the same day.
+    # The 7-11 UTC entry window is on the settlement date itself.
+    return _date.fromisoformat(settlement_date_str)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max-entry", type=int, default=None,
-                        help="Only report this entry cap (e.g. 60)")
-    parser.add_argument("--city", type=str, default=None,
-                        help="Filter to one city suffix (e.g. mia)")
-    args = parser.parse_args()
+def day_ts_bounds(d: _date) -> tuple[int, int]:
+    start = int(datetime(d.year, d.month, d.day, 0, 0, tzinfo=timezone.utc).timestamp())
+    return start, start + 86400
 
-    # Add project root to path so kalshi_bot imports work
-    sys.path.insert(0, str(ROOT))
 
-    print("Loading data...", flush=True)
-    bands    = load_bands()
-    mesonet  = load_mesonet()
-    candles  = load_candles()
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-    # Split into NO-settling and YES-settling
-    no_bands  = [b for b in bands if b["result"] == "no" and b["ticker"] in candles and candles[b["ticker"]]]
-    yes_bands = [b for b in bands if b["result"] == "yes" and b["ticker"] in candles and candles[b["ticker"]]]
+def main() -> None:
+    print("Loading data...")
+    bands   = load_bands()
+    hrrr    = load_hrrr()
+    candles = load_candles()
 
-    if args.city:
-        suffix = args.city.lower()
-        no_bands  = [b for b in no_bands  if b["metric"].endswith(suffix)]
-        yes_bands = [b for b in yes_bands if b["metric"].endswith(suffix)]
+    no_bands  = [b for b in bands if b["result"] == "no"  and b["ticker"] in candles]
+    yes_bands = [b for b in bands if b["result"] == "yes" and b["ticker"] in candles]
+    print(f"  B-band NO markets with candles:  {len(no_bands)}")
+    print(f"  B-band YES markets with candles: {len(yes_bands)}")
 
-    thresholds = [args.max_entry] if args.max_entry else ENTRY_THRESHOLDS
+    # Pre-parse all candles once
+    parsed: dict[str, list] = {}
+    for b in no_bands + yes_bands:
+        t = b["ticker"]
+        if t not in parsed:
+            parsed[t] = parse_candles(candles.get(t, []))
 
-    # -------------------------------------------------------------------------
-    # Report 1 — Entry threshold sweep for NO-settling bands
-    # -------------------------------------------------------------------------
-    print(f"\n{'='*68}")
-    print("  REPORT 1 — Entry threshold sweep (NO-settling bands)")
-    print(f"{'='*68}")
-    print(f"  Total NO-settling bands with candles: {len(no_bands)}")
-    print()
+    # ── Report 1: HRRR distance gate sweep ───────────────────────────────────
+    print(f"\n{'='*72}")
+    print("  REPORT 1 — HRRR distance gate sweep")
+    print(f"  (Entry: 7-11 UTC, NO ask {ENTRY_NO_ASK_MIN}-{ENTRY_NO_ASK_MAX}¢, PT=85¢ NO bid)")
+    print(f"{'='*72}")
 
-    # Per-threshold accumulators
-    stats: dict[int, dict] = {t: {"n_signals": 0, "n_pre_metar": 0,
-                                  "entries": [], "gains": [], "holds": []}
-                               for t in thresholds}
-
-    # Per-band data for other reports
-    band_details = []
-
-    for b in no_bands:
-        ticker    = b["ticker"]
-        metric    = b["metric"]
-        date_str  = b["date"]
-        tdate     = trading_date_str(date_str)  # day before settlement
-        strike_hi = float(b["strike_hi"])
-
-        tz = city_tz(metric)
-        if tz is None:
-            continue
-
-        clist = candles[ticker]
-        hourly = trace_no_ask(ticker, metric, tdate, clist, tz)
-        if not hourly:
-            continue
-
-        t_metar = find_metar_cross_hour(metric, tdate, strike_hi, mesonet)
-        city = metric.replace("temp_high_", "")
-
-        detail = {
-            "ticker": ticker,
-            "city": city,
-            "date": date_str,
-            "strike_hi": strike_hi,
-            "t_metar": t_metar,
-            "opening_no_ask": hourly[0][1],
-            "hourly": hourly,
-            "entries": {},
-        }
-
-        for thresh in thresholds:
-            entry = find_entry_hour(hourly, thresh)
-            if entry is None:
-                detail["entries"][thresh] = None
+    PT = 85
+    for min_dist in HRRR_DISTANCE_THRESHOLDS:
+        trades = []
+        fps = []
+        for b in no_bands:
+            city = b["metric"].replace("temp_high_", "")
+            settle_date = b["date"]
+            hrrr_fc = hrrr.get(city, {}).get(settle_date)
+            if hrrr_fc is None:
                 continue
-            t_entry, price = entry
-            is_pre = t_metar is not None and t_entry < t_metar
-            gain = 100 - price
-            # hours held: from entry hour to end of settlement day (use last candle)
-            last_hour = hourly[-1][0]
-            hold_h = max(0, last_hour - t_entry)
+            lo, hi = float(b["strike_lo"]), float(b["strike_hi"])
+            # HRRR distance: how far outside the band is the forecast?
+            if hrrr_fc < lo:
+                dist = lo - hrrr_fc
+            elif hrrr_fc > hi:
+                dist = hrrr_fc - hi
+            else:
+                dist = 0.0
+            if dist < min_dist:
+                continue
 
-            stats[thresh]["n_signals"] += 1
-            if is_pre:
-                stats[thresh]["n_pre_metar"] += 1
-            stats[thresh]["entries"].append(price)
-            stats[thresh]["gains"].append(gain)
-            stats[thresh]["holds"].append(hold_h)
+            tdate = trading_date(settle_date)
+            ts_start, ts_end = day_ts_bounds(tdate)
+            ck = parsed[b["ticker"]]
+            entry = find_entry(ck, ts_start, ts_end, ENTRY_NO_ASK_MAX, ENTRY_NO_ASK_MIN, UTC_ENTRY_HOURS)
+            if entry is None:
+                continue
+            no_ask, entry_ts = entry
+            peak_no_bid = max_no_bid_after(ck, entry_ts)
+            pt_hit = peak_no_bid >= PT
+            pnl = (PT - no_ask) if pt_hit else (100 - no_ask - 100 + (100 if b["result"]=="no" else 0))
+            # simplified: PT hit → PT-ask gain; miss → settle NO = +gain, YES = -ask
+            pnl_c = (PT - no_ask) if pt_hit else (100 - no_ask if b["result"]=="no" else -no_ask)
+            trades.append({"no_ask": no_ask, "peak_no_bid": peak_no_bid, "pt_hit": pt_hit, "pnl": pnl_c})
 
-            detail["entries"][thresh] = {
-                "t_entry": t_entry,
-                "price": price,
-                "gain": gain,
-                "hold_h": hold_h,
-                "is_pre_metar": is_pre,
-            }
-
-        band_details.append(detail)
-
-    print(f"  {'Cap':>6}  {'N_sig':>7}  {'Pre-METAR':>9}  {'Hit%':>5}  "
-          f"{'Avg_entry':>9}  {'Avg_gain':>8}  {'Avg_hold':>8}")
-    print(f"  {'-'*6}  {'-'*7}  {'-'*9}  {'-'*5}  {'-'*9}  {'-'*8}  {'-'*8}")
-    for thresh in thresholds:
-        s = stats[thresh]
-        n = s["n_signals"]
+        n = len(trades)
         if n == 0:
-            print(f"  ≤{thresh:>4}¢  {'0':>7}  {'—':>9}  {'—':>5}  {'—':>9}  {'—':>8}  {'—':>8}")
+            print(f"  dist≥{min_dist}°F: 0 trades")
             continue
-        avg_entry = sum(s["entries"]) / n
-        avg_gain  = sum(s["gains"]) / n
-        avg_hold  = sum(s["holds"]) / n
-        pre_pct   = 100 * s["n_pre_metar"] / n
-        print(f"  ≤{thresh:>4}¢  {n:>7}  {s['n_pre_metar']:>9}  {pre_pct:>4.0f}%  "
-              f"  {avg_entry:>7.1f}¢  {avg_gain:>7.1f}¢  {avg_hold:>7.1f}h")
+        pt_rate = sum(1 for t in trades if t["pt_hit"]) / n
+        avg_ask = sum(t["no_ask"] for t in trades) / n
+        avg_pnl = sum(t["pnl"] for t in trades) / n
+        total_pnl = sum(t["pnl"] for t in trades) / 100
+        print(f"  dist≥{min_dist}°F: {n:3d} trades  PT={pt_rate*100:5.1f}%  avg_ask={avg_ask:.1f}¢  "
+              f"avg_pnl={avg_pnl:+.1f}¢  total={total_pnl:+.2f}")
 
-    # -------------------------------------------------------------------------
-    # Report 2 — How many NO-settling bands never reach each threshold?
-    # -------------------------------------------------------------------------
-    print(f"\n{'='*68}")
-    print("  REPORT 2 — Bands that never dip below entry cap (always pre-priced)")
-    print(f"{'='*68}")
-    print()
-    total_no = len(band_details)
-    print(f"  {'Cap':>6}  {'Never_below':>11}  {'Pct_missed':>10}  {'Need_band_arb':>13}")
-    print(f"  {'-'*6}  {'-'*11}  {'-'*10}  {'-'*13}")
-    for thresh in thresholds:
-        never = sum(1 for d in band_details if d["entries"].get(thresh) is None)
-        pct = 100 * never / total_no if total_no else 0
-        print(f"  ≤{thresh:>4}¢  {never:>11}  {pct:>9.0f}%  {never:>13}")
+    # ── Report 2: PT sweep at best HRRR distance (≥2°F) ─────────────────────
+    BEST_DIST = 2
+    print(f"\n{'='*72}")
+    print(f"  REPORT 2 — Absolute NO bid PT sweep (HRRR dist≥{BEST_DIST}°F, 7-11 UTC)")
+    print(f"{'='*72}")
 
-    # -------------------------------------------------------------------------
-    # Report 3 — City breakdown
-    # -------------------------------------------------------------------------
-    print(f"\n{'='*68}")
-    print("  REPORT 3 — City breakdown (entry cap = 60¢)")
-    print(f"{'='*68}")
-    print()
-    city_data: dict[str, list] = defaultdict(list)
-    for d in band_details:
-        e = d["entries"].get(60)
-        city_data[d["city"]].append(e)
-
-    print(f"  {'City':>8}  {'N_bands':>7}  {'N_signals':>9}  {'Pre-METAR%':>10}  "
-          f"{'Avg_entry':>9}  {'Avg_gain':>8}")
-    print(f"  {'-'*8}  {'-'*7}  {'-'*9}  {'-'*10}  {'-'*9}  {'-'*8}")
-    city_rows = []
-    for city, entries in sorted(city_data.items()):
-        n_bands = len(entries)
-        hits = [e for e in entries if e is not None]
-        n_sig = len(hits)
-        if n_sig == 0:
-            city_rows.append((city, n_bands, 0, 0, 0, 0))
+    # Collect all trades at BEST_DIST once
+    base_trades = []
+    for b in no_bands:
+        city = b["metric"].replace("temp_high_", "")
+        settle_date = b["date"]
+        hrrr_fc = hrrr.get(city, {}).get(settle_date)
+        if hrrr_fc is None:
             continue
-        pre = sum(1 for e in hits if e["is_pre_metar"])
-        avg_e = sum(e["price"] for e in hits) / n_sig
-        avg_g = sum(e["gain"] for e in hits) / n_sig
-        city_rows.append((city, n_bands, n_sig, 100*pre/n_sig, avg_e, avg_g))
-    city_rows.sort(key=lambda r: -r[5])  # sort by avg_gain
-    for city, n_bands, n_sig, pre_pct, avg_e, avg_g in city_rows:
-        print(f"  {city:>8}  {n_bands:>7}  {n_sig:>9}  {pre_pct:>9.0f}%  "
-              f"  {avg_e:>7.1f}¢  {avg_g:>7.1f}¢")
+        lo, hi = float(b["strike_lo"]), float(b["strike_hi"])
+        dist = max(0.0, lo - hrrr_fc) if hrrr_fc < lo else max(0.0, hrrr_fc - hi) if hrrr_fc > hi else 0.0
+        if dist < BEST_DIST:
+            continue
+        tdate = trading_date(settle_date)
+        ts_start, ts_end = day_ts_bounds(tdate)
+        ck = parsed[b["ticker"]]
+        entry = find_entry(ck, ts_start, ts_end, ENTRY_NO_ASK_MAX, ENTRY_NO_ASK_MIN, UTC_ENTRY_HOURS)
+        if entry is None:
+            continue
+        no_ask, entry_ts = entry
+        peak_no_bid = max_no_bid_after(ck, entry_ts)
+        base_trades.append({"no_ask": no_ask, "peak_no_bid": peak_no_bid, "result": b["result"], "city": b["metric"].replace("temp_high_",""), "settle_date": b["date"]})
 
-    # -------------------------------------------------------------------------
-    # Report 4 — Lead time distribution (pre-METAR entries at 60¢ cap)
-    # -------------------------------------------------------------------------
-    print(f"\n{'='*68}")
-    print("  REPORT 4 — Pre-METAR lead time distribution (entry cap = 60¢)")
-    print(f"  (T_metar - T_entry for entries that fired before METAR)")
-    print(f"{'='*68}")
+    n = len(base_trades)
+    print(f"  Base trades (HRRR dist≥{BEST_DIST}°F, 7-11 UTC, NO ask {ENTRY_NO_ASK_MIN}-{ENTRY_NO_ASK_MAX}¢): {n}")
     print()
-    leads = []
-    for d in band_details:
-        e = d["entries"].get(60)
-        if e and e["is_pre_metar"] and d["t_metar"] is not None:
-            leads.append(d["t_metar"] - e["t_entry"])
+    for pt in NO_BID_PT_TARGETS:
+        if n == 0:
+            break
+        wins   = [t for t in base_trades if t["peak_no_bid"] >= pt]
+        losses = [t for t in base_trades if t["peak_no_bid"] < pt]
+        win_pnl  = sum(pt - t["no_ask"] for t in wins) / 100
+        loss_pnl = sum((100 - t["no_ask"] if t["result"]=="no" else -t["no_ask"]) for t in losses) / 100
+        avg_pnl  = (win_pnl + loss_pnl) / n * 100
+        print(f"  PT={pt}¢  hits={len(wins):3d}/{n} ({len(wins)/n*100:5.1f}%)  "
+              f"avg_pnl={avg_pnl:+.1f}¢  total={win_pnl+loss_pnl:+.2f}")
 
-    if leads:
-        buckets = defaultdict(int)
-        for l in leads:
-            bucket = f"{l}h"
-            buckets[l] += 1
-        print(f"  Lead time  Count")
-        print(f"  ---------  -----")
-        for h in sorted(buckets):
-            bar = "█" * buckets[h]
-            print(f"  {h:>7}h   {buckets[h]:>3}  {bar}")
-        avg_lead = sum(leads) / len(leads)
-        med_lead = sorted(leads)[len(leads)//2]
-        print(f"\n  Mean lead: {avg_lead:.1f}h  Median lead: {med_lead}h  "
-              f"Max lead: {max(leads)}h  n={len(leads)}")
-    else:
-        print("  No pre-METAR entries found at 60¢ cap.")
+    # ── Report 3: Entry ask range sensitivity ────────────────────────────────
+    print(f"\n{'='*72}")
+    print(f"  REPORT 3 — Entry NO ask range sensitivity (dist≥{BEST_DIST}°F, 7-11 UTC, PT=85¢)")
+    print(f"{'='*72}")
+    PT = 85
+    for max_ask in [50, 55, 60, 65, 70]:
+        sub = [t for t in base_trades if t["no_ask"] <= max_ask]
+        if not sub:
+            continue
+        wins = [t for t in sub if t["peak_no_bid"] >= PT]
+        loss_pnl = sum((100 - t["no_ask"] if t["result"]=="no" else -t["no_ask"]) for t in sub if t["peak_no_bid"] < PT) / 100
+        win_pnl  = sum(PT - t["no_ask"] for t in wins) / 100
+        avg_pnl  = (win_pnl + loss_pnl) / len(sub) * 100
+        print(f"  NO ask≤{max_ask}¢: {len(sub):3d} trades  PT={len(wins)/len(sub)*100:5.1f}%  "
+              f"avg_pnl={avg_pnl:+.1f}¢  total={win_pnl+loss_pnl:+.2f}")
 
-    # -------------------------------------------------------------------------
-    # Report 5 — False-positive rate on YES-settling bands
-    # -------------------------------------------------------------------------
-    print(f"\n{'='*68}")
-    print("  REPORT 5 — False-positive rate (YES-settling bands)")
-    print(f"  Would the strategy have entered on bands that settled YES?")
-    print(f"  Loss = entry_price (100¢ paid, 0¢ received — wrong side)")
-    print(f"{'='*68}")
-    print()
-    print(f"  Total YES-settling bands with candles: {len(yes_bands)}")
-    print()
+    # ── Report 4: UTC hour window sensitivity ────────────────────────────────
+    print(f"\n{'='*72}")
+    print(f"  REPORT 4 — UTC entry hour window (dist≥{BEST_DIST}°F, NO ask {ENTRY_NO_ASK_MIN}-{ENTRY_NO_ASK_MAX}¢, PT=85¢)")
+    print(f"{'='*72}")
+    PT = 85
+    for hour_range in [(7, 12), (7, 10), (7, 9), (6, 12), (0, 24)]:
+        h_set = set(range(hour_range[0], hour_range[1]))
+        h_trades = []
+        for b in no_bands:
+            city = b["metric"].replace("temp_high_", "")
+            hrrr_fc = hrrr.get(city, {}).get(b["date"])
+            if hrrr_fc is None:
+                continue
+            lo, hi = float(b["strike_lo"]), float(b["strike_hi"])
+            dist = max(0.0, lo - hrrr_fc) if hrrr_fc < lo else max(0.0, hrrr_fc - hi) if hrrr_fc > hi else 0.0
+            if dist < BEST_DIST:
+                continue
+            tdate = trading_date(b["date"])
+            ts_start, ts_end = day_ts_bounds(tdate)
+            ck = parsed[b["ticker"]]
+            entry = find_entry(ck, ts_start, ts_end, ENTRY_NO_ASK_MAX, ENTRY_NO_ASK_MIN, h_set)
+            if entry is None:
+                continue
+            no_ask, entry_ts = entry
+            peak_no_bid = max_no_bid_after(ck, entry_ts)
+            h_trades.append({"no_ask": no_ask, "peak_no_bid": peak_no_bid, "result": b["result"]})
+        n_h = len(h_trades)
+        if n_h == 0:
+            print(f"  UTC {hour_range[0]:02d}-{hour_range[1]:02d}: 0 trades")
+            continue
+        wins = [t for t in h_trades if t["peak_no_bid"] >= PT]
+        loss_pnl = sum((100 - t["no_ask"] if t["result"]=="no" else -t["no_ask"]) for t in h_trades if t["peak_no_bid"] < PT) / 100
+        win_pnl  = sum(PT - t["no_ask"] for t in wins) / 100
+        avg_pnl  = (win_pnl + loss_pnl) / n_h * 100
+        print(f"  UTC {hour_range[0]:02d}-{hour_range[1]:02d}: {n_h:3d} trades  PT={len(wins)/n_h*100:5.1f}%  "
+              f"avg_pnl={avg_pnl:+.1f}¢  total={win_pnl+loss_pnl:+.2f}")
 
-    fp_stats: dict[int, dict] = {t: {"n_fp": 0, "losses": []} for t in thresholds}
+    # ── Report 5: City breakdown ──────────────────────────────────────────────
+    PT = 85
+    print(f"\n{'='*72}")
+    print(f"  REPORT 5 — City breakdown (dist≥{BEST_DIST}°F, 7-11 UTC, PT=85¢)")
+    print(f"{'='*72}")
+    city_trades: dict[str, list] = defaultdict(list)
+    for t in base_trades:
+        city_trades[t["city"]].append(t)
+    print(f"  {'City':>6}  {'N':>4}  {'PT%':>5}  {'avg_ask':>7}  {'avg_pnl':>8}  {'total':>7}")
+    for city, tlist in sorted(city_trades.items(), key=lambda x: -len(x[1])):
+        wins = [t for t in tlist if t["peak_no_bid"] >= PT]
+        asks = [t["no_ask"] for t in tlist]
+        loss_pnl = sum((100 - t["no_ask"] if t["result"]=="no" else -t["no_ask"]) for t in tlist if t["peak_no_bid"] < PT) / 100
+        win_pnl  = sum(PT - t["no_ask"] for t in wins) / 100
+        avg_pnl  = (win_pnl + loss_pnl) / len(tlist) * 100
+        print(f"  {city:>6}  {len(tlist):>4}  {len(wins)/len(tlist)*100:>4.0f}%  "
+              f"{sum(asks)/len(asks):>7.1f}¢  {avg_pnl:>+7.1f}¢  {win_pnl+loss_pnl:>+6.2f}")
 
+    # ── Report 6: False-positive rate on YES-settling bands ──────────────────
+    PT = 85
+    print(f"\n{'='*72}")
+    print(f"  REPORT 6 — False-positive rate on YES-settling bands (dist≥{BEST_DIST}°F, 7-11 UTC)")
+    print(f"  Loss = entry price (NO settles 0¢ — you bought the wrong side)")
+    print(f"{'='*72}")
+    fp_count = 0
+    fp_losses = []
     for b in yes_bands:
-        ticker   = b["ticker"]
-        metric   = b["metric"]
-        tdate    = trading_date_str(b["date"])
-
-        tz = city_tz(metric)
-        if tz is None:
+        city = b["metric"].replace("temp_high_", "")
+        hrrr_fc = hrrr.get(city, {}).get(b["date"])
+        if hrrr_fc is None:
             continue
-
-        clist = candles[ticker]
-        hourly = trace_no_ask(ticker, metric, tdate, clist, tz)
-        if not hourly:
+        lo, hi = float(b["strike_lo"]), float(b["strike_hi"])
+        dist = max(0.0, lo - hrrr_fc) if hrrr_fc < lo else max(0.0, hrrr_fc - hi) if hrrr_fc > hi else 0.0
+        if dist < BEST_DIST:
             continue
-
-        for thresh in thresholds:
-            entry = find_entry_hour(hourly, thresh)
-            if entry:
-                t_entry, price = entry
-                # Loss: paid `price` cents, NO settles at 0¢
-                fp_stats[thresh]["n_fp"] += 1
-                fp_stats[thresh]["losses"].append(price)
-
-    print(f"  {'Cap':>6}  {'N_FP':>6}  {'FP_rate':>7}  {'Avg_loss':>8}  "
-          f"{'Expected_P&L_per_100_trades':>27}")
-    print(f"  {'-'*6}  {'-'*6}  {'-'*7}  {'-'*8}  {'-'*27}")
-    for thresh in thresholds:
-        s     = stats[thresh]
-        fp    = fp_stats[thresh]
-        n_tp  = s["n_signals"]
-        n_fp  = fp["n_fp"]
-        total = n_tp + n_fp
-        if total == 0:
+        tdate = trading_date(b["date"])
+        ts_start, ts_end = day_ts_bounds(tdate)
+        ck = parsed[b["ticker"]]
+        entry = find_entry(ck, ts_start, ts_end, ENTRY_NO_ASK_MAX, ENTRY_NO_ASK_MIN, UTC_ENTRY_HOURS)
+        if entry is None:
             continue
-        fp_rate   = n_fp / total
-        avg_loss  = sum(fp["losses"]) / n_fp if n_fp else 0
-        avg_gain  = sum(s["gains"]) / n_tp if n_tp else 0
-        # Expected P&L per trade = P(TP)*avg_gain - P(FP)*avg_loss
-        exp_pnl   = (1 - fp_rate) * avg_gain - fp_rate * avg_loss
-        print(f"  ≤{thresh:>4}¢  {n_fp:>6}  {100*fp_rate:>6.1f}%  {avg_loss:>7.1f}¢  "
-              f"  {exp_pnl:>+.2f}¢ expected/trade")
+        no_ask, _ = entry
+        fp_count += 1
+        fp_losses.append(no_ask)
 
-    print()
-    print("="*68)
+    n_yes = len(yes_bands)
+    n_no  = len(base_trades)
+    total = n_no + fp_count
+    if total > 0:
+        fp_rate = fp_count / total
+        avg_fp_loss = sum(fp_losses) / fp_count if fp_count else 0
+        avg_tp_gain = sum(t["no_ask"] for t in base_trades) / n_no if n_no else 0
+        exp_pnl_settle = (1 - fp_rate) * (100 - avg_tp_gain) - fp_rate * avg_fp_loss
+        print(f"  NO-settling (TPs): {n_no}")
+        print(f"  YES-settling (FPs): {fp_count}  avg loss = {avg_fp_loss:.1f}¢")
+        print(f"  FP rate: {fp_rate*100:.1f}%")
+        print(f"  Expected P&L/trade (hold-to-settle): {exp_pnl_settle:+.1f}¢")
+        print()
+        wins_settle = n_no  # all NO-settling bands held to settlement are wins
+        print(f"  Comparison to old forecast_no:")
+        print(f"    Old: enter at 45-80¢ NO ask, 4 sources required, % PT")
+        print(f"    New: enter at {ENTRY_NO_ASK_MIN}-{ENTRY_NO_ASK_MAX}¢ NO ask, HRRR dist≥{BEST_DIST}°F, 7-11 UTC, 85¢ abs PT")
+
+    print(f"\n{'='*72}")
     print("  Done.")
-    print("="*68)
+    print(f"{'='*72}")
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(ROOT))
     main()

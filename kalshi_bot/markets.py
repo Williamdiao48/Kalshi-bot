@@ -217,22 +217,30 @@ async def fetch_markets_by_series(
             "series_ticker": series,
         }
         headers = generate_headers("GET", _MARKETS_PATH)
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets",
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 429:
-                    logging.warning("Series fetch rate-limited for %s — skipping.", series)
-                    await asyncio.sleep(2.0)
-                    continue
-                resp.raise_for_status()
-                data = await resp.json()
-        except Exception as exc:
-            logging.warning("Series fetch error for %s: %s", series, exc)
-            await asyncio.sleep(0.2)
+        data: dict | None = None
+        for _attempt in range(2):
+            try:
+                async with session.get(
+                    f"{KALSHI_API_BASE}/markets",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 429:
+                        logging.warning("Series fetch rate-limited for %s — skipping.", series)
+                        await asyncio.sleep(2.0)
+                        break
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    break
+            except Exception as exc:
+                if _attempt == 0:
+                    await asyncio.sleep(5.0)
+                    headers = generate_headers("GET", _MARKETS_PATH)
+                else:
+                    logging.warning("Series fetch error for %s: %s", series, exc)
+                    await asyncio.sleep(1.0)
+        if data is None:
             continue
 
         for m in data.get("markets", []):
@@ -241,7 +249,7 @@ async def fetch_markets_by_series(
                 seen_tickers.add(t)
                 all_markets.append(_normalize_market(m))
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.4)
 
     logging.debug(
         "Series fetch: %d market(s) across %d series.", len(all_markets), len(series_tickers)

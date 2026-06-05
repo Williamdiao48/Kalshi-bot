@@ -15,10 +15,13 @@ Sections:
   5. HRRR + secondary source pairwise (intersection)
 
 Data sources (no look-ahead, no simulation):
-  - data/candlesticks.db         — real 1-min Kalshi YES bid/ask candles (Apr 6 – May 8)
-  - data/backtest/band_arb_hist_cache.json — archived HRRR daily forecasts (genuine model output)
-  - data/db/opportunity_log.db   — bot's raw_forecasts (May 2+ actual logged values)
+  - data/candlesticks.db         — real 1-min Kalshi YES bid/ask candles (Apr 4 – Jun 4)
+  - data/db/opportunity_log.db   — bot's raw_forecasts (HRRR at 7-9 UTC only; other sources daily avg)
   - candlesticks.db markets table — actual settlement results
+
+  NOTE: HRRR is loaded at 7-9 UTC only from raw_forecasts (May 2+).
+  The hist_cache HRRR is no longer used — it reflected Open-Meteo retrospective
+  daily-max values (look-ahead bias of ~17% band mismatches vs 7 UTC signal).
 
 Run:
   venv/bin/python scripts/backtest_forecast_band_yes.py
@@ -87,32 +90,40 @@ def parse_ticker(ticker: str):
 
 
 def load_all_forecasts() -> dict[tuple[str, str, str], float]:
-    """Returns {(source, city, date): forecast_f} for all ensemble sources."""
+    """Returns {(source, city, date): forecast_f} for all ensemble sources.
+
+    HRRR is loaded exclusively from bot raw_forecasts at 7-9 UTC — the actual
+    6z model run available at entry time.  Using the hist_cache HRRR (Open-Meteo
+    historical API) introduced look-ahead: it reflects retrospective daily-max
+    values that incorporate later model runs not available at 7 UTC.
+
+    All other sources (open_meteo ensemble, noaa, nws_hourly) use daily AVG
+    from raw_forecasts — their daily-max forecasts are stable through the day
+    (initialized at 0z/6z and do not change materially by 7 UTC entry window).
+    """
     forecasts: dict[tuple[str, str, str], float] = {}
 
-    # HRRR from hist cache (Apr 6 – May 8, genuine archived model output)
-    if HIST_CACHE.exists():
-        with HIST_CACHE.open() as f:
-            cache = json.load(f)
-        for key, day_map in cache.items():
-            if not key.startswith("hrrr_temp_high_"):
-                continue
-            if not isinstance(day_map, dict):
-                continue
-            parts = key.split("_")
-            if len(parts) < 4:
-                continue
-            city = parts[3]
-            for date_str, val in day_map.items():
-                if val is not None and len(date_str) == 10:
-                    k = ("hrrr", city, date_str)
-                    if k not in forecasts:
-                        forecasts[k] = float(val)
-
-    # All sources from bot DB (May 2+)
     if BOT_DB.exists():
         conn = sqlite3.connect(BOT_DB)
-        src_list = ",".join(f"'{s}'" for s in ENSEMBLE_SOURCES)
+
+        # HRRR: 7-9 UTC only (6z run available at entry time, no look-ahead)
+        hrrr_rows = conn.execute("""
+            SELECT metric, date(logged_at), AVG(data_value)
+            FROM raw_forecasts
+            WHERE source = 'hrrr'
+              AND metric LIKE 'temp_high_%'
+              AND data_value IS NOT NULL
+              AND time(logged_at) BETWEEN '07:00' AND '09:00'
+            GROUP BY metric, date(logged_at)
+        """).fetchall()
+        for metric, date_str, val in hrrr_rows:
+            city = metric.replace("temp_high_", "")
+            if val is not None:
+                forecasts[("hrrr", city, date_str)] = float(val)
+
+        # All other sources: daily AVG (stable forecasts, no timing bias)
+        other_sources = [s for s in ENSEMBLE_SOURCES if s != "hrrr"]
+        src_list = ",".join(f"'{s}'" for s in other_sources)
         rows = conn.execute(f"""
             SELECT source, metric, date(logged_at), AVG(data_value)
             FROM raw_forecasts
@@ -129,7 +140,7 @@ def load_all_forecasts() -> dict[tuple[str, str, str], float]:
                 forecasts[k] = float(val)
 
     src_counts = Counter(k[0] for k in forecasts)
-    print("Loaded forecasts per source:")
+    print("Loaded forecasts per source (HRRR = 7-9 UTC only, others = daily avg):")
     for src in ENSEMBLE_SOURCES:
         print(f"  {src:25s}  {src_counts.get(src, 0):>5,} entries")
 
