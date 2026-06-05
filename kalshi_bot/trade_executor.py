@@ -3079,6 +3079,41 @@ class TradeExecutor:
             entry_cost, contracts,
         )
 
+    def _log_shadow_forecast_band_yes(self, signal: "ForecastBandYesSignal") -> None:
+        """Log a forecast_band_yes signal to shadow_forecast_band_yes without trading.
+
+        Deduplicates: one open shadow row per ticker (unique index on ticker where
+        outcome IS NULL).  Used when FORECAST_BAND_YES_ENABLED=False to track
+        signal quality independent of real trades.
+        """
+        from datetime import datetime, timezone
+        existing = self._conn.execute(
+            "SELECT id FROM shadow_forecast_band_yes WHERE ticker = ? AND outcome IS NULL",
+            (signal.ticker,),
+        ).fetchone()
+        if existing:
+            return
+        try:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO shadow_forecast_band_yes
+                   (logged_at, ticker, metric, city, yes_ask, fc_hrrr, band_lo, band_hi, hours_to_close)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    signal.ticker, signal.metric, signal.city,
+                    signal.yes_ask, round(signal.fc_hrrr, 1),
+                    signal.band_lo, signal.band_hi,
+                    round(signal.hours_to_close, 1),
+                ),
+            )
+            logging.info(
+                "ForecastBandYES shadow logged: %s  YES_ask=%d¢  HRRR=%.1f°F → band[%.0f,%.0f]",
+                signal.ticker, signal.yes_ask, signal.fc_hrrr,
+                signal.band_lo, signal.band_hi,
+            )
+        except Exception as exc:
+            logging.warning("ForecastBandYES shadow insert error: %s", exc)
+
     async def maybe_trade_forecast_no(
         self,
         session: aiohttp.ClientSession,
@@ -3260,11 +3295,7 @@ class TradeExecutor:
             return
 
         if not FORECAST_BAND_YES_ENABLED:
-            logging.info(
-                "ForecastBandYES DETECT-ONLY (FORECAST_BAND_YES_ENABLED=false): "
-                "%s  YES×%d @ %d¢  HRRR=%.1f°F",
-                signal.ticker, count, signal.yes_ask, signal.fc_hrrr,
-            )
+            self._log_shadow_forecast_band_yes(signal)
             return
 
         if await self._exposure_cap_exceeded(session, signal.ticker, count, signal.yes_ask, "ForecastBandYES"):

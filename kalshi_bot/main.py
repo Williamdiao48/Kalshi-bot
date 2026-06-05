@@ -38,7 +38,7 @@ from .arb_detector import (
     find_crossed_book_opportunities, CrossedBookArb, CROSSED_BOOK_MIN_PROFIT,
 )
 from .bracket_arb import find_bracket_set_opportunities, BracketSetArb, BRACKET_ARB_MIN_PROFIT, BRACKET_ARB_ENABLED
-from .strike_arb import find_band_arbs, find_forecast_nos, find_forecast_band_yes_signals, find_forecast_band_yes_carryover_signals, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED, FORECAST_BAND_YES_ENABLED, FORECAST_BAND_YES_CARRYOVER_ENABLED
+from .strike_arb import find_band_arbs, find_forecast_nos, find_forecast_band_yes_signals, find_forecast_band_yes_carryover_signals, refresh_forecast_bias, BAND_ARB_EXECUTION_ENABLED, FORECAST_NO_ENABLED, FORECAST_BAND_YES_ENABLED, FORECAST_BAND_YES_SHADOW, FORECAST_BAND_YES_CARRYOVER_ENABLED
 from .polymarket_matcher import match_poly_to_kalshi, match_metaculus_to_kalshi, match_predictit_to_kalshi, PolyOpportunity
 from .news import noaa, open_meteo, nws_hourly, weatherapi, coinbase, frankfurter, yahoo_forex, bls, rss, nws_alerts, fred, eia, eia_inventory, cme_fedwatch, hrrr, congress, whitehouse, equity_index, nws_climo, metar, nws_asos, wti_futures
 from .news import polymarket, metaculus, edgar, predictit
@@ -2795,7 +2795,7 @@ async def _poll(
                 await executor.maybe_trade_forecast_no(session, _fno)
 
     # ---- forecast-band YES (morning HRRR → B-band early entry) -------------
-    if FORECAST_BAND_YES_ENABLED and hrrr_hourly_highs:
+    if hrrr_hourly_highs and (FORECAST_BAND_YES_ENABLED or FORECAST_BAND_YES_SHADOW):
         _fby_signals = find_forecast_band_yes_signals(markets, hrrr_hourly_highs)
         if _fby_signals:
             logging.info(
@@ -3434,6 +3434,7 @@ async def _fast_loop(
         await executor.maybe_trade_band_arb(session, signal)
 
     await _settle_shadow_band_arbs(conn=executor._conn, session=session)
+    await _track_shadow_forecast_band_yes(conn=executor._conn, session=session)
     _update_yes_momentum_shadows(conn=executor._conn, markets=fresh_markets)
     await _check_yes_momentum_exits(conn=executor._conn, markets=fresh_markets, session=session)
     _update_model_shadow_no(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
@@ -3952,6 +3953,62 @@ async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> No
             "Shadow band_arb settled: %s %s → %s  pnl=%.0f¢ ($%.2f)",
             ticker, side.upper(), outcome.upper(), pnl, pnl / 100,
         )
+
+
+async def _track_shadow_forecast_band_yes(conn, session: "aiohttp.ClientSession") -> None:
+    """Update open shadow_forecast_band_yes rows with PT hits and settlement outcomes.
+
+    For each open row (outcome IS NULL):
+    - If market settled: record outcome (won/lost) and pnl_cents.
+    - If not yet settled: check if current YES bid >= 70¢ and record pt_hit_at.
+    """
+    from .markets import KALSHI_API_BASE
+    rows = conn.execute(
+        "SELECT id, ticker, yes_ask FROM shadow_forecast_band_yes WHERE outcome IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    now_utc = datetime.now(timezone.utc).isoformat()
+    for row_id, ticker, yes_ask in rows:
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/markets/{ticker}",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception:
+            continue
+        mkt = data.get("market", data)
+        status = mkt.get("status", "")
+        result = mkt.get("result", "")
+        if status in ("settled", "finalized") and result in ("yes", "no"):
+            outcome = "won" if result == "yes" else "lost"
+            pnl = (100 - yes_ask) if outcome == "won" else -yes_ask
+            conn.execute(
+                "UPDATE shadow_forecast_band_yes SET outcome = ?, pnl_cents = ? WHERE id = ?",
+                (outcome, pnl, row_id),
+            )
+            logging.info(
+                "ForecastBandYES shadow settled: %s → %s  pnl=%.0f¢ ($%.2f)",
+                ticker, outcome.upper(), pnl, pnl / 100,
+            )
+        else:
+            yes_bid = mkt.get("yes_bid", 0)
+            if yes_bid >= 70:
+                existing_pt = conn.execute(
+                    "SELECT pt_hit_at FROM shadow_forecast_band_yes WHERE id = ?", (row_id,)
+                ).fetchone()
+                if existing_pt and existing_pt[0] is None:
+                    conn.execute(
+                        "UPDATE shadow_forecast_band_yes SET pt_hit_at = ? WHERE id = ?",
+                        (now_utc, row_id),
+                    )
+                    logging.info(
+                        "ForecastBandYES shadow PT hit: %s  yes_bid=%d¢  entry=%d¢  profit=%.0f¢",
+                        ticker, yes_bid, yes_ask, yes_bid - yes_ask,
+                    )
 
 
 # ---------------------------------------------------------------------------

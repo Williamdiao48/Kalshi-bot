@@ -512,6 +512,7 @@ FORECAST_NO_CORRECTED_MIN_EDGE_F: float = float(
 #   Signal: HRRR morning forecast rounds to target band → enter YES cheap at open,
 #   ride intraday price discovery as market reacts to the same HRRR signal.
 FORECAST_BAND_YES_ENABLED: bool = env_bool("FORECAST_BAND_YES_ENABLED", False)
+FORECAST_BAND_YES_SHADOW: bool = env_bool("FORECAST_BAND_YES_SHADOW", True)
 # YES ask entry window (¢). Backtest used 10–55¢; below 10 is noise.
 FORECAST_BAND_YES_MIN_ASK: int = env_int("FORECAST_BAND_YES_MIN_ASK", 10)
 FORECAST_BAND_YES_MAX_ASK: int = env_int("FORECAST_BAND_YES_MAX_ASK", 55)
@@ -2609,7 +2610,7 @@ def find_forecast_band_yes_signals(
     Returns:
         List of ForecastBandYesSignal, one per qualifying market.
     """
-    if not FORECAST_BAND_YES_ENABLED or not hrrr_highs:
+    if not (FORECAST_BAND_YES_ENABLED or FORECAST_BAND_YES_SHADOW) or not hrrr_highs:
         return []
 
     now_utc = datetime.now(timezone.utc)
