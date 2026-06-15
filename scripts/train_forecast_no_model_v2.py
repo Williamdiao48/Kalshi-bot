@@ -62,6 +62,7 @@ FEATURES = [
     "hrrr_skill_adj",       # hrrr_vs_ceil / (recent_hrrr_mae_7d + 0.5)
     "min_model_vs_ceil",    # min(hrrr_vs_ceil, gfs_vs_ceil)
     "margin_per_hour_left", # margin_f / (hours_to_close + 1)
+    "hour_utc_x_is_high",  # hour_utc * is_high: hour 22 is risky for HIGH, safe for LOW
 ]
 
 CATEGORICAL_FEATURES = ["city_enc"]
@@ -104,12 +105,14 @@ def load_data(high_only: bool, low_only: bool):
             hrs    = f(r, "hours_to_close")
             city   = float(city_map.get(r.get("city", ""), 0))
 
+            hour_utc  = f(r, "hour_utc")
+            is_high_v = f(r, "is_high")
             X_list.append([
                 margin,
                 f(r, "delta_1h"),
                 f(r, "delta_2h"),
                 f(r, "hours_above_ceil", 1.0),
-                f(r, "hour_utc"),
+                hour_utc,
                 hrs,
                 f(r, "obs_vs_hrrr_h"),
                 f(r, "obs_vs_gfs_h"),
@@ -123,12 +126,13 @@ def load_data(high_only: bool, low_only: bool):
                 f(r, "clim_drop_p50", 2.0),
                 f(r, "clim_drop_p75", 3.0),
                 city,
-                f(r, "is_high"),
+                is_high_v,
                 f(r, "month"),
                 # v2 features — fall back to derived values if missing from CSV
                 f(r, "hrrr_skill_adj",       hrrr / (mae + 0.5)),
                 f(r, "min_model_vs_ceil",     min(hrrr, gfs)),
                 f(r, "margin_per_hour_left",  margin / (hrs + 1)),
+                f(r, "hour_utc_x_is_high",    hour_utc * is_high_v),
             ])
             y_list.append(int(r["won"]))
             dates.append(r["date"])

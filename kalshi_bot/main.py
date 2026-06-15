@@ -3781,26 +3781,29 @@ def _model_shadow_features(
         clim_prob, clim_p50, clim_p75 = 0.15, 2.0, 3.0
 
     return {
-        "margin_f":           float(margin_f),
-        "delta_1h":           delta_1h,
-        "delta_2h":           delta_2h,
-        "hours_above_ceil":   float(max(1, hours_above)),
-        "hour_utc":           float(hour_utc),
-        "hours_to_close":     float(max(0, 22 - hour_utc)),
-        "obs_vs_hrrr_h":      0.0,   # not available at runtime
-        "obs_vs_gfs_h":       0.0,
-        "hrrr_vs_ceil":       round((hrrr_f or consensus) - band_ceil, 2),
-        "gfs_vs_ceil":        round((gfs_f  or consensus) - band_ceil, 2),
-        "consensus_vs_ceil":  round(consensus - band_ceil, 2),
-        "model_spread":       round(spread, 2),
-        "n_models_above_ceil":float(n_above),
-        "recent_hrrr_mae_7d": recent_mae,
-        "clim_prob_exceed":   round(clim_prob, 4),
-        "clim_drop_p50":      round(clim_p50, 2),
-        "clim_drop_p75":      round(clim_p75, 2),
-        "city_enc":           0.0,   # filled in below by caller
-        "is_high":            1.0 if is_high else 0.0,
-        "month":              float(month),
+        "margin_f":              float(margin_f),
+        "delta_1h":              delta_1h,
+        "delta_2h":              delta_2h,
+        "hours_above_ceil":      float(max(1, hours_above)),
+        "hour_utc":              float(hour_utc),
+        "hours_to_close":        float(max(0, 22 - hour_utc)),
+        "obs_vs_hrrr_h":         0.0,   # not available at runtime (hourly HRRR not stored)
+        "obs_vs_gfs_h":          0.0,
+        "hrrr_vs_ceil":          round((hrrr_f or consensus) - band_ceil, 2),
+        "gfs_vs_ceil":           round((gfs_f  or consensus) - band_ceil, 2),
+        "consensus_vs_ceil":     round(consensus - band_ceil, 2),
+        "model_spread":          round(spread, 2),
+        "n_models_above_ceil":   float(n_above),
+        "recent_hrrr_mae_7d":    recent_mae,
+        "clim_prob_exceed":      round(clim_prob, 4),
+        "clim_drop_p50":         round(clim_p50, 2),
+        "clim_drop_p75":         round(clim_p75, 2),
+        "city_enc":              0.0,   # filled in below by caller
+        "is_high":               1.0 if is_high else 0.0,
+        "month":                 float(month),
+        # hour × market-type interaction: hour 22 is high-risk for KXHIGHT but safe
+        # for KXLOWT; model needs this interaction to distinguish the two cases.
+        "hour_utc_x_is_high":   float(hour_utc) * (1.0 if is_high else 0.0),
     }
 
 
@@ -3878,9 +3881,31 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
         # when NO wins doesn't cover the 92¢ loss when YES wins (12.5% of the time).
         if yes_ask > _MODEL_SHADOW_MAX_YES_ASK:
             continue
+        # KXHIGHT gate: YES ask < 15¢ means NO payout ≤ 15¢ — risk/reward too thin.
+        # At 85¢ NO entry we need >85% WR to break even; trim these near-certain micro-wins.
+        if is_high and yes_ask < 15:
+            continue
         market_p_no = (100 - yes_ask) / 100.0
+
+        # Minimum EV gate: model_p × win_payout − (1−model_p) × no_cost < 10¢ → skip.
+        # Backtest: 379 sub-10¢ EV trades generated only +$6.37 total; 669 trades >10¢ EV
+        # generated +$311.94.  Gate prunes trivial near-certain entries with tiny payout.
+        no_price_cents = market_p_no * 100
+        model_ev = model_p * (100 - no_price_cents) - (1 - model_p) * no_price_cents
+        if model_ev < 10.0:
+            continue
+
+        # Negative-HVC + thin-margin gate: HRRR forecasts daily temp below band ceiling
+        # while current obs is only marginally above.  Live: 69.2% WR in this bucket.
+        hvc = feat_map.get("hrrr_vs_ceil", 0.0)
+        if hvc < 0 and margin_f < 2.0:
+            logging.debug(
+                "[shadow_model_no] neg-HVC gate: blocked %s  hvc=%.1f  m=%.1f",
+                ticker, hvc, margin_f,
+            )
+            continue
+
         edge      = round(model_p - market_p_no, 4)
-        hvc       = feat_map.get("hrrr_vs_ceil", 0.0)
         clim_prob = feat_map.get("clim_prob_exceed", 0.0)
 
         try:
@@ -4037,11 +4062,26 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
         yes_ask = mkt.get("yes_ask") or 100
         if yes_ask > _MODEL_SHADOW_MAX_YES_ASK:
             continue
+        if is_high and yes_ask < 15:
+            continue
         market_p_no = (100 - yes_ask) / 100.0
-        edge        = round(model_p - market_p_no, 4)
-        hvc         = feat_map.get("hrrr_vs_ceil", 0.0)
-        clim_prob   = feat_map.get("clim_prob_exceed", 0.0)
-        v1_p        = v1_open.get(ticker)  # v1 model_p if it also fired today
+
+        no_price_cents = market_p_no * 100
+        model_ev = model_p * (100 - no_price_cents) - (1 - model_p) * no_price_cents
+        if model_ev < 10.0:
+            continue
+
+        hvc = feat_map.get("hrrr_vs_ceil", 0.0)
+        if hvc < 0 and margin_f < 2.0:
+            logging.debug(
+                "[shadow_no_v2] neg-HVC gate: blocked %s  hvc=%.1f  m=%.1f",
+                ticker, hvc, margin_f,
+            )
+            continue
+
+        edge      = round(model_p - market_p_no, 4)
+        clim_prob = feat_map.get("clim_prob_exceed", 0.0)
+        v1_p      = v1_open.get(ticker)  # v1 model_p if it also fired today
 
         try:
             conn.execute("""

@@ -29,7 +29,8 @@ from pathlib import Path
 SRC = Path("data/backtest/forecast_no_training_data_kalshi.csv")
 DST = Path("data/backtest/forecast_no_training_data_kalshi_v2.csv")
 
-NEW_FIELDS = ["hrrr_skill_adj", "min_model_vs_ceil", "margin_per_hour_left"]
+NEW_FIELDS = ["hrrr_skill_adj", "min_model_vs_ceil", "margin_per_hour_left",
+              "hour_utc_x_is_high"]
 
 
 def derive(row: dict) -> dict:
@@ -45,15 +46,19 @@ def derive(row: dict) -> dict:
     mae_7d     = f("recent_hrrr_mae_7d", default=3.0)
     margin     = f("margin_f")
     hrs_left   = f("hours_to_close")
+    hour_utc   = f("hour_utc")
+    is_high    = f("is_high")
 
-    hrrr_skill_adj      = round(hrrr_vc / (mae_7d + 0.5), 4)
-    min_model_vs_ceil   = round(min(hrrr_vc, gfs_vc), 4)
+    hrrr_skill_adj       = round(hrrr_vc / (mae_7d + 0.5), 4)
+    min_model_vs_ceil    = round(min(hrrr_vc, gfs_vc), 4)
     margin_per_hour_left = round(margin / (hrs_left + 1), 4)
+    hour_utc_x_is_high   = round(hour_utc * is_high, 4)
 
     return {
         "hrrr_skill_adj":       hrrr_skill_adj,
         "min_model_vs_ceil":    min_model_vs_ceil,
         "margin_per_hour_left": margin_per_hour_left,
+        "hour_utc_x_is_high":  hour_utc_x_is_high,
     }
 
 
