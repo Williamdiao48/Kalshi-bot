@@ -192,6 +192,16 @@ _model_shadow_hrrr_lookup:   dict = {}   # (metric, date) → HRRR forecast °F
 _model_shadow_actual_lookup: dict = {}   # (obs_metric, date) → {high/low: °F}
 _model_shadow_loaded: bool = False
 
+# v2 model globals (new alpha features: hrrr_skill_adj, min_model_vs_ceil, margin_per_hour_left)
+_model_shadow_v2_lgbm_h = None
+_model_shadow_v2_iso_h  = None
+_model_shadow_v2_feat_h: list[str] = []
+_model_shadow_v2_city_h: dict[str, int] = {}
+_model_shadow_v2_lgbm_l = None
+_model_shadow_v2_iso_l  = None
+_model_shadow_v2_feat_l: list[str] = []
+_model_shadow_v2_city_l: dict[str, int] = {}
+
 
 def _load_model_shadow() -> None:
     """Load NO-signal LightGBM models + build climatology + MAE lookups.  Called once at startup."""
@@ -199,6 +209,8 @@ def _load_model_shadow() -> None:
     global _model_shadow_lgbm_l, _model_shadow_iso_l, _model_shadow_feat_l, _model_shadow_city_l
     global _model_shadow_clim, _model_shadow_hrrr_lookup, _model_shadow_actual_lookup
     global _model_shadow_loaded
+    global _model_shadow_v2_lgbm_h, _model_shadow_v2_iso_h, _model_shadow_v2_feat_h, _model_shadow_v2_city_h
+    global _model_shadow_v2_lgbm_l, _model_shadow_v2_iso_l, _model_shadow_v2_feat_l, _model_shadow_v2_city_l
     import pickle, json
 
     def _load_pkl(path: str):
@@ -212,6 +224,16 @@ def _load_model_shadow() -> None:
         _load_pkl("data/models/forecast_no_band_model_high.pkl")
     _model_shadow_lgbm_l, _model_shadow_iso_l, _model_shadow_feat_l, _model_shadow_city_l = \
         _load_pkl("data/models/forecast_no_band_model_low.pkl")
+
+    _model_shadow_v2_lgbm_h, _model_shadow_v2_iso_h, _model_shadow_v2_feat_h, _model_shadow_v2_city_h = \
+        _load_pkl("data/models/forecast_no_band_model_v2_high.pkl")
+    _model_shadow_v2_lgbm_l, _model_shadow_v2_iso_l, _model_shadow_v2_feat_l, _model_shadow_v2_city_l = \
+        _load_pkl("data/models/forecast_no_band_model_v2_low.pkl")
+    logging.info(
+        "Model shadow-NO v2: HIGH=%s  LOW=%s",
+        "ok" if _model_shadow_v2_lgbm_h else "missing",
+        "ok" if _model_shadow_v2_lgbm_l else "missing",
+    )
 
     if _model_shadow_lgbm_h is None and _model_shadow_lgbm_l is None:
         logging.warning("Model shadow-NO: no model files found — shadow trader disabled.")
@@ -3439,6 +3461,8 @@ async def _fast_loop(
     await _check_yes_momentum_exits(conn=executor._conn, markets=fresh_markets, session=session)
     _update_model_shadow_no(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
     await _settle_model_shadow_no(conn=executor._conn, session=session)
+    _update_model_shadow_no_v2(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
+    await _settle_model_shadow_no_v2(conn=executor._conn, session=session)
 
 
 async def _position_watcher(
@@ -3645,6 +3669,7 @@ async def _check_yes_momentum_exits(
 
 _MODEL_SHADOW_MIN_MARGIN   = 0.3   # °F above band_ceil to fire at all
 _MODEL_SHADOW_MIN_MODEL_P  = 0.80  # minimum calibrated model probability to log
+_MODEL_SHADOW_MAX_YES_ASK  = 55    # skip if YES still costs > 55¢ (backtest: edge ≥ 50pp → negative EV)
 _MODEL_SHADOW_SERIES = {
     # series prefix → (city_code, is_high)
     "KXHIGHLAX":("lax",True), "KXHIGHDEN":("den",True), "KXHIGHCHI":("chi",True),
@@ -3833,7 +3858,9 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
         feat_map = _model_shadow_features(metric, city, is_high, band_ceil, margin_f, hour_utc, month, conn)
         if feat_map is None:
             continue
-        feat_map["city_enc"] = float(cmap.get(city, 0))
+        # dal (Love Field) not in training data; dfw is same metro
+        _city_alias = {"dal": "dfw"}
+        feat_map["city_enc"] = float(cmap.get(_city_alias.get(city, city), 0))
 
         import warnings as _warnings
         X = _np.array([[feat_map.get(f, 0.0) for f in feats]])
@@ -3846,6 +3873,11 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
             continue
 
         yes_ask   = mkt.get("yes_ask") or 100
+        # Skip early-entry trades where market strongly disagrees (YES still expensive).
+        # Backtest: edge ≥ 50pp (yes_ask > ~55) has negative total EV — the 8¢ payout
+        # when NO wins doesn't cover the 92¢ loss when YES wins (12.5% of the time).
+        if yes_ask > _MODEL_SHADOW_MAX_YES_ASK:
+            continue
         market_p_no = (100 - yes_ask) / 100.0
         edge      = round(model_p - market_p_no, 4)
         hvc       = feat_map.get("hrrr_vs_ceil", 0.0)
@@ -3913,6 +3945,169 @@ async def _settle_model_shadow_no(conn, session: "aiohttp.ClientSession") -> Non
         logging.info(
             "[shadow_model_no] Settled: %s → %s  pnl=%+.0f¢ ($%+.2f)",
             ticker, outcome.upper(), pnl, pnl / 100,
+        )
+
+
+def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, float]) -> None:
+    """v2 shadow tracker: same gate as v1 but uses the v2 model with new alpha features."""
+    if not _model_shadow_loaded:
+        return
+    if _model_shadow_v2_lgbm_h is None and _model_shadow_v2_lgbm_l is None:
+        return
+    import numpy as _np
+    import re as _re
+
+    now_utc  = datetime.now(timezone.utc)
+    hour_utc = now_utc.hour
+    month    = now_utc.month
+
+    open_tickers = {
+        row[0] for row in conn.execute(
+            "SELECT ticker FROM shadow_model_no_v2 WHERE exit_reason IS NULL"
+        ).fetchall()
+    }
+
+    # Also grab v1 predictions for the same tickers (for comparison column)
+    v1_open = {
+        row[0]: row[1] for row in conn.execute(
+            "SELECT ticker, model_p FROM shadow_model_no WHERE exit_reason IS NULL"
+        ).fetchall()
+    }
+
+    for mkt in markets:
+        ticker = mkt.get("ticker", "")
+        m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B(\d+\.?\d*)$", ticker)
+        if not m:
+            continue
+        series = m.group(1)
+        mid    = float(m.group(2))
+        if series not in _MODEL_SHADOW_SERIES:
+            continue
+        city, is_high = _MODEL_SHADOW_SERIES[series]
+
+        metric    = f"temp_{'high' if is_high else 'low'}_{city}"
+        band_lo   = int(mid - 0.5)
+        band_ceil = band_lo + 1
+
+        running_obs = obs_values.get(metric)
+        if running_obs is None:
+            continue
+        margin_f = round(running_obs - band_ceil, 2)
+        if margin_f < _MODEL_SHADOW_MIN_MARGIN:
+            continue
+        if ticker in open_tickers:
+            continue
+
+        # Select v2 model
+        if is_high:
+            lgbm, iso, feats, cmap = (_model_shadow_v2_lgbm_h, _model_shadow_v2_iso_h,
+                                      _model_shadow_v2_feat_h, _model_shadow_v2_city_h)
+        else:
+            lgbm, iso, feats, cmap = (_model_shadow_v2_lgbm_l, _model_shadow_v2_iso_l,
+                                      _model_shadow_v2_feat_l, _model_shadow_v2_city_l)
+        if lgbm is None:
+            continue
+
+        feat_map = _model_shadow_features(metric, city, is_high, band_ceil, margin_f, hour_utc, month, conn)
+        if feat_map is None:
+            continue
+
+        # Derived v2 features (computed from existing feat_map values)
+        hrrr_vc  = feat_map.get("hrrr_vs_ceil", 0.0)
+        gfs_vc   = feat_map.get("gfs_vs_ceil", 0.0)
+        mae_7d   = feat_map.get("recent_hrrr_mae_7d", 3.0)
+        hrs_left = feat_map.get("hours_to_close", 1.0)
+        feat_map["hrrr_skill_adj"]       = hrrr_vc / (mae_7d + 0.5)
+        feat_map["min_model_vs_ceil"]    = min(hrrr_vc, gfs_vc)
+        feat_map["margin_per_hour_left"] = margin_f / (hrs_left + 1.0)
+
+        _city_alias = {"dal": "dfw"}
+        feat_map["city_enc"] = float(cmap.get(_city_alias.get(city, city), 0))
+
+        import warnings as _warnings
+        X = _np.array([[feat_map.get(f, 0.0) for f in feats]])
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            raw_p = lgbm.predict_proba(X)[0][1]
+        model_p = float(iso.predict([raw_p])[0])
+
+        if model_p < _MODEL_SHADOW_MIN_MODEL_P:
+            continue
+
+        yes_ask = mkt.get("yes_ask") or 100
+        if yes_ask > _MODEL_SHADOW_MAX_YES_ASK:
+            continue
+        market_p_no = (100 - yes_ask) / 100.0
+        edge        = round(model_p - market_p_no, 4)
+        hvc         = feat_map.get("hrrr_vs_ceil", 0.0)
+        clim_prob   = feat_map.get("clim_prob_exceed", 0.0)
+        v1_p        = v1_open.get(ticker)  # v1 model_p if it also fired today
+
+        try:
+            conn.execute("""
+                INSERT INTO shadow_model_no_v2
+                  (logged_at, ticker, series, is_high, model_p, v1_model_p,
+                   market_p_no, edge, margin_f, hvc, clim_prob,
+                   hrrr_skill_adj, min_model_vs_ceil, margin_per_hour_left, hour_utc)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (now_utc.isoformat(), ticker, series, 1 if is_high else 0,
+                  round(model_p, 4), round(v1_p, 4) if v1_p is not None else None,
+                  round(market_p_no, 4), edge,
+                  margin_f, round(hvc, 2), round(clim_prob, 4),
+                  round(feat_map["hrrr_skill_adj"], 3),
+                  round(feat_map["min_model_vs_ceil"], 2),
+                  round(feat_map["margin_per_hour_left"], 3),
+                  hour_utc))
+            logging.info(
+                "[shadow_no_v2] Entry: %s  v2=%.0f%%  v1=%s  mkt_no=%.0f%%  edge=%+.0f%%"
+                "  skill_adj=%.2f  min_mc=%.1f",
+                ticker, 100*model_p,
+                f"{100*v1_p:.0f}%" if v1_p is not None else "n/a",
+                100*market_p_no, 100*edge,
+                feat_map["hrrr_skill_adj"], feat_map["min_model_vs_ceil"],
+            )
+        except Exception:
+            pass
+
+
+async def _settle_model_shadow_no_v2(conn, session: "aiohttp.ClientSession") -> None:
+    """Resolve open shadow_model_no_v2 rows once markets finalize."""
+    from .markets import KALSHI_API_BASE
+    rows = conn.execute(
+        "SELECT id, ticker FROM shadow_model_no_v2 WHERE exit_reason IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    for row_id, ticker in rows:
+        try:
+            async with session.get(
+                f"{KALSHI_API_BASE}/markets/{ticker}",
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception:
+            continue
+        mkt    = data.get("market", data)
+        status = mkt.get("status", "")
+        result = mkt.get("result", "")
+        if status not in ("settled", "finalized") or result not in ("yes", "no"):
+            continue
+        outcome = "won" if result == "no" else "lost"
+        entry_row = conn.execute(
+            "SELECT market_p_no FROM shadow_model_no_v2 WHERE id=?", (row_id,)
+        ).fetchone()
+        entry_no_p = round(entry_row[0] * 100) if entry_row else 50
+        pnl = (100 - entry_no_p) if outcome == "won" else -entry_no_p
+        conn.execute("""
+            UPDATE shadow_model_no_v2
+            SET exit_reason='settled', exited_at=?, outcome=?, pnl_cents=?
+            WHERE id=?
+        """, (datetime.now(timezone.utc).isoformat(), outcome, float(pnl), row_id))
+        logging.info(
+            "[shadow_no_v2] Settled: %s → %s  pnl=%+.0f¢",
+            ticker, outcome.upper(), pnl,
         )
 
 

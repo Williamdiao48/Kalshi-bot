@@ -236,3 +236,35 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(8)")
         logging.info("DB schema migration V8 applied (shadow_forecast_band_yes).")
+
+    if current < 9:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_model_no_v2 (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at      TEXT    NOT NULL,
+                ticker         TEXT    NOT NULL,
+                series         TEXT,
+                is_high        INTEGER NOT NULL DEFAULT 0,
+                model_p        REAL    NOT NULL,
+                v1_model_p     REAL,
+                market_p_no    REAL    NOT NULL,
+                edge           REAL    NOT NULL,
+                margin_f       REAL,
+                hvc            REAL,
+                clim_prob      REAL,
+                hrrr_skill_adj      REAL,
+                min_model_vs_ceil   REAL,
+                margin_per_hour_left REAL,
+                hour_utc       INTEGER,
+                exit_reason    TEXT,
+                exited_at      TEXT,
+                outcome        TEXT,
+                pnl_cents      REAL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_model_no_v2_open
+                ON shadow_model_no_v2 (ticker) WHERE exit_reason IS NULL
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(9)")
+        logging.info("DB schema migration V9 applied (shadow_model_no_v2).")
