@@ -472,6 +472,24 @@ def _filter_weather_opportunities(
         if not _gate_date_alignment(opp, now):
             continue
 
+        # T-strike gate: forecast sources should not trade terminal-threshold bets
+        # (KXHIGH*-T / KXLOWT*-T).  Live data Jun 4–15 2026: 11 weather T-strike
+        # trades from hrrr/nws_hourly/noaa → 27% WR, -$6.62 net.  Root cause:
+        # warm-season models overestimate temperature certainty at exact thresholds
+        # (e.g. HRRR 93% confident Boston crosses 88°F; it didn't).  Confirmed
+        # crossings are handled by band_arb + noaa_observed without this issue.
+        # WTI and other non-temperature metrics are already excluded by the
+        # metric.startswith() guard above, so this only blocks temp T-strikes.
+        if (
+            opp.direction == "over"
+            and opp.source not in _PASS_THROUGH_SOURCES
+        ):
+            logging.debug(
+                "T-strike gate: blocked %s %s (source=%s, edge=%.1f)",
+                opp.direction, opp.market_ticker, opp.source, opp.edge,
+            )
+            continue
+
         if opp.source in _PASS_THROUGH_SOURCES:
             # High-confidence signals: ground truth (observed/climo) or NWS
             # warning.  Never gated by HRRR spread; direction-split edge threshold.

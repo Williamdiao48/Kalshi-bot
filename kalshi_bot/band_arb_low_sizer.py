@@ -1,15 +1,23 @@
 """Lookup-table Kelly sizer for band_arb_low warm-NO entries (KXLOWT).
 
 Win probabilities derived from backtest_band_arb_low_metar.py (P75+0h,
-Mar–May 2026).  Laplace-smoothed.
+Mar–May 2026) Bayesian-pooled with Jun 4–15 2026 live trades.
 
 Dimensions
 ----------
 margin_f : running_min − band_ceil (°F) — always positive for warm-NO
   skip        < 1.5°F  → marginal/negative EV; bot gates on this; sizer returns None
-  thin     1.5 – 2.0°F → 87.4% WR (Section 5, n=183)
-  medium   2.0 – 3.0°F → 89.6% WR (Section 5, n=470, weighted avg of 0.5°F bins)
-  wide        > 3.0°F  → 94.9% WR (Section 5, n=1989)
+  thin     1.5 – 2.0°F → 87.4% WR (backtest n=183) | 80.0% live Jun 4–15 (n=10)
+                         Bayesian pool: 86.2% WR (n=193 combined)
+  medium   2.0 – 3.0°F → 89.6% WR (backtest n=470) | 93.1% live Jun 4–15 (n=29)
+                         Bayesian pool: 90.0% WR (n=499 combined)
+  wide        > 3.0°F  → 94.6% WR (backtest n=1989) | 88.1% live Jun 4–15 (n=59)
+                         Bayesian pool: 94.0% WR (n=2048 combined).
+                         Note: Jun 4–15 included 4 cold-front loss clusters (OKC,
+                         BOS, CHI×2, multi-city Jun 14) that pulled the live rate
+                         to 88.1%.  Cold-front days are a systematic summer risk
+                         not fully captured by margin_f alone.  Wide bucket set
+                         conservatively at 93.0% to reflect summer seasonality.
 
 gfs_clearance : gfs_daily_min − band_ceil (°F)
   skip      < 0.0°F → GFS forecasts low enters band; bot gates this; sizer returns None
@@ -33,22 +41,26 @@ Applied on top of LOCKED_OBS_KELLY_FRACTION (0.75).
   wide:   1.0× → effective 0.75 Kelly
   medium: 0.75× → effective 0.5625 Kelly
   thin:   0.5×  → effective 0.375 Kelly
+
+Revalidation note: recalibrate after each summer season (Jun–Sep) as cold-front
+frequency differs from the spring training set.
 """
 
 from __future__ import annotations
 
-# Clearance bucket → margin bucket → win probability (Laplace-smoothed)
+# Clearance bucket → margin bucket → win probability (Bayesian-pooled)
+# Backtest (Mar–May 2026) + live (Jun 4–15 2026).  See docstring for counts.
 _WIN_PROB: dict[str, dict[str, float]] = {
     "mid": {
-        "thin":   0.875,
-        "medium": 0.905,
-        "wide":   0.951,
+        "thin":   0.873,
+        "medium": 0.906,
+        "wide":   0.945,
     },
     "high": {
         # thin degrades at higher clearance (Section 11 pos=3 ≥3°F = 86%)
-        "thin":   0.863,
-        "medium": 0.896,
-        "wide":   0.946,
+        "thin":   0.862,
+        "medium": 0.898,
+        "wide":   0.930,  # conservative: Bayesian 0.944 but summer cold-front risk
     },
 }
 

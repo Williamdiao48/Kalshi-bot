@@ -327,6 +327,14 @@ EXIT_PROFIT_TAKE_LONGSHOT_MULT: float = float(
 #   that frequently never materialises.
 #   Paired with EXIT_SOURCE_TRAILING_DRAWDOWN "noaa_day2": 0.05 as a
 #   secondary catch if the position doesn't reach the profit-take first.
+#
+# band_arb:no  3.00 — confirmed-crossing NO positions (running obs > band_ceil).
+#   Outcome is near-locked once the crossing is observed; holding to settlement
+#   maximises capture.  3.00 (300% of entry cost gain) effectively holds to
+#   settlement for any NO entry ≥ 25¢ (max gain = 75¢ = 300% on 25¢) while
+#   still exiting very cheap NOs (≤ 20¢) before the last few ¢ of upside.
+#   Raised from 2.00: Jun 4–15 2026 audit found $17.28 left on the table
+#   across 114 band_arb trades (captured $32.93 vs $50.21 at settlement).
 _pt_raw = os.environ.get(
     "EXIT_SOURCE_PROFIT_TAKE",
     '{"noaa_observed:yes": 0.50, "noaa_observed": 0.75, "metar:yes": 0.50, "metar": 0.80, "nws_alert": 0.80,'
@@ -334,7 +342,7 @@ _pt_raw = os.environ.get(
     ' "noaa_day2:yes": 0.35, "noaa_day2_early:yes": 0.35,'
     ' "noaa": 0.40, "noaa_day2": 0.20, "polymarket": 0.25,'
     ' "obs_trajectory:yes": 0.30,'
-    ' "band_arb:yes": 0.70, "band_arb:no": 2.00,'
+    ' "band_arb:yes": 0.70, "band_arb:no": 3.00,'
     ' "forecast_no": 0.40, "numeric": 0.75,'
     ' "binance": 0.35, "coinbase": 0.35}',
 )
