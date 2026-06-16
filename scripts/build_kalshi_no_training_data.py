@@ -43,7 +43,8 @@ SERIES_MAP = {
     "KXHIGHTSEA":  ("SEA", "sea",  True),
     "KXHIGHTBOS":  ("BOS", "bos",  True),
     "KXHIGHTPHX":  ("PHX", "phx",  True),
-    "KXHIGHTPHIL": ("PHL", "phl",  True),
+    "KXHIGHTPHIL": ("PHL", "phl",  True),   # legacy name (0 markets on Kalshi)
+    "KXHIGHPHIL":  ("PHL", "phl",  True),   # actual Kalshi series name
     "KXHIGHTDC":   ("DCA", "dca",  True),
     "KXHIGHTLV":   ("LAS", "las",  True),
     "KXHIGHTOKC":  ("OKC", "okc",  True),
@@ -63,6 +64,7 @@ SERIES_MAP = {
     "KXLOWTBOS":   ("BOS", "bos",  False),
     "KXLOWTHOU":   ("HOU", "hou",  False),
     "KXLOWTDFW":   ("DFW", "dfw",  False),
+    "KXLOWTDAL":   ("DFW", "dfw",  False),  # Dallas low-temp (DFW station)
     "KXLOWTSFO":   ("SFO", "sfo",  False),
     "KXLOWTSEA":   ("SEA", "sea",  False),
     "KXLOWTPHX":   ("PHX", "phx",  False),
