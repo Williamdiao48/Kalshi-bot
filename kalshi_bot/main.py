@@ -2539,6 +2539,9 @@ async def _poll(
                     ", ".join(sorted(recently_exited)),
                 )
             dry_run_held |= recently_exited
+        # Entry dedup: skip tickers entered in the last 120s so the main loop and
+        # fast loop can't both fire for the same ticker in the same ~80s window.
+        dry_run_held |= ledger.recently_entered_tickers(120)
 
         # forecast_no: block same-day re-entry for any exit reason (profit-take
         # included).  The `recently_exited_tickers` cooldown only covers stop-loss
@@ -3430,6 +3433,9 @@ async def _fast_loop(
         fast_held = set(_fast_held_info.keys())
         if EXIT_REENTRY_COOLDOWN_MINUTES > 0:
             fast_held |= ledger.recently_exited_tickers(EXIT_REENTRY_COOLDOWN_MINUTES)
+        # Entry dedup: skip tickers that were just entered (main loop and fast loop
+        # can both fire in the same 80s cycle before either trade commits to the DB).
+        fast_held |= ledger.recently_entered_tickers(120)
 
     for signal in signals:
         if signal.ticker in fast_held:
