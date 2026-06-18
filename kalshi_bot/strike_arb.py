@@ -156,6 +156,15 @@ BAND_ARB_LOW_CEIL_MAX_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MAX_HOUR", 15)
 # Backtest (May 2026, 69 shadow trades): ≤88¢ = 100% WR across all non-DEN cities
 # in noon–3pm window; ≥89¢ introduces losses (negative-EV Kelly).
 BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 88)
+# Minimum HRRR clearance above the band ceiling to fire a warm-NO signal.
+# Live data Jun 4–17 2026: HRRR gap 1–2°F → 71% WR (-$0.90 net, negative EV);
+# gap 2–3°F → 86% WR; gap 3–5°F → 93% WR.  The old veto only blocked at
+# band_ceil+0.5 (NWS rounding), far too permissive when HRRR overnight-low
+# errors of 2–4°F are common in summer.  Default 2.0°F targets the positive-EV
+# regime without cutting the high-confidence 2°F+ bucket.
+BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F: float = env_float(
+    "BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F", 2.0
+)
 # Blocklist of city suffixes that may NOT generate warm-side NO signals.
 # DEN is structurally unreliable (33% WR in backtest — alpine morning cold air
 # pools persist past noon; METAR at airport lags valley lows).
@@ -1222,16 +1231,21 @@ def find_band_arbs(
                     )
                     continue
 
-                # HRRR veto: if HRRR forecasts the low dropping to/below the
-                # NWS-adjusted ceiling, the temperature hasn't locked yet — block.
+                # HRRR veto: block if HRRR forecasts the low below the gap threshold.
+                # Uses max(BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F, 0.5) so the NWS rounding
+                # buffer is always respected even if the env var is set below 0.5.
                 if hrrr_values is not None:
                     _hrrr_warm = hrrr_values.get(parsed.metric)
-                    if _hrrr_warm is not None and _hrrr_warm < _warm_ceil_nws:
+                    _hrrr_threshold = band_ceil + max(BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F, 0.5)
+                    if _hrrr_warm is not None and _hrrr_warm < _hrrr_threshold:
                         logging.warning(
                             "BandArb warm-NO skip (HRRR veto): %s —"
-                            " HRRR=%.1f°F < ceil+0.5=%.1f°F"
-                            " (HRRR predicts low will drop into band ceiling)",
-                            ticker, _hrrr_warm, _warm_ceil_nws,
+                            " HRRR=%.1f°F < ceil+%.1f°F=%.1f°F"
+                            " (BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F=%.1f)",
+                            ticker, _hrrr_warm,
+                            max(BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F, 0.5),
+                            _hrrr_threshold,
+                            BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F,
                         )
                         continue
 
