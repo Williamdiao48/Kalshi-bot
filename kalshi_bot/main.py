@@ -3875,7 +3875,8 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
         if model_p < _MODEL_SHADOW_MIN_MODEL_P:
             continue
 
-        yes_ask   = mkt.get("yes_ask") or 100
+        yes_ask = mkt.get("yes_ask") or 100
+        yes_bid = mkt.get("yes_bid") or 0
         # Skip early-entry trades where market strongly disagrees (YES still expensive).
         # Backtest: edge ≥ 50pp (yes_ask > ~55) has negative total EV — the 8¢ payout
         # when NO wins doesn't cover the 92¢ loss when YES wins (12.5% of the time).
@@ -3885,7 +3886,9 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
         # At 85¢ NO entry we need >85% WR to break even; trim these near-certain micro-wins.
         if is_high and yes_ask < 15:
             continue
-        market_p_no = (100 - yes_ask) / 100.0
+        # NO ask = 100 - yes_bid (actual cost to buy NO, not the NO bid).
+        # Using yes_ask here (= NO bid) understates entry cost across the spread.
+        market_p_no = (100 - yes_bid) / 100.0
 
         # Minimum EV gate: model_p × win_payout − (1−model_p) × no_cost < 10¢ → skip.
         # Backtest: 379 sub-10¢ EV trades generated only +$6.37 total; 669 trades >10¢ EV
@@ -4060,11 +4063,13 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
             continue
 
         yes_ask = mkt.get("yes_ask") or 100
+        yes_bid = mkt.get("yes_bid") or 0
         if yes_ask > _MODEL_SHADOW_MAX_YES_ASK:
             continue
         if is_high and yes_ask < 15:
             continue
-        market_p_no = (100 - yes_ask) / 100.0
+        # NO ask = 100 - yes_bid (actual cost to buy NO, not the NO bid).
+        market_p_no = (100 - yes_bid) / 100.0
 
         no_price_cents = market_p_no * 100
         model_ev = model_p * (100 - no_price_cents) - (1 - model_p) * no_price_cents
