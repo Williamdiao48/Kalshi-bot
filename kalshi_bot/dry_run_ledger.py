@@ -811,29 +811,6 @@ class DryRunLedger:
             }
         return result
 
-    def recently_entered_tickers(self, cooldown_seconds: int) -> set[str]:
-        """Return tickers where a trade was ENTERED within the last cooldown_seconds.
-
-        Used to prevent the fast loop and main loop from both placing a band_arb
-        trade for the same ticker in the same ~80s window.  Both loops check
-        open_positions_info() before their trades commit, so a ticker that was
-        just entered in the main loop won't appear in fast_held yet.
-        """
-        if cooldown_seconds <= 0:
-            return set()
-        try:
-            rows = self._conn.execute(
-                """
-                SELECT DISTINCT ticker FROM trades
-                WHERE mode = 'dry_run'
-                  AND datetime(logged_at) > datetime('now', ? || ' seconds')
-                """,
-                (f"-{cooldown_seconds}",),
-            ).fetchall()
-            return {row[0] for row in rows}
-        except Exception:
-            return set()
-
     def recently_exited_tickers(self, cooldown_minutes: int) -> set[str]:
         """Return tickers exited via stop_loss or trailing_stop within cooldown_minutes.
 
