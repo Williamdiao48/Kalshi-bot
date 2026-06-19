@@ -171,6 +171,34 @@ async def _fetch_symbol(
     )
 
 
+async def _fetch_daily_closes(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    n_days: int = 6,
+) -> list[float]:
+    """Return the last n_days daily close prices for a symbol (oldest first).
+
+    Used to compute the trailing N-day return for trend gating.
+    Returns an empty list on any error so callers can treat it as unavailable.
+    """
+    url = _BASE_URL.format(symbol=symbol)
+    try:
+        data = await get_with_retry(
+            session, url,
+            params={"interval": "1d", "range": f"{n_days}d"},
+            headers=_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+        closes = (
+            data["chart"]["result"][0]
+            ["indicators"]["quote"][0]
+            ["close"]
+        )
+        return [c for c in closes if c is not None]
+    except Exception:
+        return []
+
+
 def _is_fresh(price: float | None, ts: int | None) -> bool:
     """Return True if this quote is usable (has a price and a recent timestamp).
 
@@ -242,11 +270,12 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
     specific_symbol, ltd = kalshi_active_contract()
     days_to_ltd = (ltd - now_utc.date()).days
 
-    # Fetch specific contract and CL=F concurrently.
-    (price_s, ts_s, state_s, prev_s), (price_clf, ts_clf, state_clf, prev_clf) = (
+    # Fetch specific contract, CL=F, and 6-day daily OHLCV concurrently.
+    (price_s, ts_s, state_s, prev_s), (price_clf, ts_clf, state_clf, prev_clf), daily_closes = (
         await asyncio.gather(
             _fetch_symbol(session, specific_symbol),
             _fetch_symbol(session, "CL=F"),
+            _fetch_daily_closes(session, specific_symbol),
         )
     )
 
@@ -334,6 +363,15 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
         if ts else now_utc.isoformat()
     )
 
+    # Compute 3-day trailing return from daily closes for YES trend gate.
+    # Requires at least 4 closes: close[-4] as base, close[-1] as current.
+    trailing_3d_return: float | None = None
+    if len(daily_closes) >= 4:
+        base = daily_closes[-4]
+        curr = daily_closes[-1]
+        if base and base != 0:
+            trailing_3d_return = (curr - base) / base
+
     if market_state == "CLOSED":
         logging.warning(
             "WTI Futures [%s]: market CLOSED — last close %.2f $/bbl (LTD in %d days)",
@@ -341,9 +379,15 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
         )
     else:
         logging.debug(
-            "WTI Futures [%s]: %.2f $/bbl  state=%s  (Kalshi LTD=%s, %d days)",
+            "WTI Futures [%s]: %.2f $/bbl  state=%s  (Kalshi LTD=%s, %d days)"
+            "  trailing_3d=%.1f%%",
             used_symbol, price, market_state, ltd, days_to_ltd,
+            (trailing_3d_return * 100) if trailing_3d_return is not None else float("nan"),
         )
+
+    metadata: dict = {"symbol": used_symbol, "market_state": market_state, "ltd": str(ltd)}
+    if trailing_3d_return is not None:
+        metadata["trailing_3d_return"] = trailing_3d_return
 
     return [DataPoint(
         source   = "yahoo_wti_futures",
@@ -351,5 +395,5 @@ async def fetch_futures(session: aiohttp.ClientSession) -> list[DataPoint]:
         value    = float(price),
         unit     = "$/bbl",
         as_of    = as_of,
-        metadata = {"symbol": used_symbol, "market_state": market_state, "ltd": str(ltd)},
+        metadata = metadata,
     )]

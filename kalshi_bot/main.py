@@ -718,6 +718,16 @@ RELEASE_WINDOW_MINUTES: int = env_int("RELEASE_WINDOW_MINUTES", 30)
 # Set to 0 to require same-day data; set to 7 to disable the gate.
 EIA_MAX_STALE_DAYS: int = env_int("EIA_MAX_STALE_DAYS", 1)
 
+# WTI YES downtrend gate.  All 5 WTI YES bets Jun 4–18 2026 were losses (0/5,
+# -$3.72 net).  Losses clustered when WTI was down >3.5% over the prior 3 trading
+# days (Jun 12: -3.7%, Jun 15: -5.8%).  The Jun 8 loss (+1.2% 3d return) is
+# intraday noise caught by the edge gate instead.
+# WTI_YES_MAX_3D_RETURN: block YES bets when 3-day trailing return < threshold.
+# WTI_YES_MIN_EDGE:      block YES bets when WTI is within this many $/bbl of the
+#                        strike — Jun 8 loss had edge=$0.73, a $1.50 floor blocks it.
+WTI_YES_MAX_3D_RETURN: float = env_float("WTI_YES_MAX_3D_RETURN", -0.035)
+WTI_YES_MIN_EDGE: float      = env_float("WTI_YES_MIN_EDGE", 1.5)
+
 # FOREX_MAX_STALE_DAYS — Maximum age (calendar days) of ECB/Frankfurter data
 # before it is considered stale.  ECB reference rates publish once per day
 # at ~16:00 CET (~10:00 AM ET).  Kalshi KXEURUSD / KXUSDJPY markets resolve
@@ -1952,6 +1962,50 @@ async def _poll(
                 "Release gate: suppressed %d opportunity(ies) outside %d-min release window.",
                 dropped_rw, RELEASE_WINDOW_MINUTES,
             )
+
+    # ---- WTI YES downtrend gate --------------------------------------------
+    # Block YES bets on KXWTI when WTI is in a 3-day downtrend or the edge is
+    # too thin.  Jun 4–18 2026: 0/5 YES bets won (-$3.72); 16/16 NO bets won
+    # (+$5.05).  Gate is YES-only — NO bets benefit from the downtrend and are
+    # left untouched.
+    _wti_yes_candidates = [
+        o for o in numeric_opps
+        if o.source == "yahoo_wti_futures" and o.implied_outcome == "YES"
+    ]
+    if _wti_yes_candidates:
+        _wti_trailing = next(
+            (
+                dp.metadata.get("trailing_3d_return")
+                for dp in data_points
+                if dp.source == "yahoo_wti_futures"
+                   and isinstance(dp.metadata, dict)
+            ),
+            None,
+        )
+        _wti_passed: list = []
+        for opp in numeric_opps:
+            if opp.source != "yahoo_wti_futures" or opp.implied_outcome != "YES":
+                _wti_passed.append(opp)
+                continue
+            if (
+                _wti_trailing is not None
+                and _wti_trailing < WTI_YES_MAX_3D_RETURN
+            ):
+                logging.warning(
+                    "WTI YES gate (trend): blocked %s — 3d_return=%.1f%% < %.1f%%",
+                    opp.market_ticker,
+                    _wti_trailing * 100,
+                    WTI_YES_MAX_3D_RETURN * 100,
+                )
+                continue
+            if opp.edge < WTI_YES_MIN_EDGE:
+                logging.warning(
+                    "WTI YES gate (edge): blocked %s — edge=%.2f $/bbl < %.2f",
+                    opp.market_ticker, opp.edge, WTI_YES_MIN_EDGE,
+                )
+                continue
+            _wti_passed.append(opp)
+        numeric_opps = _wti_passed
 
     # ---- Crypto daily-close gate -------------------------------------------
     # Daily-close crypto markets resolve at a fixed settlement price (e.g.
