@@ -158,12 +158,14 @@ BAND_ARB_LOW_CEIL_MAX_HOUR: int = env_int("BAND_ARB_LOW_CEIL_MAX_HOUR", 15)
 BAND_ARB_LOW_CEIL_MAX_NO_ASK: int = env_int("BAND_ARB_LOW_CEIL_MAX_NO_ASK", 88)
 # Minimum HRRR clearance above the band ceiling to fire a warm-NO signal.
 # Live data Jun 4–17 2026: HRRR gap 1–2°F → 71% WR (-$0.90 net, negative EV);
-# gap 2–3°F → 86% WR; gap 3–5°F → 93% WR.  The old veto only blocked at
-# band_ceil+0.5 (NWS rounding), far too permissive when HRRR overnight-low
-# errors of 2–4°F are common in summer.  Default 2.0°F targets the positive-EV
-# regime without cutting the high-confidence 2°F+ bucket.
+# gap 2–3°F → 86% WR; gap 3–5°F → 93% WR.
+# Jun 2026 bias calibration (16 days/city vs NWS actuals): NYC LOW bias = +2.49°F
+# (HRRR overestimates overnight lows by 2.49°F on 80% of June days).  At 2.0°F
+# gate an NYC entry with gap=2.0°F has effective margin = 2.0 - 2.49 = -0.49°F
+# (negative EV).  Raised to 3.0°F → effective margin = +0.51°F for NYC.
+# DEN (+4.13°F bias) is blocked entirely via BAND_ARB_LOW_WARM_NO_BLOCK_CITIES.
 BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F: float = env_float(
-    "BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F", 2.0
+    "BAND_ARB_LOW_WARM_HRRR_MIN_GAP_F", 3.0
 )
 # Blocklist of city suffixes that may NOT generate warm-side NO signals.
 # DEN is structurally unreliable (33% WR in backtest — alpine morning cold air
@@ -344,8 +346,13 @@ FORECAST_NO_BLACKLIST_CITIES: frozenset[str] = frozenset(
 # hrrr/nws_hourly backtest at 84-92% win rate with 2-3°F edge; full global
 # 5°F gate was silently killing all their signals before they reached this loop.
 # Sources not listed here fall back to the direction-based threshold below.
+# HRRR raised from 2.5 → 4.0: Jun 2026 bias calibration (16 days/city vs NWS
+# actuals) shows HRRR underestimates summer HIGH in Boston by -3.44°F (87% of
+# days, 0% over-predict) and Seattle by -2.30°F (100% of days).  At 2.5°F gate,
+# Boston effective margin = 2.5 - 3.44 = -0.94°F (negative EV).  At 4.0°F,
+# effective margin = +0.56°F for Boston, +1.70°F for Seattle.
 _FORECAST_NO_SOURCE_MIN_EDGE: dict[str, float] = {
-    "hrrr":              2.5,
+    "hrrr":              4.0,
     "nws_hourly":        3.0,
     "open_meteo_ecmwf":  3.5,
 }
