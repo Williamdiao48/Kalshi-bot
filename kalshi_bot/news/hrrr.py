@@ -36,7 +36,7 @@ from typing import Any
 import aiohttp
 
 from ..data import DataPoint
-from ..cities import CITIES
+from ..cities import CITIES, LOW_CITIES
 from .noaa import _gridpoint_cache, _resolve_gridpoint, _HEADERS
 
 # Local-time daytime window used to identify today's peak temperature from
@@ -45,6 +45,15 @@ from .noaa import _gridpoint_cache, _resolve_gridpoint, _HEADERS
 # lows occur before 8 AM and would be missed by the daytime window).
 _DAY_START_HOUR: int = 8
 _DAY_END_HOUR:   int = 21
+
+
+# Metric → city name lookup for both HIGH and LOW cities.
+# Used to populate DataPoint.metadata["city"] so log_shadow_forecasts()
+# captures HRRR unconditionally (same as nws_hourly, open_meteo, etc.).
+_METRIC_TO_CITY: dict[str, str] = {
+    metric: info[0]
+    for metric, info in {**CITIES, **LOW_CITIES}.items()
+}
 
 
 def to_data_points(
@@ -59,6 +68,7 @@ def to_data_points(
     (metric="temp_low_*") so KXLOWT markets have HRRR as a forecast source for
     the contradiction gate and corroboration check in main.py.
     """
+    forecast_date = as_of[:10]  # YYYY-MM-DD from UTC ISO timestamp
     points = [
         DataPoint(
             source   = "hrrr",
@@ -66,7 +76,10 @@ def to_data_points(
             value    = high_f,
             unit     = "°F",
             as_of    = as_of,
-            metadata = {},
+            metadata = {
+                "city":          _METRIC_TO_CITY.get(metric, ""),
+                "forecast_date": forecast_date,
+            },
         )
         for metric, high_f in hourly_highs.items()
     ]
@@ -78,7 +91,10 @@ def to_data_points(
                 value    = low_f,
                 unit     = "°F",
                 as_of    = as_of,
-                metadata = {},
+                metadata = {
+                    "city":          _METRIC_TO_CITY.get(metric, ""),
+                    "forecast_date": forecast_date,
+                },
             ))
     return points
 
