@@ -29,8 +29,16 @@ from pathlib import Path
 SRC = Path("data/backtest/forecast_no_training_data_kalshi.csv")
 DST = Path("data/backtest/forecast_no_training_data_kalshi_v2.csv")
 
-NEW_FIELDS = ["hrrr_skill_adj", "min_model_vs_ceil", "margin_per_hour_left",
-              "hour_utc_x_is_high"]
+NEW_FIELDS = [
+    "hrrr_skill_adj", "min_model_vs_ceil", "margin_per_hour_left",
+    "hour_utc_x_is_high",
+    # tier-1: pure derivations from existing columns
+    "day_of_year",          # 1-366, more precise than month
+    "is_weekend",           # 0/1
+    "hrrr_gfs_signed_diff", # hrrr_vs_ceil - gfs_vs_ceil (signed disagreement)
+    "all_models_agree_no",  # 1 if hrrr, gfs, consensus all > 0
+    "delta_accel",          # delta_1h - delta_2h (acceleration of cooling)
+]
 
 
 def derive(row: dict) -> dict:
@@ -43,22 +51,45 @@ def derive(row: dict) -> dict:
 
     hrrr_vc    = f("hrrr_vs_ceil")
     gfs_vc     = f("gfs_vs_ceil")
+    cons_vc    = f("consensus_vs_ceil")
     mae_7d     = f("recent_hrrr_mae_7d", default=3.0)
     margin     = f("margin_f")
     hrs_left   = f("hours_to_close")
     hour_utc   = f("hour_utc")
     is_high    = f("is_high")
+    delta_1h   = f("delta_1h")
+    delta_2h   = f("delta_2h")
+    date_str   = row.get("date", "")
 
     hrrr_skill_adj       = round(hrrr_vc / (mae_7d + 0.5), 4)
     min_model_vs_ceil    = round(min(hrrr_vc, gfs_vc), 4)
     margin_per_hour_left = round(margin / (hrs_left + 1), 4)
     hour_utc_x_is_high   = round(hour_utc * is_high, 4)
 
+    # tier-1 features
+    try:
+        from datetime import date as _date
+        d = _date.fromisoformat(date_str)
+        day_of_year = d.timetuple().tm_yday
+        is_weekend  = 1 if d.weekday() >= 5 else 0
+    except (ValueError, AttributeError):
+        day_of_year = 0
+        is_weekend  = 0
+
+    hrrr_gfs_signed_diff = round(hrrr_vc - gfs_vc, 4)
+    all_models_agree_no  = 1 if (hrrr_vc > 0 and gfs_vc > 0 and cons_vc > 0) else 0
+    delta_accel          = round(delta_1h - delta_2h, 4)
+
     return {
         "hrrr_skill_adj":       hrrr_skill_adj,
         "min_model_vs_ceil":    min_model_vs_ceil,
         "margin_per_hour_left": margin_per_hour_left,
         "hour_utc_x_is_high":  hour_utc_x_is_high,
+        "day_of_year":          day_of_year,
+        "is_weekend":           is_weekend,
+        "hrrr_gfs_signed_diff": hrrr_gfs_signed_diff,
+        "all_models_agree_no":  all_models_agree_no,
+        "delta_accel":          delta_accel,
     }
 
 

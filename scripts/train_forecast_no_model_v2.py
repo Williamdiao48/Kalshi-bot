@@ -58,11 +58,22 @@ FEATURES = [
     "city_enc",
     "is_high",
     "month",
-    # ── new v2 alpha features ─────────────────────────────────────────
+    # ── v2 alpha features ─────────────────────────────────────────────
     "hrrr_skill_adj",       # hrrr_vs_ceil / (recent_hrrr_mae_7d + 0.5)
     "min_model_vs_ceil",    # min(hrrr_vs_ceil, gfs_vs_ceil)
     "margin_per_hour_left", # margin_f / (hours_to_close + 1)
-    "hour_utc_x_is_high",  # hour_utc * is_high: hour 22 is risky for HIGH, safe for LOW
+    "hour_utc_x_is_high",  # hour_utc * is_high
+    # ── tier-1 derivations (from existing columns) ────────────────────
+    "day_of_year",          # 1-366, more precise seasonal signal than month
+    "is_weekend",           # 0/1
+    "hrrr_gfs_signed_diff", # hrrr_vs_ceil - gfs_vs_ceil (direction of disagreement)
+    "all_models_agree_no",  # 1 if hrrr, gfs, consensus all > 0
+    "delta_accel",          # delta_1h - delta_2h (is cooling accelerating?)
+    # ── tier-2 cache-enriched features ───────────────────────────────
+    "delta_3h",             # running_obs(h) - running_obs(h-3)
+    "delta_6h",             # running_obs(h) - running_obs(h-6)
+    "max_margin_today",     # highest margin seen so far today
+    "hours_since_peak",     # hours since intraday running_obs peak
 ]
 
 CATEGORICAL_FEATURES = ["city_enc"]
@@ -104,13 +115,15 @@ def load_data(high_only: bool, low_only: bool):
             margin = f(r, "margin_f")
             hrs    = f(r, "hours_to_close")
             city   = float(city_map.get(r.get("city", ""), 0))
+            d1h    = f(r, "delta_1h")
+            d2h    = f(r, "delta_2h")
 
             hour_utc  = f(r, "hour_utc")
             is_high_v = f(r, "is_high")
             X_list.append([
                 margin,
-                f(r, "delta_1h"),
-                f(r, "delta_2h"),
+                d1h,
+                d2h,
                 f(r, "hours_above_ceil", 1.0),
                 hour_utc,
                 hrs,
@@ -128,11 +141,22 @@ def load_data(high_only: bool, low_only: bool):
                 city,
                 is_high_v,
                 f(r, "month"),
-                # v2 features — fall back to derived values if missing from CSV
+                # v2 alpha — fall back to derived values if missing from CSV
                 f(r, "hrrr_skill_adj",       hrrr / (mae + 0.5)),
                 f(r, "min_model_vs_ceil",     min(hrrr, gfs)),
                 f(r, "margin_per_hour_left",  margin / (hrs + 1)),
                 f(r, "hour_utc_x_is_high",    hour_utc * is_high_v),
+                # tier-1 derivations — fall back if missing
+                f(r, "day_of_year",           0.0),
+                f(r, "is_weekend",            0.0),
+                f(r, "hrrr_gfs_signed_diff",  hrrr - gfs),
+                f(r, "all_models_agree_no",   1.0 if (hrrr > 0 and gfs > 0 and cons > 0) else 0.0),
+                f(r, "delta_accel",           d1h - d2h),
+                # tier-2 cache-enriched — fall back to proxies if missing
+                f(r, "delta_3h",              d2h),
+                f(r, "delta_6h",              d2h),
+                f(r, "max_margin_today",      margin),
+                f(r, "hours_since_peak",      0.0),
             ])
             y_list.append(int(r["won"]))
             dates.append(r["date"])

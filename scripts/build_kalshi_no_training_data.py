@@ -89,6 +89,11 @@ CSV_FIELDS = [
     "clim_prob_exceed",   # P(further_drop > margin_f | city, month, hour) from 4yr METAR history
     "clim_drop_p50",      # median expected additional cooling for this city/month/hour
     "clim_drop_p75",      # 75th pct additional cooling
+    # cache-enriched features (tier 2)
+    "delta_3h",           # running_obs(h) - running_obs(h-3)
+    "delta_6h",           # running_obs(h) - running_obs(h-6)
+    "max_margin_today",   # highest margin seen so far today up to hour h
+    "hours_since_peak",   # hours since intraday running_obs peak
     "won",
 ]
 
@@ -398,10 +403,22 @@ def build_rows(
                 if cur is not None:
                     running[h] = cur
 
-            # Track consecutive hours above ceiling
+            # Track consecutive hours above ceiling and intraday peak
             hours_above_counter = 0
+            peak_obs     = None  # highest running_obs seen so far today
+            peak_hour    = None  # hour at which peak was reached
 
             for h in HOURS:
+                # Update intraday peak before the margin check so peak tracks
+                # the running obs regardless of whether signal is active.
+                obs_h = hourly_obs.get(h)
+                if obs_h is not None:
+                    running_h = running.get(h)
+                    if running_h is not None:
+                        if peak_obs is None or running_h > peak_obs:
+                            peak_obs  = running_h
+                            peak_hour = h
+
                 if h not in running:
                     hours_above_counter = 0
                     continue
@@ -417,8 +434,15 @@ def build_rows(
 
                 r_prev1 = running.get(h - 1)
                 r_prev2 = running.get(h - 2)
+                r_prev3 = running.get(h - 3)
+                r_prev6 = running.get(h - 6)
                 delta_1h = round(running_obs - r_prev1, 2) if r_prev1 is not None else 0.0
                 delta_2h = round(running_obs - r_prev2, 2) if r_prev2 is not None else 0.0
+                delta_3h = round(running_obs - r_prev3, 2) if r_prev3 is not None else delta_2h
+                delta_6h = round(running_obs - r_prev6, 2) if r_prev6 is not None else delta_3h
+
+                max_margin_today = round((peak_obs - band_ceil), 2) if peak_obs is not None else margin_f
+                hours_since_peak = (h - peak_hour) if peak_hour is not None else 0
 
                 hrrr_h_fc    = hrrr_hourly.get(h)
                 gfs_h_fc     = gfs_hourly.get(h)
@@ -452,6 +476,10 @@ def build_rows(
                     "clim_prob_exceed":    prob_ex,
                     "clim_drop_p50":       dp50,
                     "clim_drop_p75":       dp75,
+                    "delta_3h":            delta_3h,
+                    "delta_6h":            delta_6h,
+                    "max_margin_today":    max_margin_today,
+                    "hours_since_peak":    hours_since_peak,
                     "won":               won,
                 })
 
