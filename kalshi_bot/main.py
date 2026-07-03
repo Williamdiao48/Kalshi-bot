@@ -20,6 +20,7 @@ import asyncio
 import collections
 from datetime import datetime, timezone, timedelta, date
 import logging
+import logging.handlers
 import os
 from .utils import env_float, env_int, parse_iso_dt
 from pathlib import Path
@@ -74,7 +75,9 @@ from .weather_filter import (
 
 _LOG_DIR = Path(__file__).parent.parent / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
-_log_handler = logging.FileHandler(_LOG_DIR / "bot.log")
+_log_handler = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "bot.log", maxBytes=50 * 1024 * 1024, backupCount=2
+)
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S"))
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
