@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta, date
 import logging
 import logging.handlers
 import os
+import sys
 from .utils import env_float, env_int, parse_iso_dt
 from pathlib import Path
 import time
@@ -85,6 +86,31 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(), _log_handler],
 )
+
+# ---------------------------------------------------------------------------
+# Quiet console mode (CYCLE_ONLY=true): the terminal shows only the per-cycle
+# "done" line; everything else is suppressed on screen but still written in full
+# to logs/bot.log.  Useful when running under a bare terminal where the
+# per-opportunity reports and status logs are just noise.
+# ---------------------------------------------------------------------------
+_CYCLE_DONE_MSG = "— cycle #%d done — next poll in %ds —"
+_CYCLE_ONLY = os.environ.get("CYCLE_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+if _CYCLE_ONLY:
+    class _CycleOnlyFilter(logging.Filter):
+        """Let only the per-cycle summary line reach the console handler."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            return record.msg == _CYCLE_DONE_MSG
+
+    for _h in logging.getLogger().handlers:
+        # Console stream only; the RotatingFileHandler (a FileHandler) keeps everything.
+        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+            _h.addFilter(_CycleOnlyFilter())
+
+    # Per-opportunity reports are print()ed to stdout; silence stdout while leaving
+    # the logging stream (stderr) intact so the cycle line still shows.
+    sys.stdout = open(os.devnull, "w")
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables
@@ -4381,7 +4407,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                         logging.error("Win-rate tracker error: %s", exc)
 
                 _sleep = _adaptive_poll_interval(datetime.now(timezone.utc))
-                logging.info("— cycle #%d done — next poll in %ds —", cycle, _sleep)
+                logging.info(_CYCLE_DONE_MSG, cycle, _sleep)
                 # Interleave fast band-arb loops during the sleep window
                 _elapsed = 0.0
                 while _elapsed + FAST_LOOP_INTERVAL < _sleep:
