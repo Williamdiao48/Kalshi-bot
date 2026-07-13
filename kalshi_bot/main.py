@@ -18,6 +18,7 @@ Results are deduplicated, matched against markets, and printed to stdout.
 
 import asyncio
 import collections
+from collections.abc import Callable
 from datetime import datetime, timezone, timedelta, date
 import logging
 import logging.handlers
@@ -145,6 +146,9 @@ POLL_BAND_ARB_END_ET_HOUR:   int = env_int("POLL_BAND_ARB_END_ET_HOUR", 21)
 # FAST_LOOP_INTERVAL: seconds between fast loop iterations during the sleep window.
 WATCH_THRESHOLD_F: float = env_float("WATCH_THRESHOLD_F", 3.0)
 FAST_LOOP_INTERVAL: float = env_float("FAST_LOOP_INTERVAL", 10.0)
+# Concurrency for the fast loop's per-series price refresh.  Serial fetching put the
+# loop over its interval budget; keep this modest to stay within Kalshi rate limits.
+FAST_LOOP_FETCH_CONCURRENCY: int = env_int("FAST_LOOP_FETCH_CONCURRENCY", 4)
 
 # Position watcher: tight NWS ASOS poll loop for open band_arb YES positions.
 # Bypasses the 4-minute ASOS cache and fetches fresh per-station data every
@@ -336,6 +340,17 @@ def _load_model_shadow() -> None:
     )
 
 
+def _next_day(day: str) -> str:
+    """'2026-07-13' → '2026-07-14'.
+
+    Used to turn a `date(logged_at) = ?` filter into a sargable half-open range
+    `logged_at >= day AND logged_at < _next_day(day)`.  logged_at is stored as an
+    ISO-8601 string, which sorts lexicographically, so the range selects exactly
+    the same rows the date() call did — but can use an index instead of scanning.
+    """
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+
+
 def _refresh_gfs_morning_snap(conn) -> None:
     """Query DB for the first open_meteo_gfs value per metric logged today (UTC).
 
@@ -349,6 +364,8 @@ def _refresh_gfs_morning_snap(conn) -> None:
     if _gfs_morning_snap_date == today and _gfs_morning_snap:
         return
     try:
+        # Sargable [today, tomorrow) range — see _next_day() and the note in
+        # _model_shadow_features: date(logged_at) = ? cannot use an index.
         rows = conn.execute("""
             SELECT rf.metric, rf.data_value
             FROM raw_forecasts rf
@@ -357,11 +374,11 @@ def _refresh_gfs_morning_snap(conn) -> None:
                 FROM raw_forecasts
                 WHERE source = 'open_meteo_gfs'
                   AND (metric LIKE 'temp_high_%' OR metric LIKE 'temp_low_%')
-                  AND date(logged_at) = ?
+                  AND logged_at >= ? AND logged_at < ?
                 GROUP BY metric
             ) fv ON rf.metric = fv.metric AND rf.logged_at = fv.first_at
             WHERE rf.source = 'open_meteo_gfs'
-        """, (today,)).fetchall()
+        """, (today, _next_day(today))).fetchall()
         if rows:
             _gfs_morning_snap = {metric: val for metric, val in rows}
             _gfs_morning_snap_date = today
@@ -909,6 +926,102 @@ _numeric_cache_ts: float = 0.0
 _general_cache: list[dict] = []
 _general_cache_ts: float = 0.0
 
+# ---------------------------------------------------------------------------
+# Ticker-keyed snapshot of the open-market list.
+#
+# Safety invariant (same contract as _update_fast_loop_cache above): the only
+# writer is _update_market_snapshot(), a synchronous function with no await
+# points, so under CPython's single-threaded event loop a reader observes either
+# the previous complete snapshot or the new one — never a half-built dict.
+#
+# Semantics that callers depend on:
+#   - Every market in the snapshot has status="open" (every fetch path passes
+#     status="open"), so a settled market is *absent* by construction.  This is
+#     what lets "absent from a fresh snapshot" stand in for "closed".
+#   - _numeric_cache is stale-on-failure (never emptied when a fetch fails), so
+#     a ticker can also be absent simply because the fetch broke.  _snapshot_usable()
+#     is the guard: when the snapshot is empty or stale we refuse to infer
+#     "closed" at all and fall back to fetching.
+# ---------------------------------------------------------------------------
+
+_market_by_ticker: dict[str, dict] = {}
+_market_by_ticker_ts: float = 0.0        # time.monotonic(); 0.0 = never populated
+_market_close_epoch: dict[str, float] = {}   # ticker → last-seen close_time (epoch secs)
+
+# ticker → open-market dict (or None).  Lets the PT checks serve the fast loop,
+# the poll loop, and the settlement resolver from one implementation.
+MarketLookup = Callable[[str], "dict | None"]
+
+# Snapshot older than this is not trusted for closed-inference.
+MARKET_SNAPSHOT_MAX_AGE_S: float = env_float("MARKET_SNAPSHOT_MAX_AGE_S", 300.0)
+# Parallelism for the once-per-cycle shadow settlement fetches.
+SHADOW_SETTLE_CONCURRENCY: int = env_int("SHADOW_SETTLE_CONCURRENCY", 8)
+
+# refresh_forecast_bias() costs ~115s; it aggregates historical settled data and
+# barely changes minute to minute.  Run it at most this often.
+FORECAST_BIAS_REFRESH_S: float = env_float("FORECAST_BIAS_REFRESH_S", 900.0)
+_last_bias_refresh: float = 0.0   # time.monotonic(); 0.0 = never run
+
+
+def _update_market_snapshot(markets: list[dict]) -> None:
+    """Rebuild the ticker→market snapshot from the open-market list.
+
+    Synchronous with no await points — see the safety invariant above.  Callers
+    must pass the *unfiltered* market list: a market dropped by
+    _filter_by_close_time (e.g. inside MARKET_MIN_MINUTES_TO_CLOSE of closing)
+    is still open, and omitting it would make it look settled.
+    """
+    global _market_by_ticker, _market_by_ticker_ts
+
+    snap: dict[str, dict] = {}
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        ticker = m.get("ticker")
+        if not ticker:
+            continue
+        snap[ticker] = m
+        ct = m.get("close_time") or m.get("expiration_time")
+        if ct:
+            try:
+                _market_close_epoch[ticker] = parse_iso_dt(ct).timestamp()
+            except (ValueError, AttributeError):
+                pass
+
+    _market_by_ticker = snap                 # atomic rebind
+    _market_by_ticker_ts = time.monotonic()
+
+
+def _snapshot_usable() -> bool:
+    """True when the snapshot is non-empty and fresh enough to trust for absence."""
+    return bool(_market_by_ticker) and (
+        time.monotonic() - _market_by_ticker_ts < MARKET_SNAPSHOT_MAX_AGE_S
+    )
+
+
+def _cached_market(ticker: str) -> dict | None:
+    """Open-market dict for ``ticker``, or None if absent/snapshot unusable."""
+    if not _snapshot_usable():
+        return None
+    return _market_by_ticker.get(ticker)
+
+
+def _is_open_in_snapshot(ticker: str) -> bool | None:
+    """True = open, False = probably closed, None = cannot tell (snapshot unusable)."""
+    if not _snapshot_usable():
+        return None
+    return ticker in _market_by_ticker
+
+
+def _prune_market_close_epoch(max_age_hours: float = 48.0) -> None:
+    """Drop close-time entries well past their close so the dict cannot grow forever."""
+    cutoff = datetime.now(timezone.utc).timestamp() - max_age_hours * 3600
+    stale = [t for t, ts in _market_close_epoch.items() if ts < cutoff]
+    for t in stale:
+        del _market_close_epoch[t]
+    if stale:
+        logging.debug("Pruned %d stale close-time entries.", len(stale))
+
 
 async def _get_markets(session: aiohttp.ClientSession) -> list[dict]:
     """Return the combined market list, with split-interval refresh.
@@ -1400,6 +1513,11 @@ async def _poll(
         logging.error("Failed to fetch markets: %s", markets_result)
         return
     markets: list[dict] = markets_result  # type: ignore[assignment]
+
+    # Snapshot BEFORE the close-time filter below: a market inside
+    # MARKET_MIN_MINUTES_TO_CLOSE is still open, and dropping it here would make
+    # the shadow settler mistake it for closed.  Sync call, no awaits in between.
+    _update_market_snapshot(markets)
 
     # ---- portfolio positions -----------------------------------------------
     if isinstance(positions_result, Exception):
@@ -2797,7 +2915,18 @@ async def _poll(
         and dp.metric.startswith(("temp_high", "temp_low"))
     }
     _refresh_gfs_morning_snap(opp_log._conn)
-    refresh_forecast_bias(opp_log._conn)
+
+    # refresh_forecast_bias() is a synchronous ~115s aggregation over historical
+    # settled data.  Called bare on every cycle it stalled the whole event loop —
+    # including _position_watcher, the 5s ceiling-breach force-exit loop.  Gate it
+    # (the bias map barely moves minute to minute) and run it in a worker thread
+    # so nothing else is blocked while it does run.  The SQLite conn is opened with
+    # check_same_thread=False (db.py:18), so off-thread use is safe.
+    global _last_bias_refresh
+    _now_mono = time.monotonic()
+    if _last_bias_refresh == 0.0 or _now_mono - _last_bias_refresh >= FORECAST_BIAS_REFRESH_S:
+        await asyncio.to_thread(refresh_forecast_bias, opp_log._conn)
+        _last_bias_refresh = _now_mono
     if _band_arb_obs_early:
         _early_band_arb_signals = find_band_arbs(
             markets,
@@ -3113,6 +3242,14 @@ async def _poll(
             "Fast-loop watchlist: %d near-threshold city(ies): %s",
             len(_near_threshold), sorted(_near_threshold),
         )
+
+    # ---- shadow profit-take safety net -------------------------------------
+    # The fast loop only PT-checks cities on the watchlist, so a position whose
+    # city drifts off it would otherwise go unchecked until settlement.  Run the
+    # same PT checks here against the full open-market snapshot: every open
+    # position gets covered once per cycle, for zero extra HTTP.
+    _check_yes_momentum_pt(opp_log._conn, market_for=_cached_market)
+    _check_forecast_band_yes_pt(opp_log._conn, market_for=_cached_market)
 
 
 # ---------------------------------------------------------------------------
@@ -3443,14 +3580,22 @@ async def _fast_loop(
     if not series_to_fetch:
         return
 
-    fresh_markets: list[dict] = []
-    for series in series_to_fetch:
-        try:
-            batch = await fetch_markets_by_series(session, [series], status="open")
-            fresh_markets.extend(batch)
-            await asyncio.sleep(0.2)
-        except Exception as exc:
-            logging.debug("Fast loop: series fetch failed %s: %s", series, exc)
+    # Fetch the watchlist series concurrently.  Serially this cost ~1.5s per series
+    # (HTTP + fetch_markets_by_series' own 0.4s pause + a 0.2s pause here), which put
+    # the whole fast loop over its 10s budget on a normal-sized watchlist.  Bounded
+    # by a semaphore so we stay inside Kalshi's rate limits.
+    _series_sem = asyncio.Semaphore(FAST_LOOP_FETCH_CONCURRENCY)
+
+    async def _fetch_series(series: str) -> list[dict]:
+        async with _series_sem:
+            try:
+                return await fetch_markets_by_series(session, [series], status="open")
+            except Exception as exc:
+                logging.debug("Fast loop: series fetch failed %s: %s", series, exc)
+                return []
+
+    _batches = await asyncio.gather(*[_fetch_series(s) for s in series_to_fetch])
+    fresh_markets: list[dict] = [m for batch in _batches for m in batch]
 
     if not fresh_markets:
         return
@@ -3538,14 +3683,27 @@ async def _fast_loop(
                 ledger.request_force_exit(signal.ticker, "band_arb_obs_contra")
         await executor.maybe_trade_band_arb(session, signal)
 
-    await _settle_shadow_band_arbs(conn=executor._conn, session=session)
-    await _track_shadow_forecast_band_yes(conn=executor._conn, session=session)
+    # Shadow entry loggers — synchronous, zero HTTP.  These deliberately keep
+    # using fresh_markets (the near-threshold watchlist): widening their universe
+    # to every open market would change which positions get opened, which is a
+    # strategy change, not a perf fix.
     _update_yes_momentum_shadows(conn=executor._conn, markets=fresh_markets)
-    await _check_yes_momentum_exits(conn=executor._conn, markets=fresh_markets, session=session)
     _update_model_shadow_no(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
-    await _settle_model_shadow_no(conn=executor._conn, session=session)
     _update_model_shadow_no_v2(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
-    await _settle_model_shadow_no_v2(conn=executor._conn, session=session)
+
+    # Profit-take checks — synchronous, zero HTTP.  Prefer the 10s watchlist price
+    # when we have one, else fall back to the poll-cycle snapshot so positions off
+    # the watchlist still get checked.  Settlement is handled once per poll cycle
+    # by _resolve_shadow_settlements(), not here.
+    _fresh_by_ticker = {
+        m["ticker"]: m for m in fresh_markets if isinstance(m, dict) and m.get("ticker")
+    }
+
+    def _pt_lookup(ticker: str) -> dict | None:
+        return _fresh_by_ticker.get(ticker) or _cached_market(ticker)
+
+    _check_yes_momentum_pt(conn=executor._conn, market_for=_pt_lookup)
+    _check_forecast_band_yes_pt(conn=executor._conn, market_for=_pt_lookup)
 
 
 async def _position_watcher(
@@ -3682,62 +3840,63 @@ def _update_yes_momentum_shadows(conn, markets: list[dict]) -> None:
         )
 
 
-async def _check_yes_momentum_exits(
-    conn,
-    markets: list[dict],
-    session: "aiohttp.ClientSession",
-) -> None:
-    """Check open shadow_yes_momentum rows for PT or settlement, and record exits."""
-    from .markets import KALSHI_API_BASE
+def _check_yes_momentum_pt(conn, market_for: "MarketLookup") -> None:
+    """Profit-take half of the old _check_yes_momentum_exits: zero HTTP.
 
+    Prices come from ``market_for`` (the open-market snapshot, optionally
+    overlaid with fresher watchlist prices) rather than a per-row API call.
+    Runs on every fast-loop iteration AND once per poll cycle, so a position
+    keeps getting PT-checked even after its city drops off the watchlist.
+    """
     rows = conn.execute(
         "SELECT id, ticker, entry_bid, contracts, pt_target FROM shadow_yes_momentum WHERE exit_reason IS NULL"
     ).fetchall()
     if not rows:
         return
 
-    prices = {m["ticker"]: m for m in markets if isinstance(m, dict)}
     now_utc = datetime.now(timezone.utc).isoformat()
 
     for row_id, ticker, entry_bid, contracts, pt_target in rows:
-        # PT check via current poll-cycle price
-        mkt_price = prices.get(ticker)
-        if mkt_price:
-            yes_bid = mkt_price.get("yes_bid") or 0
-            if yes_bid >= pt_target:
-                pnl = float((yes_bid - entry_bid) * contracts)
-                conn.execute(
-                    """UPDATE shadow_yes_momentum
-                       SET exit_reason='profit_take', exited_at=?, outcome='won', pnl_cents=?
-                       WHERE id=?""",
-                    (now_utc, pnl, row_id),
-                )
-                logging.info(
-                    "[shadow_yes_mom] PT %s  bid=%d¢  pnl=%+.0f¢ ($%+.2f)",
-                    ticker, yes_bid, pnl, pnl / 100,
-                )
-                continue
+        mkt_price = market_for(ticker)
+        if not mkt_price:
+            continue
+        yes_bid = mkt_price.get("yes_bid") or 0
+        if yes_bid >= pt_target:
+            pnl = float((yes_bid - entry_bid) * contracts)
+            conn.execute(
+                """UPDATE shadow_yes_momentum
+                   SET exit_reason='profit_take', exited_at=?, outcome='won', pnl_cents=?
+                   WHERE id=?""",
+                (now_utc, pnl, row_id),
+            )
+            logging.info(
+                "[shadow_yes_mom] PT %s  bid=%d¢  pnl=%+.0f¢ ($%+.2f)",
+                ticker, yes_bid, pnl, pnl / 100,
+            )
 
-        # Settlement check
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets/{ticker}",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-        except Exception:
-            continue
-        mkt = data.get("market", data)
-        if mkt.get("status") not in ("settled", "finalized"):
-            continue
-        result = mkt.get("result")
-        if result not in ("yes", "no"):
-            continue
-        settle_val = 100 if result == "yes" else 0
+
+def _apply_settle_yes_momentum(conn, ticker: str, mkt: dict) -> None:
+    """Settlement half of the old _check_yes_momentum_exits, on an already-fetched market."""
+    if mkt.get("status") not in ("settled", "finalized"):
+        return
+    result = mkt.get("result")
+    if result not in ("yes", "no"):
+        return
+
+    rows = conn.execute(
+        "SELECT id, entry_bid, contracts FROM shadow_yes_momentum "
+        "WHERE ticker = ? AND exit_reason IS NULL",
+        (ticker,),
+    ).fetchall()
+    if not rows:
+        return
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    settle_val = 100 if result == "yes" else 0
+    outcome = "won" if result == "yes" else "lost"
+
+    for row_id, entry_bid, contracts in rows:
         pnl = float((settle_val - entry_bid) * contracts)
-        outcome = "won" if result == "yes" else "lost"
         conn.execute(
             """UPDATE shadow_yes_momentum
                SET exit_reason='settled', exited_at=?, outcome=?, pnl_cents=?
@@ -3787,15 +3946,19 @@ def _model_shadow_features(
     direction = "high" if is_high else "low"
     today     = datetime.now(timezone.utc).date().isoformat()
 
-    # Forecasts from DB
+    # Forecasts from DB.
+    # Half-open [today, tomorrow) range rather than date(logged_at)=?: wrapping the
+    # column in date() makes the predicate non-sargable, which forced a full scan of
+    # ~9M raw_forecasts rows (~9s) on every call — and this runs once per candidate
+    # market, per fast-loop iteration.  The range form uses idx_raw_forecasts_metric_logged.
     fc_rows = conn.execute("""
         SELECT source, AVG(data_value)
         FROM raw_forecasts
-        WHERE metric=? AND date(logged_at)=?
+        WHERE metric=? AND logged_at >= ? AND logged_at < ?
           AND source IN ('hrrr','open_meteo_gfs','open_meteo_ecmwf','open_meteo_gem','open_meteo_icon')
           AND data_value IS NOT NULL
         GROUP BY source
-    """, (metric, today)).fetchall()
+    """, (metric, today, _next_day(today))).fetchall()
     fc = {s: v for s, v in fc_rows}
     if not fc:
         return None
@@ -4013,40 +4176,24 @@ def _update_model_shadow_no(conn, markets: list[dict], obs_values: dict[str, flo
             pass   # unique index violation = already open; ignore
 
 
-async def _settle_model_shadow_no(conn, session: "aiohttp.ClientSession") -> None:
-    """Resolve open shadow_model_no rows once markets finalize."""
-    from .markets import KALSHI_API_BASE
+def _apply_settle_model_shadow_no(conn, ticker: str, mkt: dict) -> None:
+    """Resolve open shadow_model_no rows for ``ticker`` from an already-fetched market."""
+    status = mkt.get("status", "")
+    result = mkt.get("result", "")
+    if status not in ("settled", "finalized") or result not in ("yes", "no"):
+        return
+
     rows = conn.execute(
-        "SELECT id, ticker FROM shadow_model_no WHERE exit_reason IS NULL"
+        "SELECT id, market_p_no FROM shadow_model_no WHERE ticker = ? AND exit_reason IS NULL",
+        (ticker,),
     ).fetchall()
     if not rows:
         return
-    for row_id, ticker in rows:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets/{ticker}",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-        except Exception:
-            continue
-        mkt    = data.get("market", data)
-        status = mkt.get("status", "")
-        result = mkt.get("result", "")
-        if status not in ("settled", "finalized") or result not in ("yes", "no"):
-            continue
-        outcome   = "won" if result == "no" else "lost"  # we're always on the NO side
-        yes_price = mkt.get("yes_ask") or (100 if result == "yes" else 0)
-        no_price  = 100 - yes_price
-        pnl       = no_price - 0   # shadow: 1 contract, no_price cents profit if won, else -no_entry_cost
-        # Simpler: pnl = (100 - entry_no_price) if won else -entry_no_price
-        # We stored market_p_no at entry; reconstruct entry no price
-        entry_row = conn.execute(
-            "SELECT market_p_no FROM shadow_model_no WHERE id=?", (row_id,)
-        ).fetchone()
-        entry_no_p = round((entry_row[0] * 100)) if entry_row else 50
+
+    outcome = "won" if result == "no" else "lost"  # we're always on the NO side
+    for row_id, market_p_no in rows:
+        # Reconstruct the entry NO price from the market_p_no stored at entry.
+        entry_no_p = round(market_p_no * 100) if market_p_no is not None else 50
         pnl = (100 - entry_no_p) if outcome == "won" else -entry_no_p
         conn.execute("""
             UPDATE shadow_model_no
@@ -4198,35 +4345,23 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
             pass
 
 
-async def _settle_model_shadow_no_v2(conn, session: "aiohttp.ClientSession") -> None:
-    """Resolve open shadow_model_no_v2 rows once markets finalize."""
-    from .markets import KALSHI_API_BASE
+def _apply_settle_model_shadow_no_v2(conn, ticker: str, mkt: dict) -> None:
+    """Resolve open shadow_model_no_v2 rows for ``ticker`` from an already-fetched market."""
+    status = mkt.get("status", "")
+    result = mkt.get("result", "")
+    if status not in ("settled", "finalized") or result not in ("yes", "no"):
+        return
+
     rows = conn.execute(
-        "SELECT id, ticker FROM shadow_model_no_v2 WHERE exit_reason IS NULL"
+        "SELECT id, market_p_no FROM shadow_model_no_v2 WHERE ticker = ? AND exit_reason IS NULL",
+        (ticker,),
     ).fetchall()
     if not rows:
         return
-    for row_id, ticker in rows:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets/{ticker}",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-        except Exception:
-            continue
-        mkt    = data.get("market", data)
-        status = mkt.get("status", "")
-        result = mkt.get("result", "")
-        if status not in ("settled", "finalized") or result not in ("yes", "no"):
-            continue
-        outcome = "won" if result == "no" else "lost"
-        entry_row = conn.execute(
-            "SELECT market_p_no FROM shadow_model_no_v2 WHERE id=?", (row_id,)
-        ).fetchone()
-        entry_no_p = round(entry_row[0] * 100) if entry_row else 50
+
+    outcome = "won" if result == "no" else "lost"
+    for row_id, market_p_no in rows:
+        entry_no_p = round(market_p_no * 100) if market_p_no is not None else 50
         pnl = (100 - entry_no_p) if outcome == "won" else -entry_no_p
         conn.execute("""
             UPDATE shadow_model_no_v2
@@ -4239,30 +4374,22 @@ async def _settle_model_shadow_no_v2(conn, session: "aiohttp.ClientSession") -> 
         )
 
 
-async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> None:
-    """Check open shadow_band_arb rows against live market data and record outcome."""
-    from .markets import KALSHI_API_BASE
+def _apply_settle_shadow_band_arb(conn, ticker: str, mkt: dict) -> None:
+    """Resolve open shadow_band_arb rows for ``ticker`` from an already-fetched market."""
+    status = mkt.get("status", "")
+    result = mkt.get("result", "")
+    if status not in ("settled", "finalized") or result not in ("yes", "no"):
+        return
+
     rows = conn.execute(
-        "SELECT id, ticker, side, limit_price, contracts FROM shadow_band_arb WHERE outcome IS NULL"
+        "SELECT id, side, limit_price, contracts FROM shadow_band_arb "
+        "WHERE ticker = ? AND outcome IS NULL",
+        (ticker,),
     ).fetchall()
     if not rows:
         return
-    for row_id, ticker, side, limit_price, contracts in rows:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets/{ticker}",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-        except Exception:
-            continue
-        mkt = data.get("market", data)
-        status = mkt.get("status", "")
-        result = mkt.get("result", "")
-        if status not in ("settled", "finalized") or result not in ("yes", "no"):
-            continue
+
+    for row_id, side, limit_price, contracts in rows:
         outcome = "won" if result == side else "lost"
         if outcome == "won":
             pnl = (100 - limit_price) * contracts
@@ -4278,60 +4405,183 @@ async def _settle_shadow_band_arbs(conn, session: "aiohttp.ClientSession") -> No
         )
 
 
-async def _track_shadow_forecast_band_yes(conn, session: "aiohttp.ClientSession") -> None:
-    """Update open shadow_forecast_band_yes rows with PT hits and settlement outcomes.
+def _check_forecast_band_yes_pt(conn, market_for: "MarketLookup") -> None:
+    """PT half of the old _track_shadow_forecast_band_yes: stamp pt_hit_at when YES bid >= 70¢.
 
-    For each open row (outcome IS NULL):
-    - If market settled: record outcome (won/lost) and pnl_cents.
-    - If not yet settled: check if current YES bid >= 70¢ and record pt_hit_at.
+    Zero HTTP — prices come from ``market_for``.  pt_hit_at is a latch ("did the
+    price ever touch 70¢"), so this must keep running on every fast-loop
+    iteration rather than being batched.
     """
-    from .markets import KALSHI_API_BASE
     rows = conn.execute(
-        "SELECT id, ticker, yes_ask FROM shadow_forecast_band_yes WHERE outcome IS NULL"
+        "SELECT id, ticker, yes_ask FROM shadow_forecast_band_yes "
+        "WHERE outcome IS NULL AND pt_hit_at IS NULL"
     ).fetchall()
     if not rows:
         return
+
     now_utc = datetime.now(timezone.utc).isoformat()
     for row_id, ticker, yes_ask in rows:
-        try:
-            async with session.get(
-                f"{KALSHI_API_BASE}/markets/{ticker}",
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
-        except Exception:
+        mkt = market_for(ticker)
+        if not mkt:
             continue
-        mkt = data.get("market", data)
-        status = mkt.get("status", "")
-        result = mkt.get("result", "")
-        if status in ("settled", "finalized") and result in ("yes", "no"):
-            outcome = "won" if result == "yes" else "lost"
-            pnl = (100 - yes_ask) if outcome == "won" else -yes_ask
+        yes_bid = mkt.get("yes_bid") or 0
+        if yes_bid >= 70:
             conn.execute(
-                "UPDATE shadow_forecast_band_yes SET outcome = ?, pnl_cents = ? WHERE id = ?",
-                (outcome, pnl, row_id),
+                "UPDATE shadow_forecast_band_yes SET pt_hit_at = ? WHERE id = ?",
+                (now_utc, row_id),
             )
             logging.info(
-                "ForecastBandYES shadow settled: %s → %s  pnl=%.0f¢ ($%.2f)",
-                ticker, outcome.upper(), pnl, pnl / 100,
+                "ForecastBandYES shadow PT hit: %s  yes_bid=%d¢  entry=%d¢  profit=%.0f¢",
+                ticker, yes_bid, yes_ask, yes_bid - yes_ask,
             )
-        else:
-            yes_bid = mkt.get("yes_bid", 0)
-            if yes_bid >= 70:
-                existing_pt = conn.execute(
-                    "SELECT pt_hit_at FROM shadow_forecast_band_yes WHERE id = ?", (row_id,)
-                ).fetchone()
-                if existing_pt and existing_pt[0] is None:
-                    conn.execute(
-                        "UPDATE shadow_forecast_band_yes SET pt_hit_at = ? WHERE id = ?",
-                        (now_utc, row_id),
-                    )
-                    logging.info(
-                        "ForecastBandYES shadow PT hit: %s  yes_bid=%d¢  entry=%d¢  profit=%.0f¢",
-                        ticker, yes_bid, yes_ask, yes_bid - yes_ask,
-                    )
+
+
+def _apply_settle_forecast_band_yes(conn, ticker: str, mkt: dict) -> None:
+    """Settlement half of the old _track_shadow_forecast_band_yes."""
+    status = mkt.get("status", "")
+    result = mkt.get("result", "")
+    if status not in ("settled", "finalized") or result not in ("yes", "no"):
+        return
+
+    rows = conn.execute(
+        "SELECT id, yes_ask FROM shadow_forecast_band_yes WHERE ticker = ? AND outcome IS NULL",
+        (ticker,),
+    ).fetchall()
+    if not rows:
+        return
+
+    outcome = "won" if result == "yes" else "lost"
+    for row_id, yes_ask in rows:
+        pnl = (100 - yes_ask) if outcome == "won" else -yes_ask
+        conn.execute(
+            "UPDATE shadow_forecast_band_yes SET outcome = ?, pnl_cents = ? WHERE id = ?",
+            (outcome, pnl, row_id),
+        )
+        logging.info(
+            "ForecastBandYES shadow settled: %s → %s  pnl=%.0f¢ ($%.2f)",
+            ticker, outcome.upper(), pnl, pnl / 100,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shadow settlement resolver
+#
+# Runs once per poll cycle (not per fast-loop iteration).  A ticker still present
+# in the open-market snapshot is open by construction and needs zero HTTP; only
+# tickers that have LEFT the snapshot are fetched, in parallel under a semaphore.
+#
+# Backoff is in-memory only.  Rows are never abandoned: an unresolved row keeps
+# outcome/exit_reason NULL in SQLite, so a restart simply retries it.
+# ---------------------------------------------------------------------------
+
+# Open-row queries per shadow table, and the applier for each.
+_SHADOW_TABLES: tuple[tuple[str, str, Callable[[object, str, dict], None]], ...] = (
+    ("shadow_band_arb",          "outcome IS NULL",     _apply_settle_shadow_band_arb),
+    ("shadow_forecast_band_yes", "outcome IS NULL",     _apply_settle_forecast_band_yes),
+    ("shadow_yes_momentum",      "exit_reason IS NULL", _apply_settle_yes_momentum),
+    ("shadow_model_no",          "exit_reason IS NULL", _apply_settle_model_shadow_no),
+    ("shadow_model_no_v2",       "exit_reason IS NULL", _apply_settle_model_shadow_no_v2),
+)
+
+_settle_retry_after: dict[str, float] = {}   # ticker → monotonic ts before which we don't retry
+_settle_attempts: dict[str, int] = {}        # ticker → consecutive unresolved attempts
+
+_SETTLE_BACKOFF_BASE_S = 60.0
+_SETTLE_BACKOFF_MAX_S = 1800.0
+_SETTLE_STRANDED_WARN_AFTER = 10
+
+
+async def _fetch_settle_detail(
+    session: "aiohttp.ClientSession",
+    ticker: str,
+    sem: asyncio.Semaphore,
+) -> tuple[str, dict | None]:
+    """Fetch one market detail under the semaphore.  Never raises."""
+    async with sem:
+        try:
+            return ticker, await fetch_market_detail(session, ticker)
+        except Exception as exc:
+            logging.debug("Shadow settle: detail fetch failed for %s: %s", ticker, exc)
+            return ticker, None
+
+
+async def _resolve_shadow_settlements(conn, session: "aiohttp.ClientSession") -> None:
+    """Settle every open shadow row whose ticker has left the open-market snapshot."""
+    # 1. Gather the open tickers across all shadow tables.
+    open_tickers: set[str] = set()
+    for table, where, _applier in _SHADOW_TABLES:
+        try:
+            open_tickers.update(
+                row[0] for row in conn.execute(
+                    f"SELECT DISTINCT ticker FROM {table} WHERE {where}"
+                ) if row[0]
+            )
+        except Exception as exc:
+            logging.warning("Shadow settle: query failed for %s: %s", table, exc)
+    if not open_tickers:
+        return
+
+    # 2. A ticker still in a fresh snapshot is open — no fetch needed.  When the
+    #    snapshot is unusable, _is_open_in_snapshot returns None and we fetch
+    #    rather than wrongly infer "closed".
+    now_mono = time.monotonic()
+    candidates = [
+        t for t in open_tickers
+        if _is_open_in_snapshot(t) is not True
+        and _settle_retry_after.get(t, 0.0) <= now_mono
+    ]
+    if not candidates:
+        return
+
+    # 3. Fetch in parallel, bounded.
+    sem = asyncio.Semaphore(SHADOW_SETTLE_CONCURRENCY)
+    results = await asyncio.gather(
+        *[_fetch_settle_detail(session, t, sem) for t in candidates]
+    )
+
+    resolved = 0
+    for ticker, mkt in results:
+        settled = bool(
+            mkt
+            and mkt.get("status") in ("settled", "finalized")
+            and mkt.get("result") in ("yes", "no")
+        )
+
+        if settled:
+            for _table, _where, applier in _SHADOW_TABLES:
+                try:
+                    applier(conn, ticker, mkt)
+                except Exception as exc:
+                    logging.error("Shadow settle: applier failed for %s: %s", ticker, exc)
+            _settle_retry_after.pop(ticker, None)
+            _settle_attempts.pop(ticker, None)
+            resolved += 1
+            continue
+
+        # Not settled: the fetch failed, or the market is closed-but-not-yet-final.
+        # If it came back OPEN, it was absent from the snapshot for a spurious
+        # reason (fetch failure, pagination gap) — run the PT checks off the live
+        # dict so PT coverage is not lost.
+        if mkt and mkt.get("status") == "active":
+            _live = lambda t, _m=mkt, _t=ticker: _m if t == _t else None
+            _check_yes_momentum_pt(conn, market_for=_live)
+            _check_forecast_band_yes_pt(conn, market_for=_live)
+
+        attempts = _settle_attempts.get(ticker, 0) + 1
+        _settle_attempts[ticker] = attempts
+        _settle_retry_after[ticker] = now_mono + min(
+            _SETTLE_BACKOFF_BASE_S * (2 ** (attempts - 1)), _SETTLE_BACKOFF_MAX_S
+        )
+        if attempts == _SETTLE_STRANDED_WARN_AFTER:
+            logging.warning(
+                "Shadow settle: %s unresolved after %d attempts (status=%s) — "
+                "row may be stranded.",
+                ticker, attempts, (mkt or {}).get("status", "fetch-failed"),
+            )
+
+    logging.debug(
+        "Shadow settle: %d candidate(s) fetched, %d settled.", len(candidates), resolved
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4387,12 +4637,21 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                 except Exception as exc:
                     logging.error("Unhandled error in poll cycle: %s", exc, exc_info=True)
 
+                # Shadow settlement — once per cycle, not per fast-loop iteration.
+                # Lives here rather than at the tail of _poll() so it still runs on
+                # cycles where _poll() early-returns (e.g. a market fetch failure).
+                try:
+                    await _resolve_shadow_settlements(_shared_conn, session)
+                except Exception as exc:
+                    logging.error("Shadow settlement pass failed: %s", exc, exc_info=True)
+
                 cycle += 1
 
                 # IEM actual backfill — once per UTC calendar day.
                 _today_utc = datetime.now(timezone.utc).date().isoformat()
                 if _today_utc != _shadow_backfill_date:
                     _shadow_backfill_date = _today_utc
+                    _prune_market_close_epoch()
                     try:
                         await backfill_iem_actuals(_shared_conn, session)
                     except Exception as exc:
@@ -4408,18 +4667,38 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
 
                 _sleep = _adaptive_poll_interval(datetime.now(timezone.utc))
                 logging.info(_CYCLE_DONE_MSG, cycle, _sleep)
-                # Interleave fast band-arb loops during the sleep window
-                _elapsed = 0.0
-                while _elapsed + FAST_LOOP_INTERVAL < _sleep:
-                    await asyncio.sleep(FAST_LOOP_INTERVAL)
-                    _elapsed += FAST_LOOP_INTERVAL
+
+                # Interleave fast band-arb loops during the sleep window.
+                #
+                # The budget is a real monotonic deadline, not a count of sleeps:
+                # the previous version only accumulated the asyncio.sleep() calls
+                # and never charged _fast_loop's own runtime against the window, so
+                # a slow fast loop turned a 60s wait into 5 x (10s + fast_loop_time).
+                # Now the window can overrun by at most one _fast_loop duration.
+                #
+                # Deliberately no asyncio.wait_for around _fast_loop: cancelling it
+                # mid-flight would leave its autocommit SQLite writes half-applied
+                # across rows.  The overrun warning below is the tripwire instead.
+                _deadline = time.monotonic() + _sleep
+                while True:
+                    _left = _deadline - time.monotonic()
+                    if _left <= 0:
+                        break
+                    await asyncio.sleep(min(FAST_LOOP_INTERVAL, _left))
+                    if time.monotonic() >= _deadline:
+                        break
+
+                    _fl_start = time.monotonic()
                     try:
                         await _fast_loop(session, executor, opp_log, ledger=ledger)
                     except Exception as exc:
                         logging.debug("Fast loop error: %s", exc)
-                _remaining = _sleep - _elapsed
-                if _remaining > 0:
-                    await asyncio.sleep(_remaining)
+                    _fl_dur = time.monotonic() - _fl_start
+                    if _fl_dur > FAST_LOOP_INTERVAL:
+                        logging.warning(
+                            "Fast loop overran: %.1fs > %.0fs interval (cycle budget %.0fs).",
+                            _fl_dur, FAST_LOOP_INTERVAL, _sleep,
+                        )
     finally:
         if _watcher_task is not None and not _watcher_task.done():
             _watcher_task.cancel()
