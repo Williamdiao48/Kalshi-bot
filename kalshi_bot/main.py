@@ -67,6 +67,7 @@ from .state import SeenDocuments
 from .win_rate_tracker import WinRateTracker, WIN_RATE_REPORT_INTERVAL
 from .analytics import run_attribution
 from .shadow_forecast import log_shadow_forecasts, backfill_iem_actuals
+from .shadow_report import regenerate_overviews
 from .weather_filter import (
     _ET,
     _filter_weather_opportunities,
@@ -961,6 +962,12 @@ SHADOW_SETTLE_CONCURRENCY: int = env_int("SHADOW_SETTLE_CONCURRENCY", 8)
 # barely changes minute to minute.  Run it at most this often.
 FORECAST_BIAS_REFRESH_S: float = env_float("FORECAST_BIAS_REFRESH_S", 900.0)
 _last_bias_refresh: float = 0.0   # time.monotonic(); 0.0 = never run
+
+# The shadow-model overview .txt reports are rebuilt from the live DB at most
+# this often (default 6h).  Cheap (~2k-row read + two file writes) and offloaded
+# to a worker thread, so it never stalls the event loop.
+SHADOW_OVERVIEW_REFRESH_S: float = env_float("SHADOW_OVERVIEW_REFRESH_S", 21600.0)
+_last_overview_refresh: float = 0.0   # time.monotonic(); 0.0 = never run
 
 
 def _update_market_snapshot(markets: list[dict]) -> None:
@@ -4656,6 +4663,20 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                         await backfill_iem_actuals(_shared_conn, session)
                     except Exception as exc:
                         logging.warning("shadow_forecast backfill error: %s", exc)
+
+                # Shadow overview reports — rebuilt on a fixed cadence (default 6h),
+                # and once on the first cycle after startup so they are never stale
+                # after a restart.  Offloaded to a thread to keep the event loop free.
+                global _last_overview_refresh
+                _now_mono = time.monotonic()
+                if (_last_overview_refresh == 0.0
+                        or _now_mono - _last_overview_refresh >= SHADOW_OVERVIEW_REFRESH_S):
+                    try:
+                        _counts = await asyncio.to_thread(regenerate_overviews)
+                        _last_overview_refresh = _now_mono
+                        logging.info("Shadow overview reports refreshed: %s", _counts)
+                    except Exception as exc:
+                        logging.warning("Shadow overview regen failed: %s", exc)
 
                 if WIN_RATE_REPORT_INTERVAL > 0 and cycle % WIN_RATE_REPORT_INTERVAL == 0:
                     try:
