@@ -268,3 +268,26 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(9)")
         logging.info("DB schema migration V9 applied (shadow_model_no_v2).")
+
+    if current < 10:
+        # raw_forecasts is ~9M rows and the model-shadow feature builder queries it
+        # by (metric, day) once per candidate market on every fast-loop iteration.
+        # The only existing index leads with `ticker`, so those lookups fell back to
+        # a full table scan (~9s each).  This index makes them index range seeks.
+        # Callers must use a sargable `logged_at >= ? AND logged_at < ?` range —
+        # a `date(logged_at) = ?` predicate wraps the column in a function and
+        # cannot use this index.
+        logging.info("DB schema migration V10: indexing raw_forecasts (one-off, ~35s) …")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_raw_forecasts_metric_logged
+                ON raw_forecasts (metric, logged_at)
+        """)
+        # refresh_forecast_bias() aggregates by (source, metric) and previously scanned
+        # the whole table once per source (~70s total).  data_value is included to make
+        # this a covering index for those aggregates: ~70s -> ~2s.
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_raw_forecasts_source_metric
+                ON raw_forecasts (source, metric, logged_at, data_value)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(10)")
+        logging.info("DB schema migration V10 applied (raw_forecasts indices).")
