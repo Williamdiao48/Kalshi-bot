@@ -98,6 +98,29 @@ logging.basicConfig(
 _CYCLE_DONE_MSG = "— cycle #%d done — next poll in %ds —"
 _CYCLE_ONLY = os.environ.get("CYCLE_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ---------------------------------------------------------------------------
+# Source-polling toggles (opt-in booleans, same style as CYCLE_ONLY).
+#
+# SKIP_EXTRA_SOURCES=true — stop polling every data source that only feeds
+#   markets we don't trade: RSS/news, EDGAR, equity indices, forex
+#   (Frankfurter + Yahoo), FRED, BLS, CME FedWatch, box office, Polymarket,
+#   Metaculus, PredictIt, congress, and White House.  Weather (KXHIGHT/KXLOWT),
+#   WTI (KXWTI), and crypto polling are unaffected.  Default off (poll them).
+#
+# POLL_NBA=true — poll the NBA sources (Pinnacle odds + KXNBAGAME markets).
+#   Default OFF: out of season there are no games, so skip the requests.
+#   Flip this on when the NBA season starts to resume convergence trading.
+# ---------------------------------------------------------------------------
+SKIP_EXTRA_SOURCES = os.environ.get("SKIP_EXTRA_SOURCES", "").strip().lower() in ("1", "true", "yes", "on")
+POLL_NBA = os.environ.get("POLL_NBA", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def _skip_fetch():
+    """No-op stand-in for a disabled data source: makes no HTTP request and
+    returns an empty result, which every downstream consumer treats as
+    'nothing new' (guarded by `isinstance(_, Exception)` / falsy checks)."""
+    return []
+
 if _CYCLE_ONLY:
     class _CycleOnlyFilter(logging.Filter):
         """Let only the per-cycle summary line reach the console handler."""
@@ -1443,14 +1466,20 @@ async def _poll(
     # ---- concurrent fetch of every source at once --------------------------
     # Tasks are named so unpacking is robust to future source additions.
     # To add a source: append a ("name", coroutine) pair and unpack by name below.
+    # SKIP_EXTRA_SOURCES / POLL_NBA gate the sources that feed markets we don't
+    # trade.  A gated-off source is replaced by _skip_fetch() (no HTTP, empty
+    # result) so the by-name unpacking below stays intact.  Weather, WTI, crypto
+    # (coinbase), and infra (markets/positions) always poll.
+    _extra = not SKIP_EXTRA_SOURCES
+    _nba = POLL_NBA
     _tasks: list[tuple[str, object]] = [
         ("markets",      _get_markets(session)),
-        ("rss",          rss.fetch_all_feeds(session)),
+        ("rss",          rss.fetch_all_feeds(session) if _extra else _skip_fetch()),
         ("nws",          nws_alerts.fetch_alerts(session)),
         ("nws_signals",  nws_alerts.fetch_city_alert_signals(session)),
         ("hrrr",         hrrr.fetch_hourly_temps(session)),
         ("hrrr_tomorrow", hrrr.fetch_tomorrow_highs(session)),
-        ("edgar",        edgar.fetch_filings(session)),
+        ("edgar",        edgar.fetch_filings(session) if _extra else _skip_fetch()),
         ("noaa",         noaa.fetch_city_forecasts(session)),
         ("nws_climo",    nws_climo.fetch_city_climo(session)),
         ("metar",        metar.fetch_city_forecasts(session)),
@@ -1459,22 +1488,22 @@ async def _poll(
         ("weatherapi",   weatherapi.fetch_city_forecasts(session)),
         ("open_meteo",        open_meteo.fetch_city_forecasts(session)),
         ("open_meteo_models", open_meteo.fetch_model_forecasts(session)),
-        ("equity_index",  equity_index.fetch_prices(session)),
-        ("coinbase",     coinbase.fetch_prices(session)),
-        ("frankfurter",  frankfurter.fetch_rates(session)),
-        ("yahoo_forex",  yahoo_forex.fetch_rates(session)),
-        ("bls",          bls.fetch_latest(session, seen)),
-        ("fred",         fred.fetch_rates(session)),
+        ("equity_index",  equity_index.fetch_prices(session) if _extra else _skip_fetch()),
+        ("coinbase",     coinbase.fetch_prices(session)),  # crypto — always polled (revisit)
+        ("frankfurter",  frankfurter.fetch_rates(session) if _extra else _skip_fetch()),
+        ("yahoo_forex",  yahoo_forex.fetch_rates(session) if _extra else _skip_fetch()),
+        ("bls",          bls.fetch_latest(session, seen) if _extra else _skip_fetch()),
+        ("fred",         fred.fetch_rates(session) if _extra else _skip_fetch()),
         ("eia",          eia.fetch_prices(session)),
         ("wti_futures",  wti_futures.fetch_futures(session)),
-        ("fedwatch",     cme_fedwatch.fetch_next_meeting(session)),  # no-op when CME_FEDWATCH_ENABLED=false
-        ("box_office",   box_office.fetch_weekend_chart(session, seen)),
-        ("polymarket",   polymarket.fetch_markets(session)),
-        ("metaculus",    metaculus.fetch_questions(session)),
-        ("predictit",    predictit.fetch_contracts(session)),
+        ("fedwatch",     cme_fedwatch.fetch_next_meeting(session) if _extra else _skip_fetch()),
+        ("box_office",   box_office.fetch_weekend_chart(session, seen) if _extra else _skip_fetch()),
+        ("polymarket",   polymarket.fetch_markets(session) if _extra else _skip_fetch()),
+        ("metaculus",    metaculus.fetch_questions(session) if _extra else _skip_fetch()),
+        ("predictit",    predictit.fetch_contracts(session) if _extra else _skip_fetch()),
         ("positions",    fetch_positions(session)),
-        ("pinnacle",     pinnacle.fetch_nba_games(session)),
-        ("nba_markets",  fetch_markets_by_series(session, series_tickers=("KXNBAGAME",))),
+        ("pinnacle",     pinnacle.fetch_nba_games(session) if _nba else _skip_fetch()),
+        ("nba_markets",  fetch_markets_by_series(session, series_tickers=("KXNBAGAME",)) if _nba else _skip_fetch()),
     ]
     _task_names, _task_coros = zip(*_tasks)
     _raw = await asyncio.gather(*_task_coros, return_exceptions=True)
@@ -1709,9 +1738,10 @@ async def _poll(
 
     # CME FedWatch — expected post-meeting Fed Funds rate (continuous signal,
     # not gated to FOMC release dates like FRED fred_fedfunds).
-    fedwatch_dps = await cme_fedwatch.fetch_fedwatch_datapoints(session)
-    if fedwatch_dps:
-        data_points.extend(fedwatch_dps)
+    if _extra:
+        fedwatch_dps = await cme_fedwatch.fetch_fedwatch_datapoints(session)
+        if fedwatch_dps:
+            data_points.extend(fedwatch_dps)
 
     # EIA Inventory — deferred to AFTER the staleness filter below so that
     # implied prices are computed from the same fresh spot the filter approves.
@@ -1995,7 +2025,7 @@ async def _poll(
     # These modules do their own title-based market matching internally and
     # return NumericOpportunity objects with implied_outcome set directly.
     # Run both concurrently — each makes independent HTTP requests.
-    if markets:
+    if _extra and markets:
         _gov_results = await asyncio.gather(
             congress.find_congress_opportunities(session, markets),
             whitehouse.find_whitehouse_opportunities(session, markets),
@@ -3206,7 +3236,7 @@ async def _poll(
         )
 
     # ---- NBA snapshot logging (Pinnacle + Kalshi aligned rows) ---------------
-    if not isinstance(pinnacle_result, Exception) \
+    if _nba and not isinstance(pinnacle_result, Exception) \
             and not isinstance(nba_markets_result, Exception):
         _log_nba_snapshots(opp_log._conn, pinnacle_result, nba_markets_result)
 
