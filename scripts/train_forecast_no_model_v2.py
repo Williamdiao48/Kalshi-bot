@@ -20,6 +20,7 @@ import csv
 import pickle
 import warnings
 warnings.filterwarnings("ignore")
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -210,22 +211,45 @@ def compare_v1(label, yt, yp_v2):
     print(f"  v2 AUC (test):   {roc_auc_score(yt, yp_v2):.4f}")
 
 
-def train_one(label: str, X, y, dates, out_path: Path, city_map: dict):
+def train_one(label: str, X, y, dates, out_path: Path, city_map: dict,
+              production: bool = False, calib_frac: float = 0.15):
     print(f"\n{'='*65}")
-    print(f"Training v2: {label}")
+    print(f"Training v2: {label}   mode={'PRODUCTION' if production else 'dev'}")
     print(f"{'='*65}")
     print(f"Rows: {len(y):,}   Overall WR: {y.mean():.1%}")
 
-    Xtr, Xte, ytr, yte = split_chronological(X, y, dates)
+    # Two chronological layouts (oldest → newest):
+    #
+    #   dev         | lgbm 0–64% | iso calib 64–80% | held-out TEST 80–100% |
+    #   production  | lgbm 0–(1-calib_frac)         | iso calib newest calib_frac |
+    #
+    # The calibrator (isotonic) is what turns the raw score into the model_p we
+    # bet on, and that mapping drifts with the season. In PRODUCTION mode we fit
+    # it on the *newest* slice so calibration reflects current conditions, and we
+    # skip the internal held-out test — validation is done out-of-band by the
+    # retrain wrapper (backtest_v2_model.py). In dev mode we keep an honest
+    # newest-slice held-out test for measuring whether a change helps.
     cat_idx = [FEATURES.index(f) for f in CATEGORICAL_FEATURES]
+
+    if production:
+        Xfit, Xcal, yfit, ycal = split_chronological(X, y, dates, frac=calib_frac)
+        Xeval, yeval = Xcal, ycal          # report in-sample on the calib slice
+        eval_note = f"in-sample on newest {calib_frac:.0%} calib slice"
+    else:
+        Xtr, Xte, ytr, yte = split_chronological(X, y, dates)
+        cs   = int(len(Xtr) * 0.8)
+        Xfit, yfit   = Xtr[:cs], ytr[:cs]  # oldest 64%
+        Xcal, ycal   = Xtr[cs:], ytr[cs:]  # middle 64–80% → calibration
+        Xeval, yeval = Xte, yte            # newest 20% → held-out test
+        eval_note = "held-out newest 20% test"
 
     # Logistic baseline
     print("\n--- Logistic Regression baseline ---")
     lr = Pipeline([("sc", StandardScaler()),
                    ("lr", LogisticRegression(C=0.5, max_iter=1000, random_state=42))])
-    lr.fit(Xtr, ytr)
-    lp = lr.predict_proba(Xte)[:, 1]
-    ev("LogReg", yte, lp)
+    lr.fit(Xfit, yfit)
+    lp = lr.predict_proba(Xeval)[:, 1]
+    ev("LogReg", yeval, lp)
     coefs = lr.named_steps["lr"].coef_[0]
     print("  Top 10 coefficients:")
     for i in np.argsort(np.abs(coefs))[::-1][:10]:
@@ -233,7 +257,6 @@ def train_one(label: str, X, y, dates, out_path: Path, city_map: dict):
 
     # LightGBM
     print("\n--- LightGBM ---")
-    cs   = int(len(Xtr) * 0.8)
     lgbm = lgb.LGBMClassifier(
         n_estimators=600,
         learning_rate=0.04,
@@ -247,26 +270,26 @@ def train_one(label: str, X, y, dates, out_path: Path, city_map: dict):
         verbose=-1,
     )
     lgbm.fit(
-        Xtr[:cs], ytr[:cs],
+        Xfit, yfit,
         feature_name=FEATURES,
         categorical_feature=cat_idx,
     )
-    rp = lgbm.predict_proba(Xte)[:, 1]
-    ev("LightGBM (raw)", yte, rp)
+    rp = lgbm.predict_proba(Xeval)[:, 1]
+    ev("LightGBM (raw)", yeval, rp)
 
     print("\n  Feature importances (top 15):")
     for i in np.argsort(lgbm.feature_importances_)[::-1][:15]:
         bar = "█" * int(lgbm.feature_importances_[i] / max(lgbm.feature_importances_) * 30)
         print(f"    {FEATURES[i]:<30} {lgbm.feature_importances_[i]:>6.0f}  {bar}")
 
-    # Isotonic calibration
+    # Isotonic calibration — fit on the calibration slice (newest in production).
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(lgbm.predict_proba(Xtr[cs:])[:, 1], ytr[cs:])
+    iso.fit(lgbm.predict_proba(Xcal)[:, 1], ycal)
     cp = iso.predict(rp)
-    brier, auc = ev("LightGBM (calibrated)", yte, cp)
+    brier, auc = ev(f"LightGBM (calibrated) [{eval_note}]", yeval, cp)
 
     # Calibration curve
-    pt, pp = calibration_curve(yte, cp, n_bins=10)
+    pt, pp = calibration_curve(yeval, cp, n_bins=10)
     print("\n  Calibration (predicted vs actual):")
     for a, b_ in zip(pt, pp):
         d = a - b_
@@ -275,21 +298,21 @@ def train_one(label: str, X, y, dates, out_path: Path, city_map: dict):
 
     # New feature buckets
     fi = {feat: i for i, feat in enumerate(FEATURES)}
-    bucket("hrrr_skill_adj",       yte, cp, Xte[:, fi["hrrr_skill_adj"]],
+    bucket("hrrr_skill_adj",       yeval, cp, Xeval[:, fi["hrrr_skill_adj"]],
            [-10, -2, 0, 1, 2, 4, 8, 20])
-    bucket("min_model_vs_ceil",    yte, cp, Xte[:, fi["min_model_vs_ceil"]],
+    bucket("min_model_vs_ceil",    yeval, cp, Xeval[:, fi["min_model_vs_ceil"]],
            [-10, -2, 0, 1, 2, 4, 8, 20])
-    bucket("margin_per_hour_left", yte, cp, Xte[:, fi["margin_per_hour_left"]],
+    bucket("margin_per_hour_left", yeval, cp, Xeval[:, fi["margin_per_hour_left"]],
            [0, 0.2, 0.5, 1.0, 2.0, 5.0, 20.0])
-    bucket("clim_prob_exceed",     yte, cp, Xte[:, fi["clim_prob_exceed"]],
+    bucket("clim_prob_exceed",     yeval, cp, Xeval[:, fi["clim_prob_exceed"]],
            [0, 0.05, 0.10, 0.18, 0.35, 1.0])
-    bucket("hrrr_vs_ceil",         yte, cp, Xte[:, fi["hrrr_vs_ceil"]],
+    bucket("hrrr_vs_ceil",         yeval, cp, Xeval[:, fi["hrrr_vs_ceil"]],
            [-5, -1, 0, 1, 2, 5, 15])
-    bucket("hours_to_close",       yte, cp, Xte[:, fi["hours_to_close"]],
+    bucket("hours_to_close",       yeval, cp, Xeval[:, fi["hours_to_close"]],
            [0, 2, 4, 6, 9, 12, 18, 24])
 
     # v1 comparison
-    compare_v1(label, yte, cp)
+    compare_v1(label, yeval, cp)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(pickle.dumps({
@@ -300,28 +323,40 @@ def train_one(label: str, X, y, dates, out_path: Path, city_map: dict):
         "auc":      auc,
         "base_wr":  float(y.mean()),
         "city_map": city_map,
+        "trained_mode": "production" if production else "dev",
+        "calib_frac":   calib_frac if production else 0.20,
+        "trained_at":   datetime.now(timezone.utc).isoformat(),
     }))
     print(f"\nSaved → {out_path}  (Brier={brier:.4f}, AUC={auc:.4f})")
     return lgbm, iso, brier, auc
 
 
-def main(high_only: bool, low_only: bool):
+def main(high_only: bool, low_only: bool,
+         production: bool = False, calib_frac: float = 0.15):
+    kw = dict(production=production, calib_frac=calib_frac)
     if high_only:
         X, y, dates, city_map = load_data(high_only=True, low_only=False)
-        train_one("KXHIGH", X, y, dates, MODEL_HIGH, city_map)
+        train_one("KXHIGH", X, y, dates, MODEL_HIGH, city_map, **kw)
     elif low_only:
         X, y, dates, city_map = load_data(high_only=False, low_only=True)
-        train_one("KXLOWT", X, y, dates, MODEL_LOW, city_map)
+        train_one("KXLOWT", X, y, dates, MODEL_LOW, city_map, **kw)
     else:
         X_h, y_h, d_h, city_map = load_data(high_only=True,  low_only=False)
         X_l, y_l, d_l, _        = load_data(high_only=False, low_only=True)
-        train_one("KXHIGH", X_h, y_h, d_h, MODEL_HIGH, city_map)
-        train_one("KXLOWT", X_l, y_l, d_l, MODEL_LOW,  city_map)
+        train_one("KXHIGH", X_h, y_h, d_h, MODEL_HIGH, city_map, **kw)
+        train_one("KXLOWT", X_l, y_l, d_l, MODEL_LOW,  city_map, **kw)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--high-only", action="store_true")
     parser.add_argument("--low-only",  action="store_true")
+    parser.add_argument("--production", action="store_true",
+                        help="Fit calibrator on the newest slice and skip the "
+                             "held-out test (maximizes freshness for deployment; "
+                             "validate out-of-band via backtest_v2_model.py).")
+    parser.add_argument("--calib-frac", type=float, default=0.15,
+                        help="Production mode: fraction of newest data used to "
+                             "fit the isotonic calibrator (default 0.15).")
     args = parser.parse_args()
-    main(args.high_only, args.low_only)
+    main(args.high_only, args.low_only, args.production, args.calib_frac)
