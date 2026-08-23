@@ -54,22 +54,26 @@ fi
 $PY scripts/extend_hist_cache.py
 
 # ── 2. Refresh the settled-markets cache ──────────────────────────────────────
-# The base builder loads this cache only if it EXISTS and never refreshes it.
-# Move it aside so the builder re-fetches all settled B-band markets from the
-# Kalshi API (which returns the full history, summer included).
+# Kalshi's status=settled endpoint ages out old markets, so a plain re-fetch
+# returns only a recent window and would DROP the older settled markets the
+# archive holds.  We therefore MERGE: the builder (step 3, --merge-kalshi) fetches
+# fresh and unions the new markets into the existing cache, preserving history.
+# A timestamped backup is kept in case the merge misbehaves.
+BUILD_ARGS=()
 if [[ "$REFRESH_KALSHI" == "1" ]]; then
-  log "2/7  Refresh $KALSHI_CACHE (move aside → builder re-fetches)"
+  log "2/7  Refresh $KALSHI_CACHE (merge fresh fetch → preserve history)"
   if [[ -f "$KALSHI_CACHE" ]]; then
-    mv "$KALSHI_CACHE" "${KALSHI_CACHE}.bak_${TS}"
-    echo "backed up old Kalshi cache → ${KALSHI_CACHE}.bak_${TS}"
+    cp "$KALSHI_CACHE" "${KALSHI_CACHE}.bak_${TS}"
+    echo "backed up Kalshi cache → ${KALSHI_CACHE}.bak_${TS}"
   fi
+  BUILD_ARGS+=(--merge-kalshi)
 else
-  log "2/7  Skipping Kalshi-cache refresh (--no-refresh-kalshi)"
+  log "2/7  Skipping Kalshi-cache refresh (--no-refresh-kalshi); using cache as-is"
 fi
 
 # ── 3. Rebuild the base training CSV ──────────────────────────────────────────
-log "3/7  build_kalshi_no_training_data.py"
-$PY scripts/build_kalshi_no_training_data.py
+log "3/7  build_kalshi_no_training_data.py ${BUILD_ARGS[*]}"
+$PY scripts/build_kalshi_no_training_data.py "${BUILD_ARGS[@]}"
 
 # ── 4. Rebuild the v2 feature CSV ─────────────────────────────────────────────
 log "4/7  build_training_data_v2.py"
