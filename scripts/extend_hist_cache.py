@@ -83,6 +83,48 @@ def merge_dates(existing: dict, new_data: dict) -> int:
     return added
 
 
+async def _iem_get_text(
+    session: aiohttp.ClientSession, url: str, params: dict, label: str,
+    retries: int = 6, base_delay: float = 4.0,
+) -> str | None:
+    """GET text from IEM with exponential backoff on 429 / transient errors.
+
+    IEM ASOS enforces per-IP rate limiting; a burst of requests gets 429'd.
+    Returns the body text, or None if it never succeeded.
+    """
+    delay = base_delay
+    for attempt in range(1, retries + 1):
+        async with _IEM_SEM:
+            try:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                    if resp.status == 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=429,
+                            message="Too Many Requests")
+                    resp.raise_for_status()
+                    return await resp.text()
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429 and attempt < retries:
+                    print(f"  [IEM] {label}: 429, backoff {delay:.0f}s "
+                          f"(attempt {attempt}/{retries})", file=sys.stderr)
+                elif attempt < retries:
+                    print(f"  [IEM] {label}: {e}; retry in {delay:.0f}s "
+                          f"(attempt {attempt}/{retries})", file=sys.stderr)
+                else:
+                    print(f"  [IEM] {label}: {e} — giving up", file=sys.stderr)
+                    return None
+            except Exception as e:
+                if attempt >= retries:
+                    print(f"  [IEM] {label}: {e} — giving up", file=sys.stderr)
+                    return None
+                print(f"  [IEM] {label}: {e}; retry in {delay:.0f}s "
+                      f"(attempt {attempt}/{retries})", file=sys.stderr)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60.0)
+    return None
+
+
 async def fetch_iem_hourly(
     session: aiohttp.ClientSession, station: str, start: str, end: str
 ) -> dict[str, dict[str, float]]:
@@ -95,15 +137,9 @@ async def fetch_iem_hourly(
         "tz": "UTC", "format": "onlycomma", "latlon": "no", "report_type": "3",
     }
     result: dict[str, dict[str, float]] = {}
-    async with _IEM_SEM:
-        try:
-            async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                resp.raise_for_status()
-                text = await resp.text()
-        except Exception as e:
-            print(f"  [IEM hourly] {station}: {e}", file=sys.stderr)
-            return result
+    text = await _iem_get_text(session, url, params, f"hourly {station}")
+    if text is None:
+        return result
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("station") or line.startswith("#"):
@@ -238,13 +274,32 @@ async def extend_cache(start: str, end: str, dry_run: bool) -> None:
             if not needed:
                 print(f"  {metric}: already up to date")
                 continue
-            # fetch_iem_observed pulls a whole year; filter to the requested window
+            # fetch_iem_observed pulls a whole year; filter to the requested window.
+            # It swallows 429s internally, so retry the year until it covers the
+            # needed window (or attempts are exhausted).
             years = sorted({int(start[:4]), int(end[:4])})
             new_data: dict[str, float] = {}
             for yr in years:
-                async with _IEM_SEM:
-                    part = await fetch_iem_observed(session, station, network, yr, yr, is_high)
-                new_data.update(part)
+                yr_needed = {d for d in needed if d[:4] == str(yr)}
+                delay = 4.0
+                for attempt in range(1, 7):
+                    async with _IEM_SEM:
+                        part = await fetch_iem_observed(session, station, network, yr, yr, is_high)
+                    new_data.update(part)
+                    missing = yr_needed - set(part)
+                    # Tolerate a small trailing gap: IEM daily summaries lag
+                    # ~1-2 days and today's high/low isn't finalized, so the
+                    # newest date(s) legitimately won't exist yet.  Only retry
+                    # on a large gap — the signature of a rate-limited/empty
+                    # response, not of unpublished-yet data.
+                    if len(missing) <= 2:
+                        break
+                    if attempt < 6:
+                        print(f"  [IEM] actual {station}/{yr}: incomplete "
+                              f"({len(set(part) & yr_needed)}/{len(yr_needed)} needed); "
+                              f"backoff {delay:.0f}s (attempt {attempt}/6)", file=sys.stderr)
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 60.0)
             new_in_range = {d: v for d, v in new_data.items() if start <= d <= end}
             added = merge_dates(cache[key], new_in_range)
             totals[f"actual_{metric}"] = added
