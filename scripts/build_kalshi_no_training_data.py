@@ -109,11 +109,29 @@ def parse_ticker_date(ticker: str) -> str | None:
         return None
 
 
-async def fetch_settled_markets(series_list: list[str]) -> dict[str, list[dict]]:
-    """Fetch all settled B-band markets for each series. Returns {series: [market, ...]}."""
+async def fetch_settled_markets(
+    series_list: list[str], merge: bool = False
+) -> dict[str, list[dict]]:
+    """Fetch all settled B-band markets for each series. Returns {series: [market, ...]}.
+
+    Default (merge=False): load-if-exists, never refresh — the cache is treated
+    as a frozen snapshot.
+
+    merge=True: fetch fresh from the API and UNION the results into the existing
+    cache by ticker.  Kalshi's ``status=settled`` endpoint ages out old markets,
+    so a plain re-fetch returns only a recent window and silently drops older
+    settled markets; unioning preserves the full history archive while adding
+    newly-settled markets.  This is what the rolling retrain uses.
+    """
+    existing: dict[str, list[dict]] = {}
     if KALSHI_CACHE.exists():
-        print(f"Loading Kalshi market cache from {KALSHI_CACHE}")
-        return json.loads(KALSHI_CACHE.read_text())
+        existing = json.loads(KALSHI_CACHE.read_text())
+        if not merge:
+            print(f"Loading Kalshi market cache from {KALSHI_CACHE}")
+            return existing
+        n_ex = sum(len(v) for v in existing.values())
+        print(f"Merge mode: unioning fresh fetch into existing cache "
+              f"({len(existing)} series, {n_ex:,} markets)")
 
     result = {}
     async with aiohttp.ClientSession() as session:
@@ -146,6 +164,21 @@ async def fetch_settled_markets(series_list: list[str]) -> dict[str, list[dict]]
                 print(f"  {series}: {total} B-bands  {dates[0]} → {dates[-1]}")
             else:
                 print(f"  {series}: 0 B-bands")
+
+    if merge and existing:
+        # Union the fresh fetch into the existing archive, keyed by ticker.
+        # Existing markets are preserved (they may have aged out of the API);
+        # only genuinely new tickers are appended.
+        union = {s: list(v) for s, v in existing.items()}
+        added_total = 0
+        for series, mkts in result.items():
+            seen = {m.get("ticker") for m in union.get(series, [])}
+            new = [m for m in mkts if m.get("ticker") not in seen]
+            union.setdefault(series, []).extend(new)
+            added_total += len(new)
+        result = union
+        n_after = sum(len(v) for v in result.values())
+        print(f"Merged: +{added_total:,} new markets  (archive now {n_after:,})")
 
     KALSHI_CACHE.write_text(json.dumps(result))
     print(f"Saved Kalshi market cache → {KALSHI_CACHE}")
@@ -487,10 +520,10 @@ def build_rows(
     return rows
 
 
-def main():
+def main(merge_kalshi: bool = False):
     series_list = list(SERIES_MAP.keys())
     print(f"Fetching settled B-band markets for {len(series_list)} series...")
-    markets_by_series = asyncio.run(fetch_settled_markets(series_list))
+    markets_by_series = asyncio.run(fetch_settled_markets(series_list, merge=merge_kalshi))
 
     total_markets = sum(len(v) for v in markets_by_series.values())
     print(f"\nTotal B-band markets fetched: {total_markets:,}")
@@ -525,4 +558,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--merge-kalshi", action="store_true",
+                    help="Fetch fresh settled markets from the API and union them "
+                         "into the existing cache (preserves aged-out history) "
+                         "instead of loading the cache as-is.")
+    args = ap.parse_args()
+    main(merge_kalshi=args.merge_kalshi)
