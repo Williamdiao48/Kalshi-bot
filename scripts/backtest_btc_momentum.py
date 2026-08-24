@@ -171,6 +171,57 @@ def sim_pnl(df: pd.DataFrame, momentum_col: str, threshold: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Mean-reversion (the mirror image of momentum)
+#
+# The quintile tables show a NEGATIVE momentum spread on every coin: the most
+# bearish prior-return bucket has the HIGHEST next-candle up-rate, and the most
+# bullish bucket the lowest.  So we FADE the move instead of following it:
+#   after a down-run  (momentum < -thr)  → buy YES  (expect a bounce)
+#   after an up-run   (momentum >  thr)  → buy NO   (expect a fade)
+# ---------------------------------------------------------------------------
+
+def reversion_sweep(
+    df: pd.DataFrame,
+    momentum_col: str,
+    thresholds: list[float],
+) -> list[dict]:
+    rows = []
+    for thr in thresholds:
+        # Fade the down-run: buy YES, win when up==1
+        faded_down = df[momentum_col] < -thr
+        # Fade the up-run: buy NO, win when up==0
+        faded_up   = df[momentum_col] >  thr
+
+        n_yes = int(faded_down.sum())
+        n_no  = int(faded_up.sum())
+        wr_yes = df[faded_down]["up"].mean() * 100 if n_yes > 0 else 0.0
+        wr_no  = (df[faded_up]["up"] == 0).mean() * 100 if n_no > 0 else 0.0
+        ev_yes = wr_yes - BREAK_EVEN_WR
+        ev_no  = wr_no  - BREAK_EVEN_WR
+
+        rows.append({
+            "threshold": thr,
+            "n_yes": n_yes, "wr_yes": round(wr_yes, 1), "ev_yes": round(ev_yes, 2),
+            "n_no": n_no,   "wr_no": round(wr_no, 1),   "ev_no": round(ev_no, 2),
+            "n_total": n_yes + n_no,
+            "combined_ev": round((ev_yes * n_yes + ev_no * n_no) / max(n_yes + n_no, 1), 2),
+        })
+    return rows
+
+
+def sim_pnl_reversion(df: pd.DataFrame, momentum_col: str, threshold: float) -> float:
+    """Simulate mean-reversion P&L in cents (fade the move)."""
+    faded_down = df[momentum_col] < -threshold   # buy YES → win on up==1
+    faded_up   = df[momentum_col] >  threshold   # buy NO  → win on up==0
+    total = 0.0
+    total += (df[faded_down]["up"] * (100 - 50 - ENTRY_COST)
+              + (1 - df[faded_down]["up"]) * -(50 + ENTRY_COST)).sum()
+    total += ((1 - df[faded_up]["up"]) * (100 - 50 - ENTRY_COST)
+              + df[faded_up]["up"] * -(50 + ENTRY_COST)).sum()
+    return round(float(total), 1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -242,6 +293,34 @@ def run_coin(coin: str, df15: pd.DataFrame, df1h: pd.DataFrame) -> None:
                   f"{r['wr_bull']:>6.1f}%  {r['ev_bull']:>+7.2f}¢  "
                   f"{r['n_bear']:>7}  {r['wr_bear_no']:>6.1f}%  {r['ev_bear_no']:>+7.2f}¢  "
                   f"{r['combined_ev']:>+8.2f}¢{marker}")
+
+    # --- R. Mean-reversion (fade the move) ---
+    print(f"\n[R] MEAN-REVERSION — fade the move (YES after a down-run, NO after an up-run)")
+    print(f"  {'Lookback':20s}  {'Threshold':>10}  {'n_YES':>7}  {'WR_YES':>7}  {'EV_YES':>7}  "
+          f"{'n_NO':>7}  {'WR_NO':>7}  {'EV_NO':>7}  {'Comb EV':>8}")
+    best_rev_ev = -999
+    best_rev_config = None
+    for lbl, col in lookbacks:
+        rows = reversion_sweep(df15, col, thresholds)
+        for r in rows:
+            if r["n_yes"] < 20 or r["n_no"] < 20:
+                continue
+            marker = ""
+            if r["combined_ev"] > best_rev_ev:
+                best_rev_ev = r["combined_ev"]
+                best_rev_config = (lbl, col, r["threshold"])
+                marker = " ◄ best"
+            print(f"  {lbl:20s}  {r['threshold']:>10.3f}  {r['n_yes']:>7}  "
+                  f"{r['wr_yes']:>6.1f}%  {r['ev_yes']:>+7.2f}¢  "
+                  f"{r['n_no']:>7}  {r['wr_no']:>6.1f}%  {r['ev_no']:>+7.2f}¢  "
+                  f"{r['combined_ev']:>+8.2f}¢{marker}")
+    if best_rev_config:
+        lbl, col, thr = best_rev_config
+        pnl_rev = sim_pnl_reversion(df15, col, thr)
+        n_rev = int(((df15[col] < -thr) | (df15[col] > thr)).sum())
+        print(f"\n  Best reversion config: {lbl}, |momentum|>{thr:.3f}  (combined EV {best_rev_ev:+.2f}¢)")
+        print(f"  Simulated P&L (entry at 50¢): {pnl_rev:+.1f}¢ over {n_rev} trades "
+              f"({pnl_rev/max(n_rev,1):+.2f}¢/trade)  = ${pnl_rev/100:+.2f} at $1/contract")
 
     # --- E. Time-of-day ---
     print(f"\n[E] Time-of-day analysis (UTC hours, best lookback: {lookbacks[1][0]})")
@@ -327,6 +406,34 @@ def run_extended_1h(coin: str, df1h: pd.DataFrame) -> None:
                   f"{r['wr_bull']:>6.1f}%  {r['ev_bull']:>+7.2f}¢  "
                   f"{r['n_bear']:>7}  {r['wr_bear_no']:>6.1f}%  {r['ev_bear_no']:>+7.2f}¢  "
                   f"{r['combined_ev']:>+8.2f}¢{marker}")
+
+    # Mean-reversion arm over the full 2-year window (out-of-sample check).
+    print(f"\n  MEAN-REVERSION sweep (1h candles, 2 years):")
+    print(f"  {'Lookback':12s}  {'Threshold':>10}  {'n_YES':>7}  {'WR_YES':>7}  {'EV':>7}  "
+          f"{'n_NO':>7}  {'WR_NO':>7}  {'EV':>7}  {'CombEV':>8}")
+    best_rev_ev = -999
+    best_rev = None
+    for lbl, col in lookbacks_1h:
+        rows = reversion_sweep(df1h, col, thresholds)
+        for r in rows:
+            if r["n_yes"] < 50 or r["n_no"] < 50:
+                continue
+            marker = ""
+            if r["combined_ev"] > best_rev_ev:
+                best_rev_ev = r["combined_ev"]
+                best_rev = (lbl, col, r["threshold"])
+                marker = " ◄"
+            print(f"  {lbl:12s}  {r['threshold']:>10.3f}  {r['n_yes']:>7}  "
+                  f"{r['wr_yes']:>6.1f}%  {r['ev_yes']:>+7.2f}¢  "
+                  f"{r['n_no']:>7}  {r['wr_no']:>6.1f}%  {r['ev_no']:>+7.2f}¢  "
+                  f"{r['combined_ev']:>+8.2f}¢{marker}")
+    if best_rev:
+        lbl, col, thr = best_rev
+        pnl_rev = sim_pnl_reversion(df1h, col, thr)
+        n_rev = int(((df1h[col] < -thr) | (df1h[col] > thr)).sum())
+        print(f"\n  Best 2y reversion config: {lbl}, |momentum|>{thr:.3f}  (combined EV {best_rev_ev:+.2f}¢)")
+        print(f"  Simulated P&L (entry at 50¢): {pnl_rev:+.1f}¢ over {n_rev} trades "
+              f"({pnl_rev/max(n_rev,1):+.2f}¢/trade)  = ${pnl_rev/100:+.2f} at $1/contract")
 
 
 def main(coins: list[str], no_extended: bool) -> None:

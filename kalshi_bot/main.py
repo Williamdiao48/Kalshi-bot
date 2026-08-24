@@ -1550,6 +1550,17 @@ async def _poll(
         return
     markets: list[dict] = markets_result  # type: ignore[assignment]
 
+    # Capture 15-minute crypto markets BEFORE the temporal filter below drops
+    # them.  They close within ~15 min — well inside MARKET_MIN_MINUTES_TO_CLOSE
+    # (default 30) — so the filter strips every one, which is why crypto_price_log
+    # sat empty since the logging was added (commit 7ce261b).  These rows feed the
+    # mean-reversion validation dataset only; they are NOT routed into matching or
+    # trading (that filtering is intentional and stays).
+    _crypto_15m_markets = [
+        m for m in markets
+        if m.get("ticker", "").split("-")[0] in ("KXBTC15M", "KXETH15M", "KXSOL15M")
+    ]
+
     # Snapshot BEFORE the close-time filter below: a market inside
     # MARKET_MIN_MINUTES_TO_CLOSE is still open, and dropping it here would make
     # the shadow settler mistake it for closed.  Sync call, no awaits in between.
@@ -2079,7 +2090,7 @@ async def _poll(
             if _dp.metric in _CRYPTO_SERIES_METRIC.values():
                 _coinbase_prices[_dp.metric] = _dp.value
     _crypto_log_rows = []
-    for _m in markets:
+    for _m in _crypto_15m_markets:
         _t = _m.get("ticker", "")
         _series = _t.split("-")[0]
         if _series not in _CRYPTO_SERIES_METRIC:
