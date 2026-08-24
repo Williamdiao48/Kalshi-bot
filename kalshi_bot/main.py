@@ -3947,6 +3947,12 @@ def _apply_settle_yes_momentum(conn, ticker: str, mkt: dict) -> None:
 
 
 _MODEL_SHADOW_MIN_MARGIN   = 0.3   # °F above band_ceil to fire at all
+# HIGH-side v2 shadow gate: the v2 HIGH model is trained down to a NEGATIVE margin
+# (running-max approaching the ceiling from below), so exercise it there on paper
+# too — otherwise the retrained boundary model never gets asked about the region it
+# was built for.  Applied only in the v2 shadow tracker for HIGH; v1 and LOW keep
+# +0.3.  See project_high_model_degenerate note + the -2.0 retrain.
+_MODEL_SHADOW_MIN_MARGIN_HIGH = -2.0
 _MODEL_SHADOW_MIN_MODEL_P  = 0.80  # minimum calibrated model probability to log
 _MODEL_SHADOW_MAX_YES_ASK  = 55    # skip if YES still costs > 55¢ (backtest: edge ≥ 50pp → negative EV)
 _MODEL_SHADOW_SERIES = {
@@ -4288,7 +4294,10 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
         if running_obs is None:
             continue
         margin_f = round(running_obs - band_ceil, 2)
-        if margin_f < _MODEL_SHADOW_MIN_MARGIN:
+        # Per-side gate: HIGH exercises the boundary zone (negative margin) the v2
+        # model is trained for; LOW keeps the standard +0.3 above-ceiling gate.
+        _shadow_min_margin = _MODEL_SHADOW_MIN_MARGIN_HIGH if is_high else _MODEL_SHADOW_MIN_MARGIN
+        if margin_f < _shadow_min_margin:
             continue
         if ticker in open_tickers:
             continue

@@ -25,7 +25,17 @@ from kalshi_bot.markets import KALSHI_API_BASE
 CACHE_FILE   = Path("data/backtest/band_arb_hist_cache.json")
 OUTPUT_CSV   = Path("data/backtest/forecast_no_training_data_kalshi.csv")
 KALSHI_CACHE = Path("data/backtest/kalshi_markets_cache.json")
-MIN_MARGIN   = 0.5
+# Row-emission threshold: a moment becomes a training row once
+#   running_obs - band_ceil >= MIN_MARGIN.
+# LOW stays at +0.5 (already healthy: running-min can still fall back through the
+# band, so near-ceiling LOW rows carry genuine both-class outcomes).
+# HIGH uses a NEGATIVE margin: running-max is monotonic, so at +0.5 the outcome
+# is already locked (max cleared the ceiling → settles NO) → degenerate, single-
+# class, redundant with band_arb.  Recording from 2°F BELOW the ceiling captures
+# the still-uncertain "will the max cross before close?" window, restoring class
+# balance and a real predictive target.  See project_high_model_degenerate note.
+MIN_MARGIN      = 0.5    # LOW side
+MIN_MARGIN_HIGH = -2.0   # HIGH side
 HOURS        = list(range(4, 23))
 
 # series → (iem_station, metric_base, is_high)
@@ -378,6 +388,7 @@ def build_rows(
         station, city_code, is_high = SERIES_MAP[series]
         metric_full = f"temp_{'high' if is_high else 'low'}_{city_code}"
         fn = max if is_high else min
+        min_margin = MIN_MARGIN_HIGH if is_high else MIN_MARGIN
 
         mae_key = (station, city_code, is_high)
         if mae_key not in _mae_cache:
@@ -459,7 +470,7 @@ def build_rows(
                 running_obs = running[h]
                 margin_f    = round(running_obs - band_ceil, 2)
 
-                if margin_f < MIN_MARGIN:
+                if margin_f < min_margin:
                     hours_above_counter = 0
                     continue
 
