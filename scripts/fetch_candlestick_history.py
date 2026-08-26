@@ -75,8 +75,16 @@ _DEFAULT_SERIES: tuple[str, ...] = (
     "KXBTCD", "KXBTC15M", "KXETH15M", "KXSOL15M",
 )
 
-# Minimum candles required to bother storing a market (too-short = not useful)
+# Minimum candles required to bother storing a market (too-short = not useful).
+# 15-minute crypto markets (KXBTC15M/…) only ever produce ~15 one-minute
+# candles, so a flat 30-candle floor would silently skip every one of them —
+# they get a lower floor instead.
 _MIN_CANDLES = 30
+_MIN_CANDLES_15M = 10
+
+
+def _min_candles_for(series: str) -> int:
+    return _MIN_CANDLES_15M if series.endswith("15M") else _MIN_CANDLES
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +371,7 @@ async def fetch_series(
 
         candles = await _fetch_candles(session, series, ticker, open_ts, close_ts, period)
 
-        if len(candles) < _MIN_CANDLES:
+        if len(candles) < _min_candles_for(series):
             log.debug("  Skip (only %d candles): %s", len(candles), ticker)
             continue
 
