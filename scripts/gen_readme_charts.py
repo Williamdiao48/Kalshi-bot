@@ -167,7 +167,7 @@ def build_pnl_svg(series: dict[str, list[tuple[str, float]]],
     pk = next(iter(series))
     n, wr, _net = stats[pk]
     d0s, d1s = date.fromordinal(d0).strftime("%b %-d"), date.fromordinal(d1).strftime("%b %-d %Y")
-    parts.append(f'<text x="{L}" y="{H-8}" font-size="12" fill="{_MUTED}">'
+    parts.append(f'<text x="{L+pw/2:.1f}" y="{H-8}" text-anchor="middle" font-size="12" fill="{_MUTED}">'
                  f'{n:,} settled out-of-sample markets · {wr:.0f}% win rate · '
                  f'net-positive every month · {d0s}–{d1s}</text>')
     parts.append("</svg>")
@@ -194,6 +194,7 @@ def build_latency_svg() -> str:
                  f'stroke="{_GRID}" stroke-width="1"/>')
         p.append(f'<text x="{x:.1f}" y="{T+2*bh+gap+24:.1f}" text-anchor="middle" '
                  f'font-size="12" fill="{_MUTED}">{lab}</text>')
+    after_y = T  # baseline for the multiplier callout, set from the "After fix" row
     for i, (name, sec, col, lab) in enumerate(bars):
         y = T + i * (bh + gap)
         x2 = X(sec)
@@ -202,10 +203,14 @@ def build_latency_svg() -> str:
                  f'font-size="14" font-weight="600" fill="{_MUTED}">{name}</text>')
         p.append(f'<text x="{x2+10:.1f}" y="{y+bh/2+5:.1f}" font-size="15" '
                  f'font-weight="700" fill="{col}">{lab}</text>')
+        if name.startswith("After"):
+            after_y = y + bh / 2 + 5
+    # Multiplier callout sits in the open space at the right of the "After fix"
+    # row, well clear of the footnote on the bottom baseline.
     mult = round(_LAT_BEFORE_S / _LAT_AFTER_S)
-    p.append(f'<text x="{W-R}" y="{H-14}" text-anchor="end" font-size="14" '
+    p.append(f'<text x="{W-R}" y="{after_y:.1f}" text-anchor="end" font-size="16" '
              f'font-weight="700" fill="#2da36f">≈ {mult}× faster</text>')
-    p.append(f'<text x="{L}" y="{H-14}" font-size="12" fill="{_MUTED}">'
+    p.append(f'<text x="{W/2:.1f}" y="{H-14}" text-anchor="middle" font-size="12" fill="{_MUTED}">'
              f'log scale · non-sargable query full-scanning 9.3M rows + '
              f'~98 serial HTTP calls per iteration, fixed</text>')
     p.append("</svg>")

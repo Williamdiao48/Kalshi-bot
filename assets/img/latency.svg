@@ -14,6 +14,6 @@
 <rect x="150" y="150" width="170.6" height="52" rx="5" fill="#2da36f"/>
 <text x="136" y="181.0" text-anchor="end" font-size="14" font-weight="600" fill="#7d8590">After fix</text>
 <text x="330.6" y="181.0" font-size="15" font-weight="700" fill="#2da36f">~65 s</text>
-<text x="670" y="286" text-anchor="end" font-size="14" font-weight="700" fill="#2da36f">≈ 32× faster</text>
-<text x="150" y="286" font-size="12" fill="#7d8590">log scale · non-sargable query full-scanning 9.3M rows + ~98 serial HTTP calls per iteration, fixed</text>
+<text x="670" y="181.0" text-anchor="end" font-size="16" font-weight="700" fill="#2da36f">≈ 32× faster</text>
+<text x="380.0" y="286" text-anchor="middle" font-size="12" fill="#7d8590">log scale · non-sargable query full-scanning 9.3M rows + ~98 serial HTTP calls per iteration, fixed</text>
 </svg>
