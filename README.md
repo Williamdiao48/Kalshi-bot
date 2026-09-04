@@ -8,13 +8,9 @@ The strongest live edge is on **weather markets** (daily high/low temperature). 
 
 ## Results at a Glance
 
-The current model (v2) is evaluated purely out-of-sample: every prediction is logged *before* the market settles, at the real order-book price, as a 1-contract shadow bet. Over **2,409 settled markets** since the Jun 18 2026 pricing fix it holds a **72% win rate** and is **net-positive every month** (profit factor > 1). These are per-contract simulated results — the point is the *edge and consistency*, not the dollar magnitude.
+The current model (v2) is evaluated purely out-of-sample: every prediction is logged *before* the market settles, at the real order-book price, as a 1-contract shadow bet. Over **2,447 settled markets** since the Jun 18 2026 pricing fix it holds a **72% win rate** and is **net-positive every month** (profit factor > 1). These are per-contract simulated results — the point is the *edge and consistency*, not the dollar magnitude.
 
 ![Shadow model v2 — cumulative net P&L on a 1-contract book](assets/img/shadow_pnl.svg)
-
-Separately, an engineering fix collapsed the full poll cycle from **30–40 minutes to ~65 seconds (~30×)** — the dominant cause was a non-sargable SQLite query full-scanning 9.3M rows once per candidate market, alongside ~98 serial HTTP calls per fast-loop iteration.
-
-![Poll-cycle latency before vs. after the fix](assets/img/latency.svg)
 
 ---
 
@@ -97,7 +93,7 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 ### Numeric Sources (live value vs. strike price)
 | Source | Data | Kalshi Markets |
 |---|---|---|
-| NOAA/NWS day-1 forecast | Daily high/low temp — 20 cities | `KXHIGH*`, `KXLOWT*` |
+| NOAA/NWS day-1 forecast | Daily high/low temp — 21 cities (20 with overnight low) | `KXHIGH*`, `KXLOWT*` |
 | NOAA/NWS day-2+ forecast | Extended forecast, higher edge threshold | `KXHIGH*`, `KXLOWT*` |
 | NOAA observed (ASOS) | Observed daily max/min — running intraday ground truth | `KXHIGH*`, `KXLOWT*` |
 | METAR (airport ASOS) | Real-time airport observations, 5-8 min ahead of NOAA | `KXHIGH*`, `KXLOWT*` |
@@ -239,6 +235,9 @@ The core model effort. Two probability-calibrated **LightGBM classifiers** (one 
 ## Performance & Reliability
 
 - **Poll-cycle latency fix (`788f1e1`).** Cycles had degraded from seconds to **30–40 minutes** under four stacked defects. The dominant one: `raw_forecasts` queries wrapped the timestamp column in a function (`date(logged_at)=?`), which is non-sargable, so SQLite full-scanned all **9.3M rows** — ~9s per call, run once per candidate market in a loop. Rewritten as a half-open `[day, next_day)` range backed by a new index, plus splitting ~98 serial per-iteration HTTP calls into cache-backed (zero-HTTP) profit-take checks and a once-per-cycle settlement pass gathered under a semaphore. Cycle time dropped to **~65s** (~30×).
+
+  ![Poll-cycle latency before vs. after the fix](assets/img/latency.svg)
+
 - **Log rotation.** All logging goes to `logs/bot.log` via a `RotatingFileHandler` capped at 50 MB with 2 backups, so an overnight run can't fill the disk.
 - **Source-polling toggles.** `SKIP_EXTRA_SOURCES=true` stops polling every source that only feeds markets the bot doesn't trade (RSS/news, EDGAR, equity indices, forex, FRED/BLS/FedWatch, box office, Polymarket/Metaculus/PredictIt, congress, White House); weather, WTI, and crypto are unaffected. `POLL_NBA` is off by default (no requests out of season) and flipped on when the NBA season starts. `CYCLE_ONLY=true` quiets the console to just the per-cycle summary line while the log file keeps everything.
 - **IEM rate-limit backoff (`c0f7f91`).** The historical-cache extension retries IEM 429s with backoff instead of dropping days.
@@ -377,7 +376,7 @@ kalshi_bot/
     ├── whitehouse.py        White House Presidential Actions RSS — definitive
     │                          YES signals for executive order markets
     ├── noaa.py              NOAA/NWS forecast + METAR observed fetcher
-    │                          (20 cities, high + low; midnight→5 AM window
+    │                          (21 cities high, 20 low; midnight→5 AM window
     │                           for observed min to exclude daytime contamination)
     ├── metar.py             FAA METAR real-time station observations — running
     │                          daily max/min, 5-8 min ahead of NOAA aggregate
@@ -391,7 +390,7 @@ kalshi_bot/
     │                          (official daily high/low from NWS CLI text)
     ├── open_meteo.py        Open-Meteo multi-model forecast fetcher:
     │                          blended best_match, ECMWF IFS, ICON, GEM
-    │                          (high + low, all 20 cities; bias-corrected)
+    │                          (high + low, all 21 cities; bias-corrected)
     ├── weatherapi.py        WeatherAPI.com cross-validation fetcher
     ├── pinnacle.py          Pinnacle NBA moneyline/spread fetcher
     │                          (NBA game odds for KXNBA* markets)
