@@ -1,7 +1,31 @@
-aiohttp>=3.9
-cryptography>=42.0
-python-dotenv>=1.0
-requests>=2.31
+# ---------------------------------------------------------------------------
+# Core bot — required to run the poll loop and place/simulate trades.
+# ---------------------------------------------------------------------------
+aiohttp>=3.9            # all async HTTP (every data source, Kalshi API)
+cryptography>=42.0      # Kalshi V2 RSA-PSS request signing
+python-dotenv>=1.0      # .env config loading
+requests>=2.31          # a few legacy sync scripts (not used in the bot loop)
+
+# ---------------------------------------------------------------------------
+# Model layer — LightGBM band models + logistic-regression calibration.
+# The bot degrades gracefully without these: calibration falls back to a
+# formula and shadow scoring switches off if a model file / import is absent.
+# ---------------------------------------------------------------------------
+lightgbm>=4.0           # forecast-NO band classifiers (v1/v2)
+scikit-learn>=1.4       # isotonic + logistic calibration, training utilities
+joblib>=1.3             # model (.pkl) serialization / loading
+numpy>=1.26             # feature arrays
+pandas>=2.0             # training-data assembly, backtests
+
+# ---------------------------------------------------------------------------
+# Text classifier — fine-tuned DistilBERT direction model (classifier.py).
+# Only needed to train or run text-opportunity trading; heavy install.
+# ---------------------------------------------------------------------------
+transformers>=4.40      # DistilBERT inference pipeline
+torch>=2.2              # transformers backend
+sentence-transformers>=2.6  # semantic news↔market matching / labeling
+
+# ---------------------------------------------------------------------------
+# Optional — offline analysis only (BigQuery news-matching scripts).
+# ---------------------------------------------------------------------------
 google-cloud-bigquery>=3.0
-scikit-learn>=1.4
-joblib>=1.3
