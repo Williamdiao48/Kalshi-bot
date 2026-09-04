@@ -2,6 +2,20 @@
 
 An async Python bot that implements an **information-alpha** trading strategy on [Kalshi](https://kalshi.com/) prediction markets. It continuously ingests real-time data from a wide range of public sources, matches each signal to open Kalshi markets, and automatically places (or simulates) trades when a statistically significant edge is found.
 
+The strongest live edge is on **weather markets** (daily high/low temperature). On top of the rule-based matchers, the bot runs a layer of **trained models** — probability-calibrated LightGBM classifiers that predict band settlement directly from forecast data — evaluated continuously via **shadow trading** (parallel 1-contract simulated bets logged to the database, never sent to Kalshi) so a model's edge and calibration can be measured on out-of-sample markets before it is ever trusted with capital.
+
+---
+
+## Results at a Glance
+
+The current model (v2) is evaluated purely out-of-sample: every prediction is logged *before* the market settles, at the real order-book price, as a 1-contract shadow bet. Over **2,409 settled markets** since the Jun 18 2026 pricing fix it holds a **72% win rate** and is **net-positive every month** (profit factor > 1). These are per-contract simulated results — the point is the *edge and consistency*, not the dollar magnitude.
+
+![Shadow model v2 — cumulative net P&L on a 1-contract book](assets/img/shadow_pnl.svg)
+
+Separately, an engineering fix collapsed the full poll cycle from **30–40 minutes to ~65 seconds (~30×)** — the dominant cause was a non-sargable SQLite query full-scanning 9.3M rows once per candidate market, alongside ~98 serial HTTP calls per fast-loop iteration.
+
+![Poll-cycle latency before vs. after the fix](assets/img/latency.svg)
+
 ---
 
 ## How It Works
@@ -48,9 +62,10 @@ Every 60 seconds (configurable), the bot runs a full **fetch → match → score
 3. Numeric sources compare live values to market strikes using a calibrated probability model.
 4. External forecast platforms are matched to Kalshi via stemmed Jaccard similarity; material divergences become signals.
 5. METAR observed data triggers **band-pass arbitrage** on temperature partition markets.
-6. HRRR + NWS + Open-Meteo consensus triggers **forecast-driven NO** trades on bands four or more sources project to miss.
-7. Opportunities are **scored**, **filtered** through quality gates, and executed as dry-run or live trades.
-8. A lightweight **fast loop** (default every 10s) runs band-arb checks between full cycles for near-threshold cities.
+6. HRRR + NWS + Open-Meteo consensus triggers **forecast-driven NO** trades on bands four or more sources project to miss; a trained logistic-regression calibration model supplies the win probability (with a hardcoded-formula fallback if no model is present).
+7. In parallel, **LightGBM band models** (v1 + v2, isotonic-calibrated) score every open temperature band and log **shadow-model NO** bets — 1-contract simulated trades used purely to evaluate model edge/calibration out-of-sample, not to place real orders.
+8. Opportunities are **scored**, **filtered** through quality gates, and executed as dry-run or live trades.
+9. A lightweight **fast loop** (default every 10s) runs band-arb checks between full cycles for near-threshold cities.
 
 ---
 
@@ -196,9 +211,44 @@ Each opportunity passes through, in order:
 
 ---
 
+## Predictive Models
+
+The rule-based matchers above race the order book on latency. To sidestep that race, the bot layers **trained models** that predict a market's settlement directly from forecast data, and validates each one by shadow trading before it touches capital.
+
+### LightGBM band models (shadow scanner)
+The core model effort. Two probability-calibrated **LightGBM classifiers** (one for KXHIGH daily-high bands, one for KXLOWT overnight-low bands) predict the probability that a given temperature band resolves NO, from features derived from the multi-source forecast state — per-model edge/margin to the band ceiling, HRRR skill adjustment, inter-model spread, hours-to-close, city, and month. Raw scores are passed through an **isotonic calibrator** so the output is a usable probability, not just a ranking.
+
+- Models live in `data/models/forecast_no_band_model_{high,low}.pkl` (v1) and `..._v2_{high,low}.pkl` (v2). v2 adds alpha features (`hrrr_skill_adj`, `min_model_vs_ceil`, `margin_per_hour_left`) and is the better-calibrated model.
+- They run as a **broad shadow scanner**: every cycle, each open band is scored and — when it clears the model's entry gate — a 1-contract NO bet is logged to `shadow_model_no` (v1) / `shadow_model_no_v2` (v2). These are **simulated**; no order is sent to Kalshi. Each row records the real NO entry price, so P&L per settled bet is `+(100 − entry)` on a win and `−entry` on a loss.
+- This makes the models continuously measurable on genuinely **out-of-sample** markets (predictions logged before settlement), the metric that decides whether one is worth promoting to live sizing.
+- `shadow_report.py` regenerates human-readable `shadow_model_no_overview.txt` / `shadow_model_no_v2_overview.txt` reports — win rate, Brier score, profit factor, P&L — automatically every `SHADOW_OVERVIEW_REFRESH_S` seconds (default 6h) and on demand via `scripts/shadow_model_overview.py`.
+
+> **Note on shadow entry pricing.** Shadow NO bets are booked at the real NO **ask** (`8cc5ff4`, Jun 18 2026). Rows logged before that fix stored the wrong side of the book and are not comparable — start any shadow-model backtest on or after 2026-06-18.
+
+### Rolling-window retrain pipeline
+`scripts/retrain_forecast_no.sh` refreshes the v2 band models on accumulated data to counter seasonal calibration drift (models trained in spring go out-of-distribution by late summer). It chains the full pipeline end-to-end: extend the historical observation/forecast cache to today (`extend_hist_cache.py`) → force-refresh the settled-markets cache → rebuild the training CSVs → **back up the live `.pkl` files** → train (`train_forecast_no_model_v2.py --production`, which fits the isotonic calibrator on the newest slice) → print held-out validation metrics. Nothing auto-promotes: the trainer overwrites the deployed models in place, the timestamped backup enables rollback, and the running bot only picks up new weights on restart.
+
+### Logistic-regression calibration (live)
+`calibration.py` loads `data/models/forecast_no_cal.pkl` and supplies the win probability for the **live** forecast_no signal from continuous per-model edge values. If the file is absent the bot falls back to the original hardcoded `p_estimate` formula, so it runs with or without a trained model.
+
+### DistilBERT text classifier
+`classifier.py` loads a fine-tuned DistilBERT model (`models/kalshi_classifier/`) that scores `(market_title, article_text)` pairs to pick trade direction and confidence for **text** opportunities: `P(YES) > 0.5` → buy YES, else NO. Lazy-loaded at first use; if the model directory is absent, text trading is simply disabled.
+
+---
+
+## Performance & Reliability
+
+- **Poll-cycle latency fix (`788f1e1`).** Cycles had degraded from seconds to **30–40 minutes** under four stacked defects. The dominant one: `raw_forecasts` queries wrapped the timestamp column in a function (`date(logged_at)=?`), which is non-sargable, so SQLite full-scanned all **9.3M rows** — ~9s per call, run once per candidate market in a loop. Rewritten as a half-open `[day, next_day)` range backed by a new index, plus splitting ~98 serial per-iteration HTTP calls into cache-backed (zero-HTTP) profit-take checks and a once-per-cycle settlement pass gathered under a semaphore. Cycle time dropped to **~65s** (~30×).
+- **Log rotation.** All logging goes to `logs/bot.log` via a `RotatingFileHandler` capped at 50 MB with 2 backups, so an overnight run can't fill the disk.
+- **Source-polling toggles.** `SKIP_EXTRA_SOURCES=true` stops polling every source that only feeds markets the bot doesn't trade (RSS/news, EDGAR, equity indices, forex, FRED/BLS/FedWatch, box office, Polymarket/Metaculus/PredictIt, congress, White House); weather, WTI, and crypto are unaffected. `POLL_NBA` is off by default (no requests out of season) and flipped on when the NBA season starts. `CYCLE_ONLY=true` quiets the console to just the per-cycle summary line while the log file keeps everything.
+- **IEM rate-limit backoff (`c0f7f91`).** The historical-cache extension retries IEM 429s with backoff instead of dropping days.
+- **Settled-markets cache is merged, not replaced (`80ab57a`).** Retrains union new settled markets into the existing cache so history accumulates across runs rather than being overwritten.
+
+---
+
 ## Trade Execution & Dry Run
 
-By default the bot runs in **dry-run mode** (`TRADE_DRY_RUN=true`). Every intended trade is persisted to `opportunity_log.db` as if it had been placed — same sizing, same price — but no order is sent to Kalshi. Set `TRADE_DRY_RUN=false` to enable live order placement.
+By default the bot runs in **dry-run mode** (`TRADE_DRY_RUN=true`). Every intended trade is persisted to `data/db/opportunity_log.db` as if it had been placed — same sizing, same price — but no order is sent to Kalshi. Set `TRADE_DRY_RUN=false` to enable live order placement.
 
 ### Kelly sizing
 ```
@@ -225,7 +275,7 @@ High-confidence sources (`noaa_observed`, `metar`, `band_arb`, `nws_climo`, `nws
 When a new trade is blocked by `MAX_TOTAL_EXPOSURE_CENTS`, the bot greedily force-exits the most-settled open positions to free capital. Eligible positions are from high-confidence sources with current NO value ≥ `CAPITAL_RECYCLE_MIN_NO_VALUE` (default 97¢ — essentially at settlement). This ensures capital isn't idle in near-resolved positions when new signals appear.
 
 ### Dry-run ledger
-A live overview file (`dry_run_overview.txt`) is updated every cycle showing open positions, unrealized P&L, and cumulative performance — useful for evaluating signal quality before going live. Historical trades with outcomes are stored in `opportunity_log.db`.
+A live overview file (`dry_run_overview.txt`) is updated every cycle showing open positions, unrealized P&L, and cumulative performance — useful for evaluating signal quality before going live. Historical trades with outcomes are stored in `data/db/opportunity_log.db`.
 
 ---
 
@@ -272,19 +322,33 @@ kalshi_bot/
 │                            series_ticker targeted fetch (numeric markets)
 │                            + throttled general pagination (political markets)
 ├── market_parser.py       Ticker/title → ParsedMarket (direction + strike)
+├── cities.py              Canonical city registry — single source of truth for
+│                            coordinates, timezones, station IDs, NWS CLI codes
 ├── matcher.py             Keyword matching → Opportunity dataclass
 ├── numeric_matcher.py     Numeric matching → NumericOpportunity dataclass
+├── weather_filter.py      Forecast-consensus filter + observation-gate functions
+│                            (extracted from main.py — ~1,100 lines of temp logic)
 ├── polymarket_matcher.py  External forecast divergence matching (Polymarket,
 │                            Metaculus, PredictIt) with stemmed Jaccard
 ├── box_office_matcher.py  Box office gross estimate vs. Kalshi strike matching
+├── nba_convergence.py     Kalshi↔Pinnacle NBA moneyline/spread convergence
+├── spread_matcher.py      Synthetic spread detector across same-underlying markets
+├── bracket_arb.py         Series bracket arb across mutually-exclusive temp bands
+├── arb_detector.py        Combinatorial/logical arb — price monotonicity violations
 ├── strike_arb.py          Three signal types:
 │                            band_arb — METAR observed vs. KXHIGH partition markets
 │                            forecast_no — multi-source consensus NO on bands
 │                            strike_arb — multi-source forecast strike disagreement
 ├── openmeteo_bias_table.py  Per-source/city/month bias correction table for
 │                            Open-Meteo forecasts (2-year historical backtest)
+├── calibration.py         Live logistic-regression forecast_no win-prob model
+│                            (forecast_no_cal.pkl; formula fallback if absent)
+├── classifier.py          Fine-tuned DistilBERT text-direction inference engine
 ├── scoring.py             Composite score + per-source min-edge thresholds
 │                            for all opportunity types
+├── band_arb_sizer.py      Lookup-table Kelly sizer for band_arb YES entries
+├── band_arb_low_sizer.py  Lookup-table Kelly sizer for band_arb_low warm-NO (KXLOWT)
+├── release_schedule.py    Scheduled BLS/FRED/EIA release times — gates econ exec
 ├── trade_executor.py      Kelly sizing, quality gates, dry-run/live execution,
 │                            circuit breakers, capital recycling, filter statistics
 ├── exit_manager.py        Profit-take, stop-loss, trailing stop, counter-signal
@@ -292,10 +356,17 @@ kalshi_bot/
 ├── dry_run_ledger.py      Dry-run position tracking, P&L overview file
 │                            (dry_run_overview.txt), recyclable_trades() for
 │                            capital recycling
+├── shadow_forecast.py     Logs every temp forecast (incl. ECMWF/ICON/GEM) + IEM
+│                            daily-actual backfill → look-ahead-free error dataset
+├── shadow_report.py       Shadow-model (v1+v2) overview report generation
+├── db.py                  Central DB paths (data/db/) + schema migrations
 ├── opportunity_log.py     SQLite log of surfaced opportunities + raw_forecasts
 │                            table for per-source accuracy backtesting
+├── analytics.py           P&L attribution dashboard
 ├── win_rate_tracker.py    Per-category win rate analysis
 ├── portfolio.py           Live position fetcher and summariser
+├── display.py             Console formatting for surfaced opportunities
+├── utils.py               Shared utility helpers
 ├── state.py               SQLite deduplication for text sources (state.db)
 ├── data.py                Shared DataPoint dataclass
 └── news/
@@ -339,12 +410,24 @@ kalshi_bot/
     ├── metaculus.py         Metaculus community forecast fetcher
     ├── predictit.py         PredictIt contract fetcher
     ├── edgar.py             SEC EDGAR 8-K filing fetcher
-    └── nws_alerts.py        NWS severe weather alert fetcher
+    ├── box_office.py        Box Office Mojo weekend gross fetcher
+    ├── nws_alerts.py        NWS severe weather alert fetcher
+    ├── manifold.py          Manifold play-money market fetcher (not yet integrated)
+    ├── binance.py           Binance spot fetcher (not yet integrated)
+    ├── adp.py               ADP payrolls fetcher (not yet integrated)
+    ├── chicago_pmi.py       Chicago Business Barometer PMI (not yet integrated)
+    └── vlr.py               VLR.gg live Valorant match data (not yet integrated)
 
 run.py                   Entry point
-state.db                 Text deduplication database (auto-created)
-opportunity_log.db       Trade and opportunity history (auto-created)
+data/db/opportunity_log.db  Trade + opportunity history, shadow-model tables,
+                            raw_forecasts, circuit-breaker state (auto-created)
+data/db/state.db         Text deduplication database (auto-created)
+data/models/             Trained model bundles (.pkl): LightGBM band models
+                         (v1/v2), forecast_no calibration model
+models/kalshi_classifier/  Fine-tuned DistilBERT text classifier
+logs/bot.log             Rotating run log (50 MB × 2 backups)
 dry_run_overview.txt     Live dry-run P&L overview (auto-updated each cycle)
+shadow_model_no*_overview.txt  Shadow-model performance reports (auto-refreshed)
 market_discovery.py      Legacy reference file — do not modify
 ```
 
@@ -362,8 +445,15 @@ market_discovery.py      Legacy reference file — do not modify
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install aiohttp cryptography python-dotenv
+pip install -r requirements.txt
 ```
+The core bot needs only `aiohttp`, `cryptography`, and `python-dotenv`. The
+**model layer** additionally requires `lightgbm`, `scikit-learn`, `joblib`,
+`pandas`, and `numpy`; the **DistilBERT text classifier** further needs
+`transformers` and `torch`. The bot degrades gracefully when a model file is
+missing (calibration falls back to a formula, shadow scoring and text trading
+switch off), so the heavier ML dependencies are only required if you intend to
+train or run those models.
 
 ### Configure
 Create a `.env` file in the project root:
@@ -413,6 +503,16 @@ caffeinate -i venv/bin/python run.py
 | `KALSHI_ENVIRONMENT` | `demo` | `demo` or `production` |
 | `POLL_INTERVAL` | `60` | Seconds between full poll cycles |
 | `FAST_LOOP_INTERVAL` | `10` | Seconds between fast band-arb checks |
+
+### Runtime, logging & models
+| Env Var | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Root log level (`logs/bot.log` rotates at 50 MB × 2 backups) |
+| `CYCLE_ONLY` | `false` | Quiet console to only the per-cycle summary line; log file still captures everything |
+| `SKIP_EXTRA_SOURCES` | `false` | Stop polling sources that only feed untraded markets (news/EDGAR/equities/forex/econ/external markets); weather, WTI, crypto unaffected |
+| `POLL_NBA` | `false` | Poll Pinnacle + KXNBAGAME markets (off out of season) |
+| `SHADOW_OVERVIEW_REFRESH_S` | `21600` | Seconds between auto-regenerated shadow-model overview reports (6h) |
+| `CLASSIFIER_MODEL_PATH` | `models/kalshi_classifier` | Directory of the fine-tuned DistilBERT text classifier |
 
 ### Market fetching
 | Env Var | Default | Description |
@@ -528,11 +628,13 @@ caffeinate -i venv/bin/python run.py
 
 - **Market fetching uses a two-pronged strategy** to bypass Kalshi's pagination ordering, which places 10,000+ sports markets before any weather/crypto/political markets. A targeted `series_ticker=` fetch directly retrieves all known numeric series; a throttled general pagination (0.25s/page) collects political/text-matchable markets without hitting rate limits.
 - **All HTTP is async** via `aiohttp`; a shared `ClientSession` with a 30-connection pool is reused across all cycles.
-- **Deduplication** for text sources is SQLite-backed (`state.db`). Trade and opportunity history are persisted to `opportunity_log.db`, which also stores circuit breaker state, price snapshots for P&L tracking, and a `raw_forecasts` table capturing every weather source's forecast per cycle for post-hoc accuracy analysis.
+- **Deduplication** for text sources is SQLite-backed (`data/db/state.db`). Trade and opportunity history are persisted to `data/db/opportunity_log.db`, which also stores circuit breaker state, price snapshots for P&L tracking, the `shadow_model_no` / `shadow_model_no_v2` shadow-scanner tables, a `forecast_shadow_log` for look-ahead-free forecast-vs-actual error data, and a `raw_forecasts` table capturing every weather source's forecast per cycle for post-hoc accuracy analysis. Schema evolves through numbered migrations in `db.py`.
 - **Temperature matching** uses multiple independent weather sources. Sources are weighted by historical accuracy, with `noaa_observed` and `metar` carrying the highest confidence (direct observation, same ASOS station Kalshi uses for settlement). METAR data arrives 5–8 minutes ahead of NOAA's aggregated feed — the core edge for band-pass arbitrage.
 - **Open-Meteo bias correction**: ECMWF, ICON, GEM, and blended Open-Meteo forecasts carry systematic per-city, per-month biases. A calibration table (`openmeteo_bias_table.py`) derived from 2 years of historical forecast-vs-METAR data corrects each forecast before it enters the qualifying loop. `open_meteo_gfs` is intentionally excluded from signal generation — it is identical to the blended `open_meteo` source (same GFS model underneath).
 - **NWS rounding**: Kalshi temperature markets settle against NWS CLI integer daily highs/lows (rounded to nearest degree). All threshold comparisons include ±0.5°F buffers to guarantee the official rounded value crosses the boundary.
 - **Forecast_no vs. band_arb**: `band_arb` fires once METAR observation *confirms* a band has been crossed (near-certainty, late in the day). `forecast_no` fires earlier based on model consensus projecting a miss, while the market still prices a 20–55% chance of the band hitting — capturing the information gap before observation.
+- **Model validation by shadow trading**: trained models are never promoted to live sizing on a backtest alone. Each candidate scores every open band and logs a 1-contract simulated NO bet (`shadow_model_no*` tables) at the real order-book price, so its win rate, Brier score, and P&L accumulate on genuinely out-of-sample markets. This is how the v2 band models (better-calibrated, extra alpha features) were compared against v1 before either was trusted. The `raw_forecasts` and `forecast_shadow_log` tables provide the look-ahead-free training/eval data that make this honest.
+- **Module split**: `main.py` was a god-module; temperature consensus/observation logic (~1,100 lines) is factored into `weather_filter.py`, city constants into `cities.py`, DB paths + migrations into `db.py`, and console formatting into `display.py`, keeping the poll loop itself readable.
 - **METAR date anchoring**: METAR `as_of` timestamps are anchored to noon LST on the observation date (not the fetch time) so `numeric_matcher`'s date guard consistently gates each reading to the correct market day, preventing yesterday's afternoon peak from leaking into today's market around midnight.
 - **Band-pass arb fast loop**: A secondary async loop polls METAR every 10s (configurable) for cities within `WATCH_THRESHOLD_F` of a band ceiling. This allows intraday signals without waiting for the next full poll cycle.
 - **Low-temperature signals**: `noaa_observed` returns the running minimum since local midnight. At midnight this equals the current temperature, not the overnight low. The query window is capped at midnight→5 AM local, and a morning gate blocks trades before 05:00 local when the overnight trough hasn't yet been established.
@@ -551,7 +653,7 @@ Modules that exist in the codebase but are not yet wired into the live bot:
 
 | Module | Description | Status |
 |---|---|---|
-| `news/vlr.py` | VLR.gg live Valorant match data (map scores, round state) for esports markets | In development |
+| `news/vlr.py` | VLR.gg live Valorant match data (map scores, round state) for esports markets | Implemented, not integrated |
 | `news/manifold.py` | Manifold play-money prediction market divergence matching | Implemented, not integrated |
 | `news/binance.py` | Binance spot prices for BTC, ETH, SOL, XRP, DOGE and other crypto assets | Implemented, not integrated |
 | `news/adp.py` | ADP private-sector payrolls report — early NFP signal | Implemented, not integrated |
