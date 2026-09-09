@@ -3487,6 +3487,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _band_ceil = _note.get("band_ceil_f")
                 _metric = _note.get("metric") or _note.get("series")
@@ -3554,6 +3558,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _band_lo = _note.get("band_lo_f")
                 _metric  = _note.get("metric")
@@ -3593,6 +3601,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _metric   = _note.get("metric")
                 _strike_lo = _note.get("band_lo_f")
@@ -3793,6 +3805,10 @@ async def _position_watcher(
                 try:
                     note = _json.loads(note_str) if note_str else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", row_id, ticker,
+                        exc_info=True,
+                    )
                     continue
                 band_ceil = note.get("band_ceil_f")
                 metric = note.get("metric")
@@ -4399,7 +4415,7 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
                 feat_map["hrrr_skill_adj"], feat_map["min_model_vs_ceil"],
             )
         except Exception:
-            pass
+            logging.debug("[shadow_no_v2] entry-logging failed", exc_info=True)
 
 
 def _apply_settle_model_shadow_no_v2(conn, ticker: str, mkt: dict) -> None:

@@ -2088,6 +2088,12 @@ class TradeExecutor:
         # f* = (p·max_profit − (1-p)·total_cost) / max_profit
         max_p = spread.max_profit_cents
         total_c = spread.total_cost_cents
+        if max_p <= 0 or total_c <= 0:
+            logging.debug(
+                "Spread skip (degenerate max_profit/total_cost): %s/%s",
+                spread.leg_lo.market_ticker, spread.leg_hi.market_ticker,
+            )
+            return
         raw_kelly = (p_win * max_p - (1.0 - p_win) * total_c) / max_p
         if raw_kelly <= 0:
             logging.debug(
