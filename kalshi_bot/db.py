@@ -291,3 +291,42 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(10)")
         logging.info("DB schema migration V10 applied (raw_forecasts indices).")
+
+    if current < 11:
+        # Ahead-of-time HIGH model — forward shadow log (Phase 5).  One row per
+        # (band ticker) captured near the 09:00-local decision time, BEFORE the
+        # daily high forms.  Pure probability log: never trades.  model_p is the
+        # LightGBM N(mu,sigma) band probability; market_p is the concurrent
+        # implied prob; outcome/actual_f are backfilled at settlement.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_lookahead_high (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at      TEXT    NOT NULL,
+                city           TEXT    NOT NULL,
+                date_target    TEXT    NOT NULL,
+                ticker         TEXT    NOT NULL,
+                series         TEXT,
+                band_lo        REAL,
+                band_hi        REAL,
+                mu             REAL    NOT NULL,
+                sigma          REAL    NOT NULL,
+                model_p        REAL    NOT NULL,
+                market_yes_bid INTEGER,
+                market_yes_ask INTEGER,
+                market_p       REAL,
+                cutoff_local   TEXT,
+                settled_at     TEXT,
+                outcome        TEXT,
+                actual_f       REAL
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_lookahead_high_ticker
+                ON shadow_lookahead_high (ticker)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_slh_open
+                ON shadow_lookahead_high (date_target, outcome)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(11)")
+        logging.info("DB schema migration V11 applied (shadow_lookahead_high).")

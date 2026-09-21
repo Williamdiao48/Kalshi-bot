@@ -780,7 +780,7 @@ class ExitManager:
                     logged = parse_iso_dt(trade.logged_at)
                     if logged > _min_hold_cutoff:
                         continue
-                except (AttributeError, ValueError):
+                except (AttributeError, ValueError, TypeError):
                     pass
 
             cost = trade.total_cost_cents
@@ -1306,7 +1306,7 @@ class ExitManager:
                     logged = parse_iso_dt(trade.logged_at)
                     if logged > _cs_min_hold_cutoff:
                         continue
-                except (AttributeError, ValueError):
+                except (AttributeError, ValueError, TypeError):
                     pass
 
             # ---- Numeric counter-signal check --------------------------------
@@ -1843,7 +1843,7 @@ class ExitManager:
         exit_price = int(trade.current_mid)
         now = datetime.now(timezone.utc).isoformat()
         cost = trade.total_cost_cents
-        pct = pnl / cost * 100
+        pct = pnl / cost * 100 if cost else 0.0
         order_id: str | None = None
 
         if self._dry_run:

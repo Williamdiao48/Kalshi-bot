@@ -2088,6 +2088,12 @@ class TradeExecutor:
         # f* = (p·max_profit − (1-p)·total_cost) / max_profit
         max_p = spread.max_profit_cents
         total_c = spread.total_cost_cents
+        if max_p <= 0 or total_c <= 0:
+            logging.debug(
+                "Spread skip (degenerate max_profit/total_cost): %s/%s",
+                spread.leg_lo.market_ticker, spread.leg_hi.market_ticker,
+            )
+            return
         raw_kelly = (p_win * max_p - (1.0 - p_win) * total_c) / max_p
         if raw_kelly <= 0:
             logging.debug(
@@ -2758,8 +2764,14 @@ class TradeExecutor:
                 max_cents  = max(1, int(LOCKED_OBS_MAX_POSITION_CENTS * _dd_factor))
                 hard_cap   = LOCKED_OBS_MAX_CONTRACTS
             else:
+                # "under" / one-sided threshold markets have no lower bound
+                # (strike_lo is None); only the ceiling clearance binds.
+                _lower_clear = (
+                    float("inf") if signal.strike_lo is None
+                    else signal.observed_max - signal.strike_lo
+                )
                 min_clearance = min(
-                    signal.observed_max - signal.strike_lo,
+                    _lower_clear,
                     signal.band_ceil - signal.observed_max,
                 )
                 clearance_factor = min(0.20, min_clearance / 5.0)
@@ -2801,11 +2813,15 @@ class TradeExecutor:
 
         if not BAND_ARB_EXECUTION_ENABLED:
             if is_low_yes:
+                _margin_lo = (
+                    float("inf") if signal.strike_lo is None
+                    else signal.observed_max - signal.strike_lo
+                )
                 logging.info(
                     "BandArb LOW-YES DETECT-ONLY: %s YES×%d @ %d¢  p=%.2f"
                     "  margin_lo=%.1f°F  margin_hi=%.1f°F",
                     signal.ticker, count, signal.yes_ask, p_win,
-                    signal.observed_max - signal.strike_lo,
+                    _margin_lo,
                     signal.band_ceil - signal.observed_max,
                 )
             else:
@@ -2836,19 +2852,20 @@ class TradeExecutor:
                 return
 
         self.stats.trades_attempted += 1
+        _lo_str = "−∞" if signal.strike_lo is None else f"{signal.strike_lo:.1f}"
         if is_low_yes:
             score = round(0.70 + p_win * 0.15, 2)
             logging.info(
-                "BandArb LOW-YES: %s  obs_min=%.1f°F in [%.1f–%.1f]"
+                "BandArb LOW-YES: %s  obs_min=%.1f°F in [%s–%.1f]"
                 "  YES×%d @ %d¢  p=%.2f  %.1fh to close",
-                signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
+                signal.ticker, signal.observed_max, _lo_str, signal.band_ceil,
                 count, signal.yes_ask, p_win, signal.hours_to_close,
             )
         else:
             score = 1.0 if signal.is_locked else round(0.70 + p_win * 0.15, 2)
             logging.info(
-                "BandArb YES: %s  obs=%.1f°F in [%.1f–%.1f]  YES×%d @ %d¢  p=%.2f  (%s)",
-                signal.ticker, signal.observed_max, signal.strike_lo, signal.band_ceil,
+                "BandArb YES: %s  obs=%.1f°F in [%s–%.1f]  YES×%d @ %d¢  p=%.2f  (%s)",
+                signal.ticker, signal.observed_max, _lo_str, signal.band_ceil,
                 count, signal.yes_ask, p_win,
                 "locked" if signal.is_locked else "pre-lock",
             )
@@ -2862,9 +2879,9 @@ class TradeExecutor:
         _yes_note: dict = {
             "metric":       signal.metric,
             "observed_f":   round(signal.observed_max, 1),
-            "band_lo_f":    round(signal.strike_lo,    1),
+            "band_lo_f":    None if signal.strike_lo is None else round(signal.strike_lo, 1),
             "band_ceil_f":  round(signal.band_ceil,    1),
-            "margin_lo_f":  round(signal.observed_max - signal.strike_lo, 2),
+            "margin_lo_f":  None if signal.strike_lo is None else round(signal.observed_max - signal.strike_lo, 2),
             "margin_hi_f":  round(signal.band_ceil - signal.observed_max, 2),
             "sl_frac":      0.30 if (signal.band_ceil - signal.observed_max) >= 0.5 else 0.20,
             "is_locked":    signal.is_locked,

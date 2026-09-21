@@ -3487,6 +3487,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _band_ceil = _note.get("band_ceil_f")
                 _metric = _note.get("metric") or _note.get("series")
@@ -3554,6 +3558,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _band_lo = _note.get("band_lo_f")
                 _metric  = _note.get("metric")
@@ -3593,6 +3601,10 @@ async def _fast_loop(
                 try:
                     _note = _json.loads(_row_note) if _row_note else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", _row_id, _row_ticker,
+                        exc_info=True,
+                    )
                     continue
                 _metric   = _note.get("metric")
                 _strike_lo = _note.get("band_lo_f")
@@ -3738,6 +3750,10 @@ async def _fast_loop(
     _update_yes_momentum_shadows(conn=executor._conn, markets=fresh_markets)
     _update_model_shadow_no(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
     _update_model_shadow_no_v2(conn=executor._conn, markets=fresh_markets, obs_values=obs_values)
+    # Lookahead-HIGH is a full-distribution calibration log, not a strategy shadow:
+    # it internally widens to EVERY open band via the _market_by_ticker snapshot and
+    # uses fresh_markets only as a fresher-price overlay (see its docstring).
+    _update_shadow_lookahead_high(conn=executor._conn, markets=fresh_markets)
 
     # Profit-take checks — synchronous, zero HTTP.  Prefer the 10s watchlist price
     # when we have one, else fall back to the poll-cycle snapshot so positions off
@@ -3793,6 +3809,10 @@ async def _position_watcher(
                 try:
                     note = _json.loads(note_str) if note_str else {}
                 except Exception:
+                    logging.debug(
+                        "skip row %s (%s): bad note JSON", row_id, ticker,
+                        exc_info=True,
+                    )
                     continue
                 band_ceil = note.get("band_ceil_f")
                 metric = note.get("metric")
@@ -4399,7 +4419,7 @@ def _update_model_shadow_no_v2(conn, markets: list[dict], obs_values: dict[str, 
                 feat_map["hrrr_skill_adj"], feat_map["min_model_vs_ceil"],
             )
         except Exception:
-            pass
+            logging.debug("[shadow_no_v2] entry-logging failed", exc_info=True)
 
 
 def _apply_settle_model_shadow_no_v2(conn, ticker: str, mkt: dict) -> None:
@@ -4521,6 +4541,194 @@ def _apply_settle_forecast_band_yes(conn, ticker: str, mkt: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ahead-of-time HIGH model — forward shadow logger (Phase 5, never trades)
+#
+# Structural opposite of _update_model_shadow_no: it records the LightGBM
+# N(mu,sigma) band probabilities at the ~09:00-local *decision* time, BEFORE
+# the daily high forms or breaches a band, alongside the concurrent market
+# price.  Outcome is backfilled at settlement.  This is a pure probability log
+# for the Phase 5 forward, selection-bias-free eval — it opens no positions.
+# ---------------------------------------------------------------------------
+_lookahead_high_model = None
+_lookahead_high_loaded = False
+
+# ticker short code -> forecast_shadow_log / CITY_CODE display name.
+from .cities import CITIES as _CITIES_LOOKAHEAD  # noqa: E402
+_LOOKAHEAD_SHORT_TO_DISPLAY = {
+    k.replace("temp_high_", ""): v[0] for k, v in _CITIES_LOOKAHEAD.items()
+}
+
+
+def _load_lookahead_high_model() -> None:
+    """Load the ahead-of-time HIGH model pkl once at startup.  Never fatal."""
+    global _lookahead_high_model, _lookahead_high_loaded
+    try:
+        import scripts.shadow_lookahead as _LA
+        _lookahead_high_model = _LA.load_model(_LA.MODEL_PATH)
+    except Exception as exc:
+        logging.warning("Lookahead-HIGH model: load failed (%s) — logger disabled.", exc)
+        _lookahead_high_model = None
+    _lookahead_high_loaded = _lookahead_high_model is not None
+    logging.info(
+        "Lookahead-HIGH shadow model: %s",
+        "ok" if _lookahead_high_loaded else "missing/disabled",
+    )
+
+
+def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
+    """Log ahead-of-time HIGH band probabilities near the morning decision time.
+
+    Unlike v1/v2 (which shadow a near-threshold *trading* strategy and so only
+    care about watchlist bands), this is a full-distribution *calibration* log:
+    it records EVERY open HIGH band, not just the near-money watchlist, so the
+    model-vs-market Brier/log-loss is unbiased.  Universe = the full open-market
+    snapshot (`_market_by_ticker`), with the passed `markets` (fresh watchlist
+    prices) overlaid so on-watchlist bands get the freshest bid/ask.
+
+    Fires only in the [09:00, 11:00) city-local window so the captured market
+    price is contemporaneous with the model's 09:00-local feature cutoff.  A
+    UNIQUE(ticker) index means the first successful capture per band per day
+    sticks; later polls are no-ops.  Never places an order.
+    """
+    if not _lookahead_high_loaded:
+        return
+    import re as _re
+    try:
+        import scripts.shadow_lookahead as _LA
+        import scripts.build_lookahead_features as _FB
+    except Exception:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Bands already captured today — skip work once a band is logged.
+    logged: set[str] = {
+        row[0] for row in conn.execute(
+            "SELECT ticker FROM shadow_lookahead_high WHERE outcome IS NULL"
+        ).fetchall()
+    }
+
+    # Universe = every open band from the full snapshot, with fresh watchlist
+    # prices overlaid (fresher bid/ask wins).  If the snapshot is unusable we
+    # degrade gracefully to just the watchlist bands.
+    universe: dict[str, dict] = {}
+    if _snapshot_usable():
+        universe.update(_market_by_ticker)
+    for mkt in markets:
+        t = mkt.get("ticker")
+        if t:
+            universe[t] = mkt
+
+    # Group still-unlogged HIGH candidate bands by display-city, inside the window.
+    by_city: dict[str, list[dict]] = {}
+    city_date: dict[str, str] = {}
+    for mkt in universe.values():
+        ticker = mkt.get("ticker", "")
+        if ticker in logged:
+            continue
+        m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B(\d+\.?\d*)$", ticker)
+        if not m:
+            continue
+        series = m.group(1)
+        if series not in _MODEL_SHADOW_SERIES:
+            continue
+        city_code, is_high = _MODEL_SHADOW_SERIES[series]
+        if not is_high:
+            continue
+        display = _LOOKAHEAD_SHORT_TO_DISPLAY.get(city_code)
+        tz = _FB.CITY_TZ.get(display) if display else None
+        if tz is None:
+            continue
+        now_local = now_utc.astimezone(tz)
+        if not (9 <= now_local.hour < 11):          # morning decision window only
+            continue
+        by_city.setdefault(display, []).append(mkt)
+        city_date[display] = now_local.date().isoformat()
+
+    if not by_city:
+        return
+
+    for display, mkts in by_city.items():
+        date_target = city_date[display]
+        try:
+            feat = _LA.build_serve_features(conn, display, date_target, is_high=1)
+        except Exception as exc:
+            logging.debug("[lookahead_high] feature build failed for %s: %s", display, exc)
+            continue
+        if feat is None or feat.empty:
+            continue
+        try:
+            mu, sigma = _LA.predict_dist(_lookahead_high_model, feat)
+        except Exception as exc:
+            logging.debug("[lookahead_high] predict failed for %s: %s", display, exc)
+            continue
+
+        cutoff_local = _FB.cutoff_utc(display, date.fromisoformat(date_target), _LA.CUTOFF)
+        cutoff_iso = cutoff_local.isoformat() if cutoff_local is not None else None
+
+        for mkt in mkts:
+            ticker = mkt.get("ticker", "")
+            m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B(\d+\.?\d*)$", ticker)
+            if not m:
+                continue
+            series = m.group(1)
+            mid = float(m.group(2))
+            band_lo = int(mid - 0.5)
+            band_hi = band_lo + 1
+            model_p = _LA.band_prob(mu, sigma, band_lo, band_hi)
+
+            yes_bid = mkt.get("yes_bid")
+            yes_ask = mkt.get("yes_ask")
+            if yes_bid is not None and yes_ask is not None:
+                market_p = (yes_bid + yes_ask) / 200.0
+            elif yes_bid is not None:
+                market_p = yes_bid / 100.0
+            elif yes_ask is not None:
+                market_p = yes_ask / 100.0
+            else:
+                market_p = None
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO shadow_lookahead_high
+                      (logged_at, city, date_target, ticker, series, band_lo, band_hi,
+                       mu, sigma, model_p, market_yes_bid, market_yes_ask, market_p,
+                       cutoff_local)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (now_utc.isoformat(), display, date_target, ticker, series,
+                     float(band_lo), float(band_hi), round(mu, 3), round(sigma, 3),
+                     round(model_p, 4), yes_bid, yes_ask,
+                     round(market_p, 4) if market_p is not None else None,
+                     cutoff_iso),
+                )
+                logging.info(
+                    "[lookahead_high] %s  mu=%.1f sig=%.1f  model=%.0f%%  mkt=%s%%",
+                    ticker, mu, sigma, 100 * model_p,
+                    f"{100*market_p:.0f}" if market_p is not None else "?",
+                )
+            except Exception:
+                pass   # UNIQUE(ticker) violation = already captured today; ignore
+
+
+def _apply_settle_shadow_lookahead_high(conn, ticker: str, mkt: dict) -> None:
+    """Backfill outcome for a settled ahead-of-time HIGH shadow row."""
+    status = mkt.get("status", "")
+    result = mkt.get("result", "")
+    if status not in ("settled", "finalized") or result not in ("yes", "no"):
+        return
+    conn.execute(
+        """
+        UPDATE shadow_lookahead_high
+        SET outcome = ?, settled_at = ?
+        WHERE ticker = ? AND outcome IS NULL
+        """,
+        (result, datetime.now(timezone.utc).isoformat(), ticker),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shadow settlement resolver
 #
 # Runs once per poll cycle (not per fast-loop iteration).  A ticker still present
@@ -4538,6 +4746,7 @@ _SHADOW_TABLES: tuple[tuple[str, str, Callable[[object, str, dict], None]], ...]
     ("shadow_yes_momentum",      "exit_reason IS NULL", _apply_settle_yes_momentum),
     ("shadow_model_no",          "exit_reason IS NULL", _apply_settle_model_shadow_no),
     ("shadow_model_no_v2",       "exit_reason IS NULL", _apply_settle_model_shadow_no_v2),
+    ("shadow_lookahead_high",    "outcome IS NULL",     _apply_settle_shadow_lookahead_high),
 )
 
 _settle_retry_after: dict[str, float] = {}   # ticker → monotonic ts before which we don't retry
@@ -4672,6 +4881,7 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
 
     # Load NO-signal model + climatology for the shadow trader.
     _load_model_shadow()
+    _load_lookahead_high_model()
 
     # Seed calibrated priors from any historical data already in the DB.
     executor.refresh_calibrated_priors(win_tracker)
