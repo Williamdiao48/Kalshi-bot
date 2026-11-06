@@ -4626,7 +4626,7 @@ def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
         ticker = mkt.get("ticker", "")
         if ticker in logged:
             continue
-        m = _re.match(r"^([A-Z]+)-\d{2}[A-Z]{3}\d{2}-B(\d+\.?\d*)$", ticker)
+        m = _re.match(r"^([A-Z]+)-(\d{2}[A-Z]{3}\d{2})-B(\d+\.?\d*)$", ticker)
         if not m:
             continue
         series = m.group(1)
@@ -4641,6 +4641,15 @@ def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
             continue
         now_local = now_utc.astimezone(tz)
         if not (9 <= now_local.hour < 11):          # morning decision window only
+            continue
+        # Only today's contracts: the model forecasts today's high, and tomorrow's
+        # bands are also open at 09:00. Logging those under today's date_target
+        # scored them against the wrong day's distribution.
+        try:
+            ticker_date = datetime.strptime(m.group(2), "%y%b%d").date()
+        except ValueError:
+            continue
+        if ticker_date != now_local.date():
             continue
         by_city.setdefault(display, []).append(mkt)
         city_date[display] = now_local.date().isoformat()

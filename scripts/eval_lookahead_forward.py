@@ -78,7 +78,18 @@ def load_rows(db: str) -> pd.DataFrame:
         return df
     df["y"] = (df["outcome"] == "yes").astype(int)
     df["date_target"] = pd.to_datetime(df["date_target"]).dt.date
-    return df
+
+    # Before the logger fix, next-day contracts were logged under today's
+    # date_target and scored with today's distribution. Keep only rows whose
+    # contract date matches date_target.
+    ticker_date = pd.to_datetime(
+        df["ticker"].str.extract(r"-(\d{2}[A-Z]{3}\d{2})-")[0],
+        format="%y%b%d", errors="coerce").dt.date
+    matched = ticker_date == df["date_target"]
+    if (~matched).any():
+        print(f"dropped {int((~matched).sum()):,} of {len(df):,} rows whose contract "
+              f"date != date_target (pre-fix mis-dated captures)")
+    return df[matched].reset_index(drop=True)
 
 
 def attach_actual(df: pd.DataFrame, db: str) -> pd.DataFrame:
