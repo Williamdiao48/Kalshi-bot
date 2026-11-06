@@ -60,18 +60,25 @@ def parse_args() -> argparse.Namespace:
                    help="warn (don't fail) below this many settled city-days")
     p.add_argument("--near", type=float, nargs=2, default=(0.1, 0.9),
                    metavar=("LO", "HI"), help="near-money market_p band")
+    p.add_argument("--model", default="v2",
+                   help="model_version prefix to score: v2 (default) or v1. "
+                        "Never pool versions -- they are different models.")
     return p.parse_args()
 
 
-def load_rows(db: str) -> pd.DataFrame:
-    """Settled forward-log rows, with outcome mapped to 0/1 and dates parsed."""
+def load_rows(db: str, model: str = "v2") -> pd.DataFrame:
+    """Settled forward-log rows of one model version, outcome mapped to 0/1.
+
+    Rows logged by the pre-V12 bot carry NULL model_version; they are v1.
+    """
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         df = pd.read_sql_query(
             "SELECT city, date_target, ticker, band_lo, band_hi, mu, sigma, "
             "       model_p, market_yes_bid, market_yes_ask, market_p, "
             "       outcome, actual_f "
-            "FROM shadow_lookahead_high WHERE outcome IN ('yes','no')", con)
+            "FROM shadow_lookahead_high WHERE outcome IN ('yes','no') "
+            "  AND COALESCE(model_version, 'v1') LIKE ?", con, params=(f"{model}%",))
     finally:
         con.close()
     if df.empty:
@@ -93,16 +100,17 @@ def load_rows(db: str) -> pd.DataFrame:
 
 
 def attach_actual(df: pd.DataFrame, db: str) -> pd.DataFrame:
-    """Fill actual_f (the realized daily high) from forecast_shadow_log labels.
+    """Fill actual_f (the realized daily high) from the official CLI labels.
 
-    The logger leaves actual_f NULL; the realized high is recoverable from the
-    labeled shadow log by (city, date_target). Needed only for CRPS/PIT.
+    The logger leaves actual_f NULL. cli_daily is the Kalshi settlement source
+    (IEM max_tmpf, used before, disagreed with it on ~1/3 of days). Needed only
+    for CRPS/PIT.
     """
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         lab = pd.read_sql_query(
-            "SELECT city, date_target, actual_f FROM forecast_shadow_log "
-            "WHERE is_high=1 AND actual_f IS NOT NULL", con)
+            "SELECT city, date AS date_target, high_f AS actual_f FROM cli_daily "
+            "WHERE high_f IS NOT NULL", con)
     finally:
         con.close()
     if lab.empty:
@@ -222,10 +230,11 @@ def report_distribution(df: pd.DataFrame) -> None:
 
 def main() -> None:
     a = parse_args()
-    df = load_rows(a.db)
+    df = load_rows(a.db, a.model)
+    print(f"model_version: {a.model}*")
     if df.empty:
-        print("shadow_lookahead_high has no SETTLED rows yet — the forward log is "
-              "still accumulating. Re-run after some band days have settled.")
+        print("shadow_lookahead_high has no SETTLED rows for this model yet — the "
+              "forward log is still accumulating. Re-run after some band days settle.")
         return
 
     df = attach_actual(df, a.db)
