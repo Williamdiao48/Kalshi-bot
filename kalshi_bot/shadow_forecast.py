@@ -65,6 +65,16 @@ _IEM_BACKFILL_MIN_AGE_DAYS = 2
 
 _IEM_DAILY_URL = "https://mesonet.agron.iastate.edu/api/1/daily.json"
 
+# IEM archive of the NWS CLI daily climate report — the product Kalshi settles
+# HIGH/LOW markets on. Station = "K" + the ASOS id above. Dallas Love Field
+# (CLIDAL) is not archived by IEM nor served by api.weather.gov, so Dallas has
+# no CLI label and is excluded from CLI-labelled models.
+_IEM_CLI_URL = "https://mesonet.agron.iastate.edu/json/cli.py"
+_CLI_UNAVAILABLE = {"Dallas"}
+# A same-day "preliminary" CLI exists; the final is issued early the next
+# morning. Only store dates at least this old, and upsert so re-fetches win.
+_CLI_MIN_AGE_DAYS = 2
+
 
 def log_shadow_forecasts(
     conn: sqlite3.Connection,
@@ -212,3 +222,86 @@ async def backfill_iem_actuals(
 
     if updates:
         logging.info("shadow_forecast backfill: wrote actual_f for %d group(s).", updates)
+
+
+def _cli_num(v: Any) -> float | None:
+    """CLI JSON numbers come as ints, or "M" (missing) / "T" (trace) / None."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_cli_results(
+    city: str, station: str, payload: dict, max_date: str, fetched_at: str,
+) -> list[tuple]:
+    """IEM cli.py JSON -> cli_daily rows for dates <= max_date (YYYY-MM-DD)."""
+    rows = []
+    for r in payload.get("results", []) or []:
+        d = r.get("valid")
+        if not d or d > max_date:
+            continue
+        high, low = _cli_num(r.get("high")), _cli_num(r.get("low"))
+        if high is None and low is None:
+            continue
+        rows.append((city, d, station, high, low,
+                     _cli_num(r.get("high_normal")), _cli_num(r.get("low_normal")),
+                     fetched_at))
+    return rows
+
+
+async def backfill_cli_actuals(
+    conn: sqlite3.Connection,
+    session: aiohttp.ClientSession,
+    years: list[int] | None = None,
+) -> int:
+    """Upsert official NWS CLI daily highs/lows into cli_daily.
+
+    One IEM request per (city, year). Defaults to the current UTC year, plus the
+    previous year during the first week of January so late finals land. Called
+    once per day by the poll loop; also usable for a one-off historical fill.
+    Returns the number of rows upserted.
+    """
+    today = datetime.now(timezone.utc).date()
+    if years is None:
+        years = [today.year] + ([today.year - 1] if today.timetuple().tm_yday <= 7 else [])
+    max_date = (today - timedelta(days=_CLI_MIN_AGE_DAYS)).isoformat()
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    rows: list[tuple] = []
+    for city, (asos, _network) in sorted(_IEM_CITY_STATIONS.items()):
+        if city in _CLI_UNAVAILABLE:
+            continue
+        station = f"K{asos}"
+        for year in years:
+            url = f"{_IEM_CLI_URL}?station={station}&year={year}"
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    resp.raise_for_status()
+                    payload = await resp.json(content_type=None)
+            except Exception as exc:
+                logging.warning("cli backfill: IEM fetch error %s/%d: %s", station, year, exc)
+                await asyncio.sleep(0.3)
+                continue
+            rows.extend(parse_cli_results(city, station, payload, max_date, fetched_at))
+            await asyncio.sleep(0.3)
+
+    if not rows:
+        return 0
+    try:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO cli_daily
+                (city, date, station, high_f, low_f, high_normal_f, low_normal_f, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    except Exception as exc:
+        logging.warning("cli backfill: upsert error: %s", exc)
+        return 0
+    logging.info("cli backfill: upserted %d city-day(s) through %s.", len(rows), max_date)
+    return len(rows)

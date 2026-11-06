@@ -330,3 +330,28 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("INSERT INTO schema_version(version) VALUES(11)")
         logging.info("DB schema migration V11 applied (shadow_lookahead_high).")
+
+    if current < 12:
+        # V12 — official NWS CLI daily climate report (the Kalshi settlement
+        # source), used as the lookahead model's label. IEM's METAR-derived
+        # max_tmpf disagrees with the CLI on ~1/3 of city-days (hourly obs miss
+        # the peak), so it is NOT a valid training target for settlement.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cli_daily (
+                city           TEXT    NOT NULL,
+                date           TEXT    NOT NULL,
+                station        TEXT,
+                high_f         REAL,
+                low_f          REAL,
+                high_normal_f  REAL,
+                low_normal_f   REAL,
+                fetched_at     TEXT    NOT NULL,
+                PRIMARY KEY (city, date)
+            )
+        """)
+        # Separate rows scored by different lookahead models; pre-V12 rows are v1.
+        _add_col("shadow_lookahead_high", "model_version", "TEXT")
+        conn.execute("UPDATE shadow_lookahead_high SET model_version = 'v1' "
+                     "WHERE model_version IS NULL")
+        conn.execute("INSERT INTO schema_version(version) VALUES(12)")
+        logging.info("DB schema migration V12 applied (cli_daily, lookahead model_version).")
