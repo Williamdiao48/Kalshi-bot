@@ -9,6 +9,10 @@ Two jobs, both importable by main.py's poll loop and runnable offline for testin
      failure mode called out for the old forecast_no model).
   2. predict_bands(model, feat_row, bands) -> per-band P(YES) from N(mu, sigma_recal).
 
+v2 models (target == "resid_consensus") predict a correction to consensus_median;
+predict_dist adds it back. v1 bundles are refused by load_model: their features
+(raw levels, month, clim_high) are no longer built.
+
 Offline self-test (the anti-skew proof): rebuild features for a labeled city-day and
 assert they match data/lookahead/features_high.parquet row-for-row.
 
@@ -29,25 +33,40 @@ from scipy.stats import norm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scripts.build_lookahead_features as FB  # noqa: E402
+from kalshi_bot.shadow_forecast import _CLI_UNAVAILABLE  # noqa: E402
 
 CUTOFF = time(9, 0)
 MIN_CORE = 3
 MAE_WINDOW = 14
 MODEL_PATH = "data/models/lookahead_high.pkl"
+STALE_WARN_DAYS = 10      # retrain is weekly; warn when a model is this old
+STALE_SKIP_DAYS = 21      # and stop logging rather than score with a stale model
 
 
 def load_model(path: str = MODEL_PATH) -> dict | None:
     try:
         with open(path, "rb") as f:
-            return pickle.load(f)
+            model = pickle.load(f)
     except FileNotFoundError:
+        return None
+    if model.get("target") != "resid_consensus":
+        raise ValueError(f"{path} is a pre-v2 bundle; retrain with "
+                         "scripts/train_lookahead_high_model.py --save-model")
+    return model
+
+
+def model_age_days(model: dict, today) -> int | None:
+    """Days between the model's last training label and `today`."""
+    try:
+        return (today - pd.to_datetime(model["trained_through"]).date()).days
+    except Exception:
         return None
 
 
 def _melted_for_city(conn: sqlite3.Connection, city: str, is_high: int) -> pd.DataFrame:
     """All shadow-log rows for one city (its history is needed for trailing skill)."""
     df = pd.read_sql_query(
-        "SELECT logged_at, city, date_target, source, forecast_f, actual_f "
+        "SELECT logged_at, city, date_target, source, forecast_f "
         "FROM forecast_shadow_log WHERE is_high = ? AND city = ?",
         conn, params=(is_high, city))
     df["logged_at"] = pd.to_datetime(df["logged_at"], utc=True, format="mixed")
@@ -58,13 +77,16 @@ def _melted_for_city(conn: sqlite3.Connection, city: str, is_high: int) -> pd.Da
 def build_serve_features(conn: sqlite3.Connection, city: str, date_target,
                          is_high: int = 1) -> pd.DataFrame | None:
     """Feature row for (city, date_target) at the 09:00-local cutoff. None if absent."""
+    if city in _CLI_UNAVAILABLE:                          # no settlement-grade label
+        return None
     if isinstance(date_target, str):
         date_target = pd.to_datetime(date_target).date()
     df = _melted_for_city(conn, city, is_high)
     if df.empty:
         return None
+    cli = FB.load_cli(conn, is_high, city)
     latest = FB.latest_before_cutoff(df, CUTOFF)          # enforces logged_at<=cutoff
-    wide = FB.pivot_features(latest)
+    wide = FB.pivot_features(latest, cli)
     wide = FB.add_derived(wide, MIN_CORE)                 # n_core>=3 quality gate
     wide = FB.add_trailing_skill(wide, MAE_WINDOW)        # prior-days-only skill
     row = wide[wide["date_target"] == date_target]
@@ -75,7 +97,12 @@ def predict_dist(model: dict, feat_row: pd.DataFrame):
     """(mu, sigma_recal) for a 1-row feature frame."""
     X = feat_row[model["features"]]
     mu = float(model["mu_model"].predict(X)[0])
-    sig = float(model["sigma_model"].predict(X)[0]) * np.sqrt(np.pi / 2.0)
+    if model.get("target") == "resid_consensus":
+        cons = float(feat_row["consensus_median"].iloc[0])
+        if not np.isfinite(cons):
+            raise ValueError("consensus_median missing")
+        mu += cons
+    sig = max(float(model["sigma_model"].predict(X)[0]) * model["sigma_scale"], 0.0)
     sig = max(sig, model["sigma_floor"]) * model["recal"]
     return mu, sig
 
@@ -95,7 +122,7 @@ def predict_bands(model: dict, feat_row: pd.DataFrame,
 def selftest(db: str) -> None:
     """Prove serve features == training features for labeled city-days."""
     train = pd.read_parquet("data/lookahead/features_high.parquet")
-    feat_cols = [c for c in train.columns if c not in ("city", "date_target", "actual_f")]
+    feat_cols = FB.feature_columns(train) + ["consensus_median"]
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         sample = train.sample(min(8, len(train)), random_state=1)

@@ -66,7 +66,7 @@ from .release_schedule import is_within_release_window, next_release
 from .state import SeenDocuments
 from .win_rate_tracker import WinRateTracker, WIN_RATE_REPORT_INTERVAL
 from .analytics import run_attribution
-from .shadow_forecast import log_shadow_forecasts, backfill_iem_actuals
+from .shadow_forecast import log_shadow_forecasts, backfill_iem_actuals, backfill_cli_actuals
 from .shadow_report import regenerate_overviews
 from .weather_filter import (
     _ET,
@@ -4551,6 +4551,8 @@ def _apply_settle_forecast_band_yes(conn, ticker: str, mkt: dict) -> None:
 # ---------------------------------------------------------------------------
 _lookahead_high_model = None
 _lookahead_high_loaded = False
+_lookahead_high_mtime: float | None = None    # pkl mtime at last load (hot reload)
+_lookahead_stale_warned: str | None = None    # date of last staleness warning
 
 # ticker short code -> forecast_shadow_log / CITY_CODE display name.
 from .cities import CITIES as _CITIES_LOOKAHEAD  # noqa: E402
@@ -4560,10 +4562,18 @@ _LOOKAHEAD_SHORT_TO_DISPLAY = {
 
 
 def _load_lookahead_high_model() -> None:
-    """Load the ahead-of-time HIGH model pkl once at startup.  Never fatal."""
-    global _lookahead_high_model, _lookahead_high_loaded
+    """Load the ahead-of-time HIGH model pkl.  Never fatal.
+
+    Called at startup and again whenever the pkl's mtime changes (the weekly
+    retrain job atomically replaces it), so a retrain needs no bot restart.
+    """
+    global _lookahead_high_model, _lookahead_high_loaded, _lookahead_high_mtime
     try:
         import scripts.shadow_lookahead as _LA
+        try:
+            _lookahead_high_mtime = os.stat(_LA.MODEL_PATH).st_mtime
+        except OSError:
+            _lookahead_high_mtime = None
         _lookahead_high_model = _LA.load_model(_LA.MODEL_PATH)
     except Exception as exc:
         logging.warning("Lookahead-HIGH model: load failed (%s) — logger disabled.", exc)
@@ -4571,8 +4581,20 @@ def _load_lookahead_high_model() -> None:
     _lookahead_high_loaded = _lookahead_high_model is not None
     logging.info(
         "Lookahead-HIGH shadow model: %s",
-        "ok" if _lookahead_high_loaded else "missing/disabled",
+        _lookahead_high_model.get("version", "ok") if _lookahead_high_loaded
+        else "missing/disabled",
     )
+
+
+def _maybe_reload_lookahead_high_model() -> None:
+    """Reload if the pkl on disk changed since the last load (cheap stat)."""
+    try:
+        import scripts.shadow_lookahead as _LA
+        mtime = os.stat(_LA.MODEL_PATH).st_mtime
+    except Exception:
+        return
+    if mtime != _lookahead_high_mtime:
+        _load_lookahead_high_model()
 
 
 def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
@@ -4589,7 +4611,13 @@ def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
     price is contemporaneous with the model's 09:00-local feature cutoff.  A
     UNIQUE(ticker) index means the first successful capture per band per day
     sticks; later polls are no-ops.  Never places an order.
+
+    Rows carry the model's `version` (e.g. "v2@2026-11-04") so evals never mix
+    models.  A model older than STALE_SKIP_DAYS stops logging (the weekly
+    retrain job has failed) rather than score with a drifting model.
     """
+    global _lookahead_stale_warned
+    _maybe_reload_lookahead_high_model()
     if not _lookahead_high_loaded:
         return
     import re as _re
@@ -4600,6 +4628,19 @@ def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
         return
 
     now_utc = datetime.now(timezone.utc)
+    model_version = _lookahead_high_model.get("version", "v2")
+    age = _LA.model_age_days(_lookahead_high_model, now_utc.date())
+    if age is not None and age > _LA.STALE_WARN_DAYS:
+        today = now_utc.date().isoformat()
+        if _lookahead_stale_warned != today:
+            _lookahead_stale_warned = today
+            logging.warning(
+                "[lookahead_high] model %s is %d days old (retrain job failing?)%s",
+                model_version, age,
+                " — logging PAUSED" if age > _LA.STALE_SKIP_DAYS else "",
+            )
+        if age > _LA.STALE_SKIP_DAYS:
+            return
 
     # Bands already captured today — skip work once a band is logged.
     logged: set[str] = {
@@ -4703,14 +4744,14 @@ def _update_shadow_lookahead_high(conn, markets: list[dict]) -> None:
                     INSERT INTO shadow_lookahead_high
                       (logged_at, city, date_target, ticker, series, band_lo, band_hi,
                        mu, sigma, model_p, market_yes_bid, market_yes_ask, market_p,
-                       cutoff_local)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       cutoff_local, model_version)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (now_utc.isoformat(), display, date_target, ticker, series,
                      float(band_lo), float(band_hi), round(mu, 3), round(sigma, 3),
                      round(model_p, 4), yes_bid, yes_ask,
                      round(market_p, 4) if market_p is not None else None,
-                     cutoff_iso),
+                     cutoff_iso, model_version),
                 )
                 logging.info(
                     "[lookahead_high] %s  mu=%.1f sig=%.1f  model=%.0f%%  mkt=%s%%",
@@ -4932,6 +4973,12 @@ async def run(*, poll_interval: int = POLL_INTERVAL_SECONDS) -> None:
                         await backfill_iem_actuals(_shared_conn, session)
                     except Exception as exc:
                         logging.warning("shadow_forecast backfill error: %s", exc)
+                    # Official NWS CLI labels (Kalshi settlement source) for the
+                    # lookahead model's targets and trailing-skill features.
+                    try:
+                        await backfill_cli_actuals(_shared_conn, session)
+                    except Exception as exc:
+                        logging.warning("cli backfill error: %s", exc)
 
                 # Shadow overview reports — rebuilt on a fixed cadence (default 6h),
                 # and once on the first cycle after startup so they are never stale
