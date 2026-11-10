@@ -41,6 +41,7 @@ from scipy.stats import norm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from kalshi_bot.cities import CITIES  # noqa: E402
+from kalshi_bot.fees import FEE_SCHEDULES  # noqa: E402
 from kalshi_bot.market_parser import TICKER_TO_METRIC  # noqa: E402
 
 # ticker prefix -> display city (longest-prefix match; metric -> CITIES display)
@@ -49,7 +50,6 @@ _PREFIX_CITY = {pfx: CITIES[m][0] for pfx, m in TICKER_TO_METRIC.items()
 _PREFIXES = sorted(_PREFIX_CITY, key=len, reverse=True)  # longest first
 CITY_TZ = {v[0]: v[3] for v in CITIES.values()}
 
-FEE = 0.01          # Kalshi ~1c/contract proxy (fraction of $1 notional)
 EDGE_THR = 0.08     # min model-vs-market edge to "trade" in the P&L proxy
 
 
@@ -140,23 +140,44 @@ def calib_table(df, pcol, ycol, bins=(0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1.0
     return g
 
 
-def pnl_proxy(df):
+def trade_pnl(model_p, yes_bid_c, yes_ask_c, y):
     """Trade the model's edge vs the book at decision time, settle at outcome.
 
-    Buy YES at ask when model_p - ask > EDGE_THR; buy NO at (1-bid) when
-    bid - model_p > EDGE_THR. Payoff in $1 notional, minus a per-trade fee.
+    Buy YES at the ask when model_p - ask > EDGE_THR; buy NO at (1 - bid) when
+    bid - model_p > EDGE_THR. Rows without a two-sided book never trade.
+    Returns (gross P&L per contract in $, entry price paid in $, traded mask);
+    fees are applied by report_pnl so every schedule sees the same trades.
     """
-    ask = df["yes_ask"] / 100.0
-    bid = df["yes_bid"] / 100.0
-    y = df["outcome"].to_numpy()
-    mp = df["model_p"].to_numpy()
-    pnl = np.zeros(len(df)); traded = np.zeros(len(df), bool); side = np.array([""] * len(df), object)
-    buy_yes = mp - ask.to_numpy() > EDGE_THR
-    buy_no = bid.to_numpy() - mp > EDGE_THR
-    pnl[buy_yes] = np.where(y[buy_yes] == 1, 1 - ask.to_numpy()[buy_yes], -ask.to_numpy()[buy_yes]) - FEE
-    pnl[buy_no] = np.where(y[buy_no] == 0, bid.to_numpy()[buy_no], -(1 - bid.to_numpy()[buy_no])) - FEE
-    traded = buy_yes | buy_no
-    return pnl, traded
+    mp = np.asarray(model_p, dtype=float)
+    ask = np.asarray(yes_ask_c, dtype=float) / 100.0
+    bid = np.asarray(yes_bid_c, dtype=float) / 100.0
+    y = np.asarray(y)
+    book = np.isfinite(ask) & np.isfinite(bid)
+    buy_yes = book & (mp - ask > EDGE_THR)
+    buy_no = book & (bid - mp > EDGE_THR)
+    gross = np.zeros(len(mp)); price = np.zeros(len(mp))
+    gross[buy_yes] = np.where(y[buy_yes] == 1, 1 - ask[buy_yes], -ask[buy_yes])
+    gross[buy_no] = np.where(y[buy_no] == 0, bid[buy_no], -(1 - bid[buy_no]))
+    price[buy_yes] = ask[buy_yes]
+    price[buy_no] = 1 - bid[buy_no]
+    return gross, price, buy_yes | buy_no
+
+
+def report_pnl(gross, price, traded) -> None:
+    """P&L of the same trades under each fee schedule (flat 1c vs Kalshi's)."""
+    n_t = int(traded.sum())
+    print(f"\nP&L proxy (edge>{EDGE_THR}): trades={n_t}/{len(traded)}, "
+          f"$1 notional per contract")
+    if not n_t:
+        return
+    g, px = gross[traded], price[traded]
+    print(f"  {'gross (no fee)':<22} total={g.sum():+8.2f}  mean/trade={g.mean():+.4f}  "
+          f"win rate {(g > 0).mean():.3f}")
+    for name, fee_fn in FEE_SCHEDULES.items():
+        fee = fee_fn(px)
+        net = g - fee
+        print(f"  {name:<22} total={net.sum():+8.2f}  mean/trade={net.mean():+.4f}  "
+              f"(avg fee {fee.mean() * 100:.2f}c)")
 
 
 def main() -> None:
@@ -205,13 +226,7 @@ def main() -> None:
     print("\nmarket calibration (sanity — should be near-diagonal):")
     print(calib_table(df, "market_p", "outcome").to_string())
 
-    pnl, traded = pnl_proxy(df)
-    n_t = int(traded.sum())
-    print(f"\nP&L proxy (edge>{EDGE_THR}, fee {FEE}): trades={n_t}/{len(df)}  "
-          f"total={pnl[traded].sum():+.2f}  mean/trade={pnl[traded].mean() if n_t else 0:+.4f}")
-    if n_t:
-        wins = ((df['outcome'].to_numpy()[traded] == 1) & (pnl[traded] > 0)).sum()
-        print(f"  gross win rate on trades: {(pnl[traded] > 0).mean():.3f}")
+    report_pnl(*trade_pnl(df["model_p"], df["yes_bid"], df["yes_ask"], df["outcome"]))
 
     print("\nCAVEAT: selection-biased subset (only bot-flagged near-money bands); a "
           "clean full-distribution test needs forward shadow logging (Phase 5).")
