@@ -355,3 +355,40 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                      "WHERE model_version IS NULL")
         conn.execute("INSERT INTO schema_version(version) VALUES(12)")
         logging.info("DB schema migration V12 applied (cli_daily, lookahead model_version).")
+
+    if current < 13:
+        # V13 — band-NO classifier v3 calibration log (kalshi_bot/classifier_v3.py).
+        # One row per (band, hourly METAR decision instant `asof`) for today's
+        # contracts inside the model domain; no strategy gates. `result` is the
+        # settled 'yes'/'no'. P&L is computed at eval time from yes_bid/yes_ask
+        # with Kalshi's fee formula, so no pnl column.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_model_no_v3 (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at      TEXT    NOT NULL,
+                asof           TEXT    NOT NULL,
+                ticker         TEXT    NOT NULL,
+                city           TEXT    NOT NULL,
+                date_target    TEXT    NOT NULL,
+                is_high        INTEGER NOT NULL,
+                band_ceil      INTEGER NOT NULL,
+                margin_f       REAL,
+                local_hour     REAL,
+                model_p        REAL    NOT NULL,
+                yes_bid        INTEGER,
+                yes_ask        INTEGER,
+                model_version  TEXT    NOT NULL,
+                result         TEXT,
+                settled_at     TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_smn_v3_ticker_asof
+                ON shadow_model_no_v3 (ticker, asof)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_smn_v3_open
+                ON shadow_model_no_v3 (result)
+        """)
+        conn.execute("INSERT INTO schema_version(version) VALUES(13)")
+        logging.info("DB schema migration V13 applied (shadow_model_no_v3).")
