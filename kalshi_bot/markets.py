@@ -22,16 +22,19 @@ _MARKETS_PATH = "/trade-api/v2/markets"
 # the flood of KXMVE sports markets that dominate the default pagination order.
 # ---------------------------------------------------------------------------
 NUMERIC_SERIES: tuple[str, ...] = (
-    # Daily high temperature by city — original series
+    # Daily high temperature by city — original series. KXHIGHDAL, KXHIGHBOS and
+    # KXHIGHOU were dropped: they have never listed a market (checked against
+    # /markets and /historical/markets, 2026-11-10); Dallas, Boston and Houston
+    # trade as KXHIGHTDAL, KXHIGHTBOS and KXHIGHTHOU.
     "KXHIGHLAX", "KXHIGHDEN", "KXHIGHCHI", "KXHIGHNY", "KXHIGHMIA",
-    "KXHIGHDAL", "KXHIGHBOS", "KXHIGHAUS", "KXHIGHOU",
+    "KXHIGHAUS",
     # Daily high temperature — new KXHIGHT* series (launched 2026-04)
     "KXHIGHTSFO", "KXHIGHTSEA", "KXHIGHTBOS", "KXHIGHTPHX", "KXHIGHPHIL",
     "KXHIGHTATL", "KXHIGHTMIN", "KXHIGHTDC",  "KXHIGHTLV",  "KXHIGHTOKC",
     "KXHIGHTDAL", "KXHIGHTSATX", "KXHIGHTHOU", "KXHIGHTNOLA",
     # Daily low temperature — KXLOWT* series (launched 2026-04)
     "KXLOWTLAX", "KXLOWTDEN", "KXLOWTCHI", "KXLOWTNYC", "KXLOWTMIA",
-    "KXLOWTAUS", "KXLOWTBOS", "KXLOWTHOU", "KXLOWTDFW",
+    "KXLOWTAUS", "KXLOWTBOS", "KXLOWTHOU", "KXLOWTDAL",
     "KXLOWTSFO", "KXLOWTSEA", "KXLOWTPHX", "KXLOWTPHIL",
     "KXLOWTATL", "KXLOWTMIN", "KXLOWTDC",  "KXLOWTLV",
     "KXLOWTOKC", "KXLOWTSATX", "KXLOWTNOLA",

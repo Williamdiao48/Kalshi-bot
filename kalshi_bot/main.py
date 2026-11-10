@@ -3874,7 +3874,7 @@ _MODEL_SHADOW_SERIES = {
     "KXHIGHTMIN":("msp",True),"KXHIGHTDFW":("dfw",True),"KXHIGHTSATX":("sat",True),
     "KXLOWTLAX":("lax",False),"KXLOWTDEN":("den",False),"KXLOWTCHI":("chi",False),
     "KXLOWTNYC":("ny",False), "KXLOWTMIA":("mia",False),"KXLOWTAUS":("aus",False),
-    "KXLOWTBOS":("bos",False),"KXLOWTHOU":("hou",False),"KXLOWTDFW":("dfw",False),
+    "KXLOWTBOS":("bos",False),"KXLOWTHOU":("hou",False),"KXLOWTDAL":("dfw",False),
     "KXLOWTSFO":("sfo",False),"KXLOWTSEA":("sea",False),"KXLOWTPHX":("phx",False),
     "KXLOWTPHIL":("phl",False),"KXLOWTATL":("atl",False),"KXLOWTMIN":("msp",False),
     "KXLOWTDC":("dca",False), "KXLOWTLV":("las",False), "KXLOWTOKC":("okc",False),

@@ -20,7 +20,8 @@ Because that full distribution includes many tail bands both sides price near
 
 Metrics per cut: Brier + log-loss with day-CLUSTERED bootstrap CIs (same-day
 bands are correlated, so a naive IID CI overstates significance), calibration
-tables, and a decision-time P&L proxy at the real book prices net of a fee.
+tables, and a decision-time P&L proxy at the real book prices, net of a flat 1c fee
+and of Kalshi's actual taker-fee schedule (kalshi_bot/fees.py).
 When the realized daily high is joinable from `forecast_shadow_log`, we also
 report distribution sharpness/calibration: CRPS, PIT z-mean/z-std, 80% coverage.
 
@@ -45,11 +46,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Reuse the exact Phase-4 statistics so the two evals are directly comparable.
 from scripts.eval_lookahead_vs_market import (  # noqa: E402
-    brier, logloss, clustered_bootstrap, calib_table,
+    brier, logloss, clustered_bootstrap, calib_table, report_pnl, trade_pnl,
 )
 
-FEE = 0.01          # Kalshi ~1c/contract proxy (fraction of $1 notional)
-EDGE_THR = 0.08     # min model-vs-market edge to "trade" in the P&L proxy
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,28 +122,6 @@ def attach_actual(df: pd.DataFrame, db: str) -> pd.DataFrame:
     return merged.drop(columns=[c for c in merged.columns if c.endswith("_lab")])
 
 
-def pnl_proxy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Trade the model's edge vs the real book at decision time, settle at outcome.
-
-    Buy YES at ask when model_p - ask > EDGE_THR; buy NO at (1-bid) when
-    bid - model_p > EDGE_THR. Payoff in $1 notional, minus a per-trade fee.
-    Only rows with a real bid & ask can trade.
-    """
-    n = len(df)
-    ask = (df["market_yes_ask"] / 100.0).to_numpy()
-    bid = (df["market_yes_bid"] / 100.0).to_numpy()
-    y = df["y"].to_numpy()
-    mp = df["model_p"].to_numpy()
-    have_book = np.isfinite(ask) & np.isfinite(bid)
-
-    pnl = np.zeros(n)
-    buy_yes = have_book & (mp - ask > EDGE_THR)
-    buy_no = have_book & (bid - mp > EDGE_THR)
-    pnl[buy_yes] = np.where(y[buy_yes] == 1, 1 - ask[buy_yes], -ask[buy_yes]) - FEE
-    pnl[buy_no] = np.where(y[buy_no] == 0, bid[buy_no], -(1 - bid[buy_no])) - FEE
-    return pnl, (buy_yes | buy_no)
-
-
 def crps_gaussian(mu, sigma, x):
     """Closed-form CRPS for a Gaussian predictive dist (lower is better)."""
     sigma = np.maximum(sigma, 1e-6)
@@ -194,13 +171,7 @@ def report_cut(df: pd.DataFrame, label: str, n_boot: int) -> None:
         print("\nmarket calibration (sanity — should be near-diagonal):")
         print(calib_table(dm, "market_p", "y").to_string())
 
-    pnl, traded = pnl_proxy(d)
-    n_t = int(traded.sum())
-    print(f"\nP&L proxy (edge>{EDGE_THR}, fee {FEE}): trades={n_t}/{len(d)}  "
-          f"total={pnl[traded].sum():+.2f}  "
-          f"mean/trade={pnl[traded].mean() if n_t else 0:+.4f}")
-    if n_t:
-        print(f"  gross win rate on trades: {(pnl[traded] > 0).mean():.3f}")
+    report_pnl(*trade_pnl(d["model_p"], d["market_yes_bid"], d["market_yes_ask"], d["y"]))
 
 
 def report_distribution(df: pd.DataFrame) -> None:

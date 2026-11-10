@@ -58,7 +58,7 @@ TICKER_TO_METRIC: dict[str, str] = {
     "KXLOWTAUS":  "temp_low_aus",
     "KXLOWTBOS":  "temp_low_bos",
     "KXLOWTHOU":  "temp_low_hou",
-    "KXLOWTDFW":  "temp_low_dfw",
+    "KXLOWTDAL":  "temp_low_dfw",   # settles on CLIDFW; "KXLOWTDFW" never existed
     "KXLOWTSFO":  "temp_low_sfo",
     "KXLOWTSEA":  "temp_low_sea",
     "KXLOWTPHX":  "temp_low_phx",
